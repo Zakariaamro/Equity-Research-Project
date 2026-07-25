@@ -1,9 +1,14 @@
 # Equity Research Platform — Architecture
 
-**Version:** 1.0
+**Version:** 1.1
 **Date:** 2026-07-25
 **Owner:** Zakaria
 **Status:** Approved for V1 implementation
+
+**Changelog**
+- v1.1 — Watchlist set to AMZN / NVDA / MU with verified CIKs and fiscal year ends.
+  Raw archive policy clarified. Retry parameters specified. Q4 reporting note added.
+- v1.0 — Initial architecture.
 
 ---
 
@@ -13,8 +18,23 @@ Automatically detect new SEC filings by a watchlist of companies, extract financ
 statements and narrative sections, compute ratios, analyse the narrative with an LLM,
 and surface the results on a dashboard — without the operator's laptop being on.
 
-**V1 watchlist:** Amazon (CIK 0001018724). Microsoft and NVIDIA are config additions,
-not code changes.
+### Watchlist (verified against SEC 2026-07-25)
+
+| Company | Ticker | CIK | Fiscal year end | 10-K typically filed |
+|---|---|---|---|---|
+| Amazon.com Inc | AMZN | `0001018724` | 12-31 | Early February |
+| NVIDIA Corp | NVDA | `0001045810` | 01-31 | Late February |
+| Micron Technology Inc | MU | `0000723125` | 09-03 | Early October |
+
+**Three different fiscal calendars.** This is a feature, not an annoyance — it forces the
+system to treat fiscal periods as data rather than assume calendar quarters, which is
+correct behaviour for any real research tool. Never infer a period from a filing date.
+
+**Development order:** Amazon first. It is the only watchlist member expected to file
+during the V1 build window (Q2 10-Q, historically the first days of August). NVIDIA's
+Q2 FY2027 10-Q lands around late August; Micron files nothing until its 10-K in early
+October. Adding NVDA and MU is a `config.py` change, not a code change — that is the
+test of whether the architecture is right.
 
 ---
 
@@ -42,7 +62,7 @@ restructuring tables, which is deliberately harder than doing it correctly.
 
 ## 3. Verified Findings (2026-07-25)
 
-These were confirmed against live SEC data and are the basis for the design.
+Confirmed against live SEC data. These are the basis for the design.
 
 ### 3.1 `FilingSummary.xml` solves section segmentation
 
@@ -58,7 +78,7 @@ Every XBRL filing has `FilingSummary.xml` listing each report with a `MenuCatego
 | `Details` | XBRL tagging detail | **Skip — redundant** |
 
 Confirmed on Amazon 10-K `0001018724-26-000004` (FY2025) and 10-Q
-`0001018724-26-000014` (Q1 2026). Structure is identical across both form types.
+`0001018724-26-000014` (Q1 2026). Structure identical across both form types.
 
 Amazon 10-K notes: Description of Business & Accounting Policies · Financial Instruments ·
 Property and Equipment · Leases · Acquisitions, Goodwill & Acquired Intangibles · Debt ·
@@ -78,21 +98,27 @@ of contents. Take the *last* match, not the first.
 
 ### 3.3 8-K handling: filter on Item 2.02
 
-Amazon files ~30 8-Ks a year; most are irrelevant. Forward guidance appears in the
-earnings press release, filed as **Exhibit 99.1 to an 8-K carrying Item 2.02
-("Results of Operations and Financial Condition")** — roughly four per year.
+Forward guidance appears in the earnings press release, filed as **Exhibit 99.1 to an
+8-K carrying Item 2.02 ("Results of Operations and Financial Condition")** — roughly
+four per year per company.
 
-**Rule:** ingest 8-Ks only when Item 2.02 is present.
+**Rule:** ingest 8-Ks only when Item 2.02 is present. **The substantive content is in
+Exhibit 99.1, not the 8-K body** — see §4.1.
 
 *Unverified:* the `items` field in the EDGAR submissions API is expected to carry
 8-K item numbers (e.g. `"2.02,9.01"`). Confirm during implementation; if absent,
-fall back to parsing the filing index page.
+fall back to the filing index. Exclude only if both sources yield nothing.
 
 ### 3.4 Filter at the source
 
 Amazon filed accessions `-25-000070` through `-25-000132` in one stretch of 2025,
 overwhelmingly Form 4 insider transactions. The monitor must filter by form type
 before doing anything else.
+
+### 3.5 Filing sizes vary widely
+
+Amazon 10-K ≈ 12 MB. NVIDIA ≈ 11 MB. Micron ranges 17–46 MB. This matters because
+raw filings are committed to the repo — see §4.1 and the accepted-debt note.
 
 ---
 
@@ -102,17 +128,35 @@ Constraint: must run without the operator's machine being on. Cost target: $0 in
 
 | Concern | Choice | Why |
 |---|---|---|
-| Scheduler + compute | **GitHub Actions** (cron workflow) | Always-on, free, built-in secrets, no Linux admin |
+| Scheduler + compute | **GitHub Actions** (cron workflow) | Always-on, free on public repos, built-in secrets, no Linux admin |
 | State | **SQLite committed to the repo** | Runners are ephemeral; repo is the durable store |
-| Raw filings | gzipped in `data/raw/` | Permanent archive, ~a few MB/year/company |
+| Raw filings | gzipped in `data/raw/` | Permanent archive |
 | Dashboard | **Streamlit Community Cloud** | Free, deploys from the same repo, redeploys on push |
 | LLM | Anthropic API, section-level calls | Budget ≈ $20 total |
 
 **Why not a VM:** SSH, systemd and deployment would consume ~8 of ~30 available hours
 and teach operations rather than system design. Revisit if the watchlist exceeds ~10 companies.
 
+### 4.1 Raw archive policy
+
+**Archive every document containing original content. Do not archive SEC-generated
+renderings of content already archived.**
+
+| Form | Archive |
+|---|---|
+| 10-K, 10-Q | Primary document + `FilingSummary.xml` |
+| 8-K | **All documents listed in the filing index**, including Exhibit 99.1 |
+
+Rationale: R-files are SEC renderings derived from the primary document plus its XBRL —
+regenerable, so archiving them is duplication. Exhibit 99.1 is genuinely separate content
+and is the *only* place guidance appears; an 8-K archived without it is worthless.
+8-K filings are small, so archiving them wholesale costs little.
+
 **Accepted debt (time-boxed, deliberate):**
 - SQLite-in-git does not scale past a handful of companies. Fine at V1 size.
+- Repo growth: three companies at roughly 15 MB per annual filing, gzipped, is tens of
+  MB per year. Acceptable now; revisit before adding a fourth company or backfilling
+  more than three years.
 - GitHub Actions cron drifts 5–30 minutes. Irrelevant given filings are analysed within hours.
 - Streamlit Community Cloud apps are public. All source data is public; no secrets in the DB.
 
@@ -126,7 +170,7 @@ edgar/
   db.py             Schema creation, connection handling
   edgar_client.py   ALL HTTP to SEC. Rate limiting + User-Agent live here and nowhere else
   monitor.py        Poll for filings not yet in the database
-  fetch.py          Download primary doc + FilingSummary, gzip to disk
+  fetch.py          Download and archive per §4.1
   sections.py       Parse FilingSummary, fetch R-files, extract MD&A, clean to text
   xbrl.py           Pull companyfacts, normalise into xbrl_facts
   metrics.py        Compute ratios from xbrl_facts, record formula + inputs
@@ -152,6 +196,8 @@ data/
 
 ## 6. Database Schema
 
+Seven tables.
+
 ```sql
 -- ============ REFERENCE ============
 CREATE TABLE companies (
@@ -170,7 +216,7 @@ CREATE TABLE filings (
     period_end     TEXT,                 -- ISO 8601
     items          TEXT,                 -- 8-K items, comma-separated; NULL otherwise
     primary_doc    TEXT,                 -- 'amzn-20260331.htm'
-    raw_path       TEXT,                 -- path to gzipped archive
+    raw_path       TEXT,                 -- directory holding gzipped archives
     discovered_at  TEXT NOT NULL,
     status         TEXT NOT NULL         -- discovered|fetched|sectioned|analyzed|failed
 );
@@ -178,7 +224,7 @@ CREATE TABLE filings (
 CREATE TABLE sections (
     id            INTEGER PRIMARY KEY,
     accession_no  TEXT NOT NULL REFERENCES filings(accession_no),
-    category      TEXT NOT NULL,         -- Statements|Notes|Policies|MDA|RiskFactors|Cover
+    category      TEXT NOT NULL,         -- Statements|Notes|Policies|MDA|RiskFactors|Exhibit
     short_name    TEXT NOT NULL,         -- 'Income Taxes'
     source_file   TEXT,                  -- 'R14.htm' | 'primary'
     position      INTEGER,
@@ -191,14 +237,14 @@ CREATE TABLE xbrl_facts (
     id            INTEGER PRIMARY KEY,
     cik           TEXT NOT NULL REFERENCES companies(cik),
     taxonomy      TEXT NOT NULL,         -- 'us-gaap' | 'dei'
-    concept       TEXT NOT NULL,         -- 'RevenueFromContractWithCustomerExcludingAssessedTax'
+    concept       TEXT NOT NULL,
     unit          TEXT NOT NULL,         -- 'USD'
     period_start  TEXT,
     period_end    TEXT NOT NULL,
     fiscal_year   INTEGER,
     fiscal_period TEXT,                  -- 'FY' | 'Q1' | 'Q2' | 'Q3'
     value         REAL NOT NULL,
-    accession_no  TEXT,                  -- filing that reported it
+    accession_no  TEXT,
     form_type     TEXT,
     UNIQUE(cik, concept, unit, period_start, period_end, accession_no)
 );
@@ -212,7 +258,7 @@ CREATE TABLE metrics (
     name         TEXT NOT NULL,          -- 'operating_margin'
     value        REAL,
     formula      TEXT NOT NULL,          -- 'OperatingIncomeLoss / Revenues'
-    inputs_json  TEXT NOT NULL,          -- {"OperatingIncomeLoss": 1.0e10, "Revenues": 1.4e11}
+    inputs_json  TEXT NOT NULL,
     calc_version TEXT NOT NULL,
     computed_at  TEXT NOT NULL,
     UNIQUE(cik, period_end, name, calc_version)
@@ -222,8 +268,8 @@ CREATE TABLE metrics (
 CREATE TABLE analyses (
     id             INTEGER PRIMARY KEY,
     section_id     INTEGER NOT NULL REFERENCES sections(id),
-    prompt_name    TEXT NOT NULL,        -- 'note_materiality'
-    prompt_version TEXT NOT NULL,        -- 'v1'
+    prompt_name    TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
     model          TEXT NOT NULL,
     input_hash     TEXT NOT NULL,        -- sha256(section text + rendered prompt)
     output_json    TEXT NOT NULL,
@@ -250,19 +296,25 @@ CREATE TABLE findings (
 ### Why these columns exist
 
 **`metrics.formula` and `metrics.inputs_json`** — every ratio on the dashboard can display
-its own derivation. An analyst tool that shows "Operating margin: 11.2%" without letting you
-see the numerator and denominator is a toy. This makes every calculation auditable at no cost.
+its own derivation. An analyst tool showing "Operating margin: 11.2%" without letting you
+see numerator and denominator is a toy. Auditability at no cost.
 
 **`analyses.input_hash` with a UNIQUE constraint** — the database itself prevents paying
-twice for an identical call. Change the prompt, the hash changes, you get a fresh analysis and
-the old one is retained for comparison. Prompt versioning and cost control from one column.
+twice for an identical call. Change the prompt, the hash changes, you get a fresh analysis
+and the old one is retained for comparison. Prompt versioning and cost control from one column.
 
-**`findings.quote`** — every AI claim must be anchored to verbatim filing text. This is the
-strongest available control against hallucination, and it is structural rather than a
-prompt instruction. A finding without a quote is a bug.
+**`findings.quote`** — every AI claim must be anchored to verbatim filing text. The strongest
+available control against hallucination, and structural rather than a prompt instruction.
+A finding without a quote is a bug.
 
-**`filings.status`** — makes the pipeline resumable and idempotent. A run that dies partway
-through can be re-run without duplicating work or re-paying for analysis.
+**`filings.status`** — makes the pipeline resumable and idempotent.
+
+### Note on `fiscal_period`
+
+There is deliberately no `Q4`. Companies do not file a Q4 10-Q; the fourth quarter is
+covered by the 10-K. SEC XBRL reports `FY` for annual figures, and Q4 must be *derived*
+(FY minus Q1 + Q2 + Q3). When that derivation is implemented it belongs in `metrics`,
+not `xbrl_facts` — it is a calculation, not an observed fact.
 
 ---
 
@@ -285,9 +337,10 @@ Computed in `metrics.py` from `xbrl_facts`. Version as `v1`.
 
 **Implementation note — concept aliasing.** Companies tag the same idea differently.
 Amazon reports net sales as `RevenueFromContractWithCustomerExcludingAssessedTax`, not
-`Revenues`, and does not report gross profit directly. `config.py` must hold an ordered
-alias list per canonical concept, and `metrics.py` takes the first that resolves. Where no
-input resolves, write `NULL` — never a guess.
+`Revenues`, and does not report gross profit directly. Micron and NVIDIA, as semiconductor
+manufacturers, do report gross profit. `config.py` must hold an ordered alias list per
+canonical concept; `metrics.py` takes the first that resolves. Where no input resolves,
+write `NULL` — never a guess.
 
 ---
 
@@ -295,7 +348,7 @@ input resolves, write `NULL` — never a guess.
 
 ### V1 — Must have
 - Poll for new 10-K, 10-Q, and Item 2.02 8-K filings for the watchlist
-- Store raw filings permanently
+- Store raw filings permanently per §4.1
 - Extract statements, notes, and MD&A into `sections`
 - Ingest XBRL facts; compute the ten metrics above
 - LLM analysis of notes and MD&A producing quote-anchored findings
@@ -306,11 +359,11 @@ input resolves, write `NULL` — never a guess.
 - Year-over-year comparison of the same note across filings
 - Material change detection
 - Historical backfill (same code path, different inputs)
+- Derived Q4 figures
 - Email or push notification on high-severity findings
-- Microsoft and NVIDIA enabled
 
 ### Future — Could have
-- Cross-company comparison
+- Cross-company comparison (NVDA/MU supply-chain linkage is a natural first case)
 - Earnings call transcripts
 - Full risk factor diffing
 - Valuation modelling
@@ -328,3 +381,6 @@ input resolves, write `NULL` — never a guess.
 | 5 | R-files via FilingSummary for statements and notes | Removes the largest technical risk | 2026-07-25 |
 | 6 | 8-Ks filtered to Item 2.02 only | Guidance without the noise | 2026-07-25 |
 | 7 | Automate last — manual CLI first, cron at the end | Automation multiplies bugs and hides failures | 2026-07-25 |
+| 8 | Watchlist AMZN / NVDA / MU | AI-infrastructure basket; three distinct fiscal calendars stress the design correctly | 2026-07-25 |
+| 9 | Archive original content, not SEC renderings | Ex-99.1 is unique and essential; R-files are regenerable | 2026-07-25 |
+| 10 | Build against Amazon first | Only watchlist member expected to file during the build window | 2026-07-25 |
