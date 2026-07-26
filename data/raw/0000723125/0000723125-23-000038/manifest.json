@@ -1,0 +1,109 @@
+{
+  "accession_no": "0000723125-23-000038",
+  "cik": "0000723125",
+  "form_type": "8-K",
+  "documents": [
+    {
+      "filename": "0000723125-23-000038-index-headers.html",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "0000723125-23-000038-index.html",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "0000723125-23-000038-xbrl.zip",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "0000723125-23-000038.txt",
+      "type": "",
+      "description": "Complete submission text file",
+      "archived": true
+    },
+    {
+      "filename": "FilingSummary.xml",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "Financial_Report.xlsx",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "MetaLinks.json",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "R1.htm",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "Show.js",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "a2023q3ex991-pressrelease.htm",
+      "type": "EX-99.1",
+      "description": "EX-99.1 EARNINGS RELEASE",
+      "archived": true
+    },
+    {
+      "filename": "mu-20230628.htm",
+      "type": "8-K",
+      "description": "8-K",
+      "archived": true
+    },
+    {
+      "filename": "mu-20230628.xsd",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "mu-20230628_g1.jpg",
+      "type": "GRAPHIC",
+      "description": "GRAPHIC",
+      "archived": true
+    },
+    {
+      "filename": "mu-20230628_htm.xml",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "mu-20230628_lab.xml",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "mu-20230628_pre.xml",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "report.css",
+      "type": "",
+      "description": "",
+      "archived": true
+    }
+  ]
+}

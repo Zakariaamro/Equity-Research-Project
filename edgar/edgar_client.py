@@ -161,7 +161,14 @@ class EdgarClient:
         return self._get(url).json()
 
     def get_filing_index(self, cik: str, accession_no: str) -> list[dict[str, Any]]:
-        """Return the list of documents in a filing (name, type, size, ...)."""
+        """Return the complete list of documents in a filing (name, size, ...).
+
+        This is index.json. Its own `type` field is a display icon class
+        (e.g. "text.gif"), NOT the SEC-declared document type (EX-99.1,
+        10-K, GRAPHIC, ...) -- see ARCHITECTURE.md §3.6. For the real
+        document type, fetch and parse f"{accession_no}-index.html" via
+        get_archive_file() instead.
+        """
         url = FILING_INDEX_URL.format(
             cik_no_zeros=strip_cik_leading_zeros(cik),
             accession_no_nodash=strip_accession_dashes(accession_no),

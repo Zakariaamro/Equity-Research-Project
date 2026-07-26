@@ -1,11 +1,19 @@
 # Equity Research Platform — Architecture
 
-**Version:** 1.2
+**Version:** 1.4
 **Date:** 2026-07-26
 **Owner:** Zakaria
 **Status:** Approved for V1 implementation
 
 **Changelog**
+- v1.4 — §3.7 added: R-files are served wrapped in an SGML `<DOCUMENT>...<TEXT>...
+  </TEXT></DOCUMENT>` envelope, not bare HTML, confirmed against AMZN 10-K
+  `0001018724-26-000004`'s `R18.htm`. `html_text.py` now strips this explicitly instead
+  of relying on parser leniency to find `<body>` by accident.
+- v1.3 — §6 `sections` UNIQUE constraint gains `source_file` (table was empty; no
+  migration). §3.6 added: `index.json`'s `type` is a display icon class, not a document
+  type; `{accession}-index.html`'s Document Format Files table is the authoritative
+  source, confirmed against NVDA 8-K `0001045810-26-000019`.
 - v1.2 — §3.3 8-K `items` field confirmed populated (was unverified). Archiving vs.
   analysis scope boundary made explicit: archiving unbounded, analysis bounded by a
   configurable start date (arrives with the spec that needs it).
@@ -124,6 +132,61 @@ before doing anything else.
 
 Amazon 10-K ≈ 12 MB. NVIDIA ≈ 11 MB. Micron ranges 17–46 MB. This matters because
 raw filings are committed to the repo — see §4.1 and the accepted-debt note.
+
+### 3.6 There are two different "filing index" resources, and only one has document types
+
+Easy to conflate; confirmed empirically during SPEC-002 review against NVDA 8-K
+`0001045810-26-000019`.
+
+- **`index.json`** (`.../{accession}/index.json`) — the machine-readable directory
+  listing. Its `type` field is a **display icon class** (`text.gif`, `compressed.gif`,
+  `image2.gif`), not a document type. Every file in the NVDA filing above, including the
+  actual Exhibit 99.1, came back `text.gif`. Unusable for identifying exhibit numbers.
+- **`{accession}-index.html`** — the human-readable filing page. Its "Document Format
+  Files" table has a `Type` column that is SEC-declared and authoritative: it correctly
+  labels NVDA's `q4fy26pr.htm` as `EX-99.1` even though the filename gives no hint.
+  This is the resource that actually resolves the SPEC-001 Exhibit 99.1 false positive.
+
+**Consequence:** the `-index.html` table does not enumerate every archived file either —
+viewer-support files (`FilingSummary.xml`, `R*.htm`, `MetaLinks.json`, `report.css`,
+`Show.js`) never appear in it. A complete, typed manifest requires both resources:
+`index.json` for the full file list, `-index.html` for types where they exist. This is
+exactly the kind of thing that would otherwise be rediscovered painfully in six months.
+
+### 3.7 R-files are served wrapped in an SGML envelope, not as bare HTML
+
+Confirmed empirically during SPEC-002 implementation against AMZN 10-K
+`0001018724-26-000004`'s `R18.htm` (Income Taxes note).
+
+Fetching an R-file directly from its archive URL —
+`https://www.sec.gov/Archives/edgar/data/{cik}/{accession_no_nodash}/R18.htm` — does
+**not** return bare HTML. It returns:
+
+```
+<DOCUMENT>
+<TYPE>XML
+<SEQUENCE>31
+<FILENAME>R18.htm
+<DESCRIPTION>IDEA: XBRL DOCUMENT
+<TEXT>
+<html>...</html>
+</TEXT>
+</DOCUMENT>
+```
+
+**Reproduction:** `curl -A "<UA>" https://www.sec.gov/Archives/edgar/data/1018724/000101872426000004/R18.htm`
+— HTTP 200, `content-type: text/html`, byte-identical on repeat fetch. Not a caching
+artifact or a fluke of one filing; this is how SEC serves the R-file endpoint.
+
+**Why this matters:** `BeautifulSoup`'s `html.parser` happens to be lenient enough to
+find the nested `<body>` regardless of the malformed SGML tags wrapping it (it nests
+everything under `<document><type><sequence>...<text><html><body>`, and `.body` still
+finds it) — so naive code that assumes bare HTML will silently produce correct-looking
+output *by accident*. That is a worse failure mode than an outright error: it means the
+parsing was never actually validated to handle this, and a future SEC formatting change
+could silently corrupt extracted text with no signal. SPEC-002 R4's `html_text.py`
+therefore strips this envelope explicitly before parsing and raises if no `<body>` is
+found afterward, rather than depending on parser leniency.
 
 ---
 
@@ -244,7 +307,7 @@ CREATE TABLE sections (
     position      INTEGER,
     text          TEXT NOT NULL,         -- cleaned plain text
     text_hash     TEXT NOT NULL,         -- sha256, used as cache key
-    UNIQUE(accession_no, category, short_name)
+    UNIQUE(accession_no, category, short_name, source_file)
 );
 
 CREATE TABLE xbrl_facts (
@@ -322,6 +385,15 @@ available control against hallucination, and structural rather than a prompt ins
 A finding without a quote is a bug.
 
 **`filings.status`** — makes the pipeline resumable and idempotent.
+
+### Note on `sections.UNIQUE`
+
+Changed from `UNIQUE(accession_no, category, short_name)` to `UNIQUE(accession_no,
+category, short_name, source_file)` during SPEC-002 review, before any row had ever been
+written to the table. Two reports in the same filing can legitimately share a
+`MenuCategory`/`ShortName` pair; `source_file` (the distinct R-file, e.g. `R14.htm`)
+disambiguates them without requiring `short_name` to ever be anything but the verbatim
+SEC value. Because the table was empty, this was a schema edit, not a migration.
 
 ### Note on `fiscal_period`
 

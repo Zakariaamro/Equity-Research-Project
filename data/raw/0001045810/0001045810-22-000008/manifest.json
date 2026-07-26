@@ -1,0 +1,115 @@
+{
+  "accession_no": "0001045810-22-000008",
+  "cik": "0001045810",
+  "form_type": "8-K",
+  "documents": [
+    {
+      "filename": "0001045810-22-000008-index-headers.html",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "0001045810-22-000008-index.html",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "0001045810-22-000008-xbrl.zip",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "0001045810-22-000008.txt",
+      "type": "",
+      "description": "Complete submission text file",
+      "archived": true
+    },
+    {
+      "filename": "FilingSummary.xml",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "Financial_Report.xlsx",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "MetaLinks.json",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "R1.htm",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "Show.js",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "nvda-20220216.htm",
+      "type": "8-K",
+      "description": "8-K",
+      "archived": true
+    },
+    {
+      "filename": "nvda-20220216.xsd",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "nvda-20220216_htm.xml",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "nvda-20220216_lab.xml",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "nvda-20220216_pre.xml",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "nvdalogoa19.jpg",
+      "type": "GRAPHIC",
+      "description": "NVDA LOGO",
+      "archived": true
+    },
+    {
+      "filename": "q4fy22cfocommentary.htm",
+      "type": "EX-99.2",
+      "description": "Q4FY22 CFO COMMENTARY",
+      "archived": true
+    },
+    {
+      "filename": "q4fy22pr.htm",
+      "type": "EX-99.1",
+      "description": "Q4FY22 PRESS RELEASE",
+      "archived": true
+    },
+    {
+      "filename": "report.css",
+      "type": "",
+      "description": "",
+      "archived": true
+    }
+  ]
+}

@@ -11,7 +11,7 @@ import logging
 import sqlite3
 import sys
 
-from edgar import config, db, fetch, monitor
+from edgar import config, db, fetch, monitor, sections
 from edgar.edgar_client import EdgarClient
 from edgar.monitor import DiscoveredFiling
 
@@ -104,6 +104,55 @@ def cmd_discover(args: argparse.Namespace) -> None:
         conn.close()
 
 
+def cmd_extract(args: argparse.Namespace) -> None:
+    tickers = None
+    if args.ticker:
+        _validate_ticker(args.ticker)
+        tickers = [args.ticker]
+
+    conn = db.get_connection()
+    try:
+        client = EdgarClient()
+        results = sections.extract_pending(
+            conn,
+            client,
+            tickers=tickers,
+            accession=args.accession,
+            limit=args.limit,
+            force=args.force,
+        )
+        accession_nos = [r["accession_no"] for r in results]
+        failures = sum(1 for r in results if r["status"] == "failed")
+
+        written = 0
+        if accession_nos:
+            placeholders = ",".join("?" for _ in accession_nos)
+            written = conn.execute(
+                f"SELECT COUNT(*) AS n FROM sections WHERE accession_no IN ({placeholders})",
+                accession_nos,
+            ).fetchone()["n"]
+
+        print(
+            f"Processed {len(results)} filing(s): {written} section row(s) on file, "
+            f"{failures} failure(s)."
+        )
+        _print_filings_table(conn, accession_nos)
+    finally:
+        conn.close()
+
+
+def cmd_backfill_manifests(args: argparse.Namespace) -> None:
+    conn = db.get_connection()
+    try:
+        client = EdgarClient()
+        results = fetch.backfill_manifests(conn, client)
+        written = sum(1 for r in results if r["status"] == "written")
+        failed = sum(1 for r in results if r["status"] == "failed")
+        print(f"Backfilled manifests for {len(results)} filing(s): {written} written, {failed} failed.")
+    finally:
+        conn.close()
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     conn = db.get_connection()
     try:
@@ -138,6 +187,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="Report what would happen without writing"
     )
 
+    p_extract = sub.add_parser(
+        "extract", help="Extract statements, notes, and policies into sections"
+    )
+    p_extract.add_argument("--ticker", help="Restrict to one watchlist ticker")
+    p_extract.add_argument("--accession", help="Extract a single filing by accession number")
+    p_extract.add_argument("--limit", type=int, default=None, help="Cap the number of filings")
+    p_extract.add_argument(
+        "--force", action="store_true", help="Re-extract filings already marked sectioned"
+    )
+
+    sub.add_parser(
+        "backfill-manifests", help="Generate manifest.json for already-archived filings"
+    )
+
     sub.add_parser("status", help="Summarize filings by company, form, and status")
 
     return parser
@@ -152,6 +215,10 @@ def main(argv: list[str] | None = None) -> int:
         cmd_init_db(args)
     elif args.command == "discover":
         cmd_discover(args)
+    elif args.command == "extract":
+        cmd_extract(args)
+    elif args.command == "backfill-manifests":
+        cmd_backfill_manifests(args)
     elif args.command == "status":
         cmd_status(args)
 

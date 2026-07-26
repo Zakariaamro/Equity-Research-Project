@@ -1,0 +1,667 @@
+{
+  "accession_no": "0001045810-21-000010",
+  "cik": "0001045810",
+  "form_type": "10-K",
+  "documents": [
+    {
+      "filename": "0001045810-21-000010-index-headers.html",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "0001045810-21-000010-index.html",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "0001045810-21-000010-xbrl.zip",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "0001045810-21-000010.txt",
+      "type": "",
+      "description": "Complete submission text file",
+      "archived": false
+    },
+    {
+      "filename": "FilingSummary.xml",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "Financial_Report.xlsx",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "MetaLinks.json",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R1.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R10.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R11.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R12.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R13.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R14.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R15.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R16.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R17.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R18.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R19.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R2.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R20.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R21.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R22.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R23.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R24.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R25.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R26.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R27.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R28.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R29.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R3.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R30.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R31.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R32.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R33.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R34.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R35.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R36.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R37.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R38.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R39.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R4.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R40.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R41.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R42.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R43.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R44.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R45.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R46.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R47.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R48.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R49.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R5.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R50.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R51.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R52.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R53.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R54.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R55.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R56.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R57.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R58.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R59.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R6.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R60.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R61.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R62.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R63.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R64.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R65.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R66.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R67.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R68.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R69.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R7.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R70.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R71.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R72.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R73.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R74.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R75.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R76.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R77.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R78.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R79.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R8.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R80.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R81.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R82.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R83.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R84.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R85.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "R9.htm",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "Show.js",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "consentofindependentregist.htm",
+      "type": "EX-23.1",
+      "description": "CONSENT OF INDEPENDENT REGISTERED PUBLIC ACCOUNTING FIRM",
+      "archived": false
+    },
+    {
+      "filename": "descriptionoftheregistrant.htm",
+      "type": "EX-4.7",
+      "description": "EX-4.7",
+      "archived": false
+    },
+    {
+      "filename": "listofregistrantssubsidiar.htm",
+      "type": "EX-21.1",
+      "description": "LIST OF REGISTRANTS SUBSIDIARIES",
+      "archived": false
+    },
+    {
+      "filename": "nvda-20210131.htm",
+      "type": "10-K",
+      "description": "FY2021 10-K",
+      "archived": true
+    },
+    {
+      "filename": "nvda-20210131.xsd",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "nvda-20210131_cal.xml",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "nvda-20210131_def.xml",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "nvda-20210131_g1.jpg",
+      "type": "GRAPHIC",
+      "description": "NVDA LOGO",
+      "archived": false
+    },
+    {
+      "filename": "nvda-20210131_g2.jpg",
+      "type": "GRAPHIC",
+      "description": "5YR STOCK PERFORMANCE GRAPH",
+      "archived": false
+    },
+    {
+      "filename": "nvda-20210131_htm.xml",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "nvda-20210131_lab.xml",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "nvda-20210131_pre.xml",
+      "type": "",
+      "description": "",
+      "archived": false
+    },
+    {
+      "filename": "nvda-2021xex311.htm",
+      "type": "EX-31.1",
+      "description": "302 CERTIFICATION OF CEO",
+      "archived": false
+    },
+    {
+      "filename": "nvda-2021xex312.htm",
+      "type": "EX-31.2",
+      "description": "302 CERTIFICATION OF CFO",
+      "archived": false
+    },
+    {
+      "filename": "nvda-2021xex321.htm",
+      "type": "EX-32.1",
+      "description": "906 CERTIFICATION OF CEO",
+      "archived": false
+    },
+    {
+      "filename": "nvda-2021xex322.htm",
+      "type": "EX-32.2",
+      "description": "906 CERTIFICATION OF CFO",
+      "archived": false
+    },
+    {
+      "filename": "report.css",
+      "type": "",
+      "description": "",
+      "archived": false
+    }
+  ]
+}

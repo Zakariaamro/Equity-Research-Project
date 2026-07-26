@@ -8,6 +8,12 @@ dependencies = [
     # request; requests gives us that ergonomically. stdlib urllib would work
     # but makes edgar_client.py substantially more verbose for no benefit.
     "requests>=2.31",
+    # SPEC-002: parsing R-file HTML into clean text and scraping the SEC
+    # "Document Format Files" table. html.parser (stdlib) lacks the
+    # ergonomic tree/table-navigation API this needs; lxml is an
+    # alternative but adds a C-extension build dependency for no real gain
+    # here since these documents are not huge.
+    "beautifulsoup4>=4.12",
 ]
 
 [project.optional-dependencies]

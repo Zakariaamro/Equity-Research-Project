@@ -1,0 +1,121 @@
+{
+  "accession_no": "0000723125-20-000079",
+  "cik": "0000723125",
+  "form_type": "8-K",
+  "documents": [
+    {
+      "filename": "0000723125-20-000079-index-headers.html",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "0000723125-20-000079-index.html",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "0000723125-20-000079-xbrl.zip",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "0000723125-20-000079.txt",
+      "type": "",
+      "description": "Complete submission text file",
+      "archived": true
+    },
+    {
+      "filename": "FilingSummary.xml",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "Financial_Report.xlsx",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "MetaLinks.json",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "R1.htm",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "Show.js",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "a2020q4exhibit991-pres.htm",
+      "type": "EX-99.1",
+      "description": "2020 Q4 EXHIBIT 99.1 EARNINGS RELEASE",
+      "archived": true
+    },
+    {
+      "filename": "mu-20200929.htm",
+      "type": "8-K",
+      "description": "8-K",
+      "archived": true
+    },
+    {
+      "filename": "mu-20200929.xsd",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "mu-20200929_cal.xml",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "mu-20200929_def.xml",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "mu-20200929_g1.jpg",
+      "type": "GRAPHIC",
+      "description": "GRAPHIC",
+      "archived": true
+    },
+    {
+      "filename": "mu-20200929_htm.xml",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "mu-20200929_lab.xml",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "mu-20200929_pre.xml",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "report.css",
+      "type": "",
+      "description": "",
+      "archived": true
+    }
+  ]
+}

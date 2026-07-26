@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS sections (
     position      INTEGER,
     text          TEXT NOT NULL,
     text_hash     TEXT NOT NULL,
-    UNIQUE(accession_no, category, short_name)
+    UNIQUE(accession_no, category, short_name, source_file)
 );
 
 CREATE TABLE IF NOT EXISTS xbrl_facts (

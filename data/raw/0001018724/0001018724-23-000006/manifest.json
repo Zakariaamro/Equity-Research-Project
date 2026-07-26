@@ -1,0 +1,115 @@
+{
+  "accession_no": "0001018724-23-000006",
+  "cik": "0001018724",
+  "form_type": "8-K",
+  "documents": [
+    {
+      "filename": "0001018724-23-000006-index-headers.html",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "0001018724-23-000006-index.html",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "0001018724-23-000006-xbrl.zip",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "0001018724-23-000006.txt",
+      "type": "",
+      "description": "Complete submission text file",
+      "archived": true
+    },
+    {
+      "filename": "FilingSummary.xml",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "Financial_Report.xlsx",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "MetaLinks.json",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "R1.htm",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "Show.js",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "amazonlogorgba09.jpg",
+      "type": "GRAPHIC",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "amzn-20230331xex991.htm",
+      "type": "EX-99.1",
+      "description": "EX-99.1",
+      "archived": true
+    },
+    {
+      "filename": "amzn-20230331xex992.htm",
+      "type": "EX-99.2",
+      "description": "EX-99.2",
+      "archived": true
+    },
+    {
+      "filename": "amzn-20230427.htm",
+      "type": "8-K",
+      "description": "8-K",
+      "archived": true
+    },
+    {
+      "filename": "amzn-20230427.xsd",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "amzn-20230427_htm.xml",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "amzn-20230427_lab.xml",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "amzn-20230427_pre.xml",
+      "type": "",
+      "description": "",
+      "archived": true
+    },
+    {
+      "filename": "report.css",
+      "type": "",
+      "description": "",
+      "archived": true
+    }
+  ]
+}

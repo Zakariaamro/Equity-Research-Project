@@ -29,10 +29,16 @@ WATCHLIST: list[Company] = [
     Company(ticker="MU", cik="0000723125", name="Micron Technology, Inc.", fiscal_year_end="0903"),
 ]
 
+TENK_FORM_TYPE: str = "10-K"
+TENQ_FORM_TYPE: str = "10-Q"
 EIGHTK_FORM_TYPE: str = "8-K"
-TRACKED_FORMS: list[str] = ["10-K", "10-Q", EIGHTK_FORM_TYPE]
+TRACKED_FORMS: list[str] = [TENK_FORM_TYPE, TENQ_FORM_TYPE, EIGHTK_FORM_TYPE]
 
 EIGHTK_REQUIRED_ITEM: str = "2.02"
+
+# Section extraction (SPEC-002) covers these form types only; MD&A/Risk
+# Factors/8-K exhibit extraction is SPEC-003.
+SECTION_EXTRACTABLE_FORM_TYPES: list[str] = [TENK_FORM_TYPE, TENQ_FORM_TYPE]
 
 # SEC Fair Access policy requires an identifying User-Agent on every request.
 # Format: "Name email@example.com". Read from the environment so no personal
@@ -62,3 +68,29 @@ PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 DATA_DIR: Path = PROJECT_ROOT / "data"
 DB_PATH: Path = DATA_DIR / "app.db"
 RAW_ARCHIVE_DIR: Path = DATA_DIR / "raw"
+
+# --- SPEC-002: manifests and section extraction ---
+
+FILING_SUMMARY_FILENAME: str = "FilingSummary.xml"
+MANIFEST_FILENAME: str = "manifest.json"
+FILING_INDEX_HTML_SUFFIX: str = "-index.html"
+
+# FilingSummary.xml MenuCategory values.
+MENUCATEGORY_COVER: str = "Cover"
+MENUCATEGORY_STATEMENTS: str = "Statements"
+MENUCATEGORY_NOTES: str = "Notes"
+MENUCATEGORY_POLICIES: str = "Policies"
+MENUCATEGORY_TABLES: str = "Tables"
+MENUCATEGORY_DETAILS: str = "Details"
+
+# Reports in these categories are extracted to `sections`; everything else
+# (Cover, Tables, Details) is skipped -- see SPEC-002 R2.
+SECTION_MENUCATEGORIES: list[str] = [
+    MENUCATEGORY_STATEMENTS,
+    MENUCATEGORY_NOTES,
+    MENUCATEGORY_POLICIES,
+]
+
+# SEC-declared document type (from the filing index's Document Format Files
+# table) identifying an earnings press release exhibit -- see ARCHITECTURE.md §3.6.
+EXHIBIT_991_TYPE: str = "EX-99.1"
