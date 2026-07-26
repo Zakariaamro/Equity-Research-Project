@@ -1,0 +1,23 @@
+[project]
+name = "edgar"
+version = "0.1.0"
+description = "Automated SEC filing monitor, ingestion, and analysis pipeline"
+requires-python = ">=3.11"
+dependencies = [
+    # SEC requires custom User-Agent, timeouts, and retry handling on every
+    # request; requests gives us that ergonomically. stdlib urllib would work
+    # but makes edgar_client.py substantially more verbose for no benefit.
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["edgar*"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

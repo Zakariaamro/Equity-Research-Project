@@ -1,0 +1,54 @@
+{
+  "_comment": "Hand-built fixture for edge-case coverage (form filtering, 8-K item resolution incl. fallback). CIK matches AMZN in config.WATCHLIST. Real accession numbers 0001018724-26-000004 / -000014 / -000002 are genuine SEC filings (see amzn_submissions.json); the remaining synthetic accessions do not correspond to real filings and exist only to exercise edge cases.",
+  "cik": "1018724",
+  "filings": {
+    "recent": {
+      "form": ["4", "10-K", "10-Q", "8-K", "8-K", "8-K", "8-K", "S-8", "8-K"],
+      "accessionNumber": [
+        "0000000000-26-000001",
+        "0001018724-26-000004",
+        "0001018724-26-000014",
+        "0001018724-26-000002",
+        "0001018724-25-000999",
+        "0001018724-25-000998",
+        "0001018724-25-000997",
+        "0001018724-25-000996",
+        "0001018724-25-000995"
+      ],
+      "filingDate": [
+        "2026-01-01",
+        "2026-02-06",
+        "2026-04-30",
+        "2026-02-05",
+        "2025-09-01",
+        "2025-08-01",
+        "2025-07-01",
+        "2025-06-01",
+        "2025-05-01"
+      ],
+      "reportDate": [
+        "",
+        "2025-12-31",
+        "2026-03-31",
+        "2026-02-05",
+        "2025-09-01",
+        "2025-08-01",
+        "2025-07-01",
+        "",
+        "2025-05-01"
+      ],
+      "items": ["", "", "", "2.02,9.01", "", "5.02", "", "", "9.01, 2.02"],
+      "primaryDocument": [
+        "form4.xml",
+        "amzn-20251231.htm",
+        "amzn-20260331.htm",
+        "amzn-20260205.htm",
+        "amzn-20250901.htm",
+        "amzn-20250801.htm",
+        "amzn-20250701.htm",
+        "s8.htm",
+        "amzn-20250501.htm"
+      ]
+    }
+  }
+}

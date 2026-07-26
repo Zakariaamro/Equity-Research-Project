@@ -1,11 +1,14 @@
 # Equity Research Platform — Architecture
 
-**Version:** 1.1
-**Date:** 2026-07-25
+**Version:** 1.2
+**Date:** 2026-07-26
 **Owner:** Zakaria
 **Status:** Approved for V1 implementation
 
 **Changelog**
+- v1.2 — §3.3 8-K `items` field confirmed populated (was unverified). Archiving vs.
+  analysis scope boundary made explicit: archiving unbounded, analysis bounded by a
+  configurable start date (arrives with the spec that needs it).
 - v1.1 — Watchlist set to AMZN / NVDA / MU with verified CIKs and fiscal year ends.
   Raw archive policy clarified. Retry parameters specified. Q4 reporting note added.
 - v1.0 — Initial architecture.
@@ -105,9 +108,11 @@ four per year per company.
 **Rule:** ingest 8-Ks only when Item 2.02 is present. **The substantive content is in
 Exhibit 99.1, not the 8-K body** — see §4.1.
 
-*Unverified:* the `items` field in the EDGAR submissions API is expected to carry
-8-K item numbers (e.g. `"2.02,9.01"`). Confirm during implementation; if absent,
-fall back to the filing index. Exclude only if both sources yield nothing.
+**Verified (SPEC-001 implementation):** the `items` field in the EDGAR submissions API
+IS populated, confirmed against live AMZN, NVDA, and MU data (e.g. `"2.02,9.01"`). The
+filing-index-page fallback is retained anyway, as insurance against any filing where
+the submissions JSON's `items` value is blank — exclude only if both sources yield
+nothing.
 
 ### 3.4 Filter at the source
 
@@ -151,6 +156,15 @@ Rationale: R-files are SEC renderings derived from the primary document plus its
 regenerable, so archiving them is duplication. Exhibit 99.1 is genuinely separate content
 and is the *only* place guidance appears; an 8-K archived without it is worthless.
 8-K filings are small, so archiving them wholesale costs little.
+
+**Archiving is unbounded. LLM analysis is not.** Discovery and archival run over a
+company's full filing history with no date floor — archiving is free (SEC hosting,
+no API cost) and unbounded history is valuable test material for later specs.
+Analysis is different: it calls a paid LLM per section, and an unbounded first run
+would walk the *entire* filing history and consume the whole project budget in one
+pass. Analysis must therefore be bounded by a configurable start date. That config
+key is not added in SPEC-001 — it arrives with the spec that introduces `analyze.py`,
+since nothing consumes it yet.
 
 **Accepted debt (time-boxed, deliberate):**
 - SQLite-in-git does not scale past a handful of companies. Fine at V1 size.
@@ -384,3 +398,4 @@ write `NULL` — never a guess.
 | 8 | Watchlist AMZN / NVDA / MU | AI-infrastructure basket; three distinct fiscal calendars stress the design correctly | 2026-07-25 |
 | 9 | Archive original content, not SEC renderings | Ex-99.1 is unique and essential; R-files are regenerable | 2026-07-25 |
 | 10 | Build against Amazon first | Only watchlist member expected to file during the build window | 2026-07-25 |
+| 11 | Archiving unbounded; LLM analysis bounded by a configurable start date | Archiving is free and unbounded history is useful test material; unbounded analysis would burn the entire LLM budget on one run | 2026-07-26 |
