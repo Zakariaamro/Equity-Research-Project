@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import shutil
 import sqlite3
 import sys
 
-from edgar import config, db, fetch, monitor, sections
+from edgar import config, db, fetch, monitor, section_store, sections
 from edgar.edgar_client import EdgarClient
 from edgar.monitor import DiscoveredFiling
 
@@ -153,6 +154,26 @@ def cmd_backfill_manifests(args: argparse.Namespace) -> None:
         conn.close()
 
 
+def cmd_migrate_sections(args: argparse.Namespace) -> None:
+    conn = db.get_connection()
+    try:
+        if not args.dry_run and section_store.needs_migration(conn):
+            if not config.DB_PATH.exists():
+                raise SystemExit(f"No database at {config.DB_PATH}")
+            backup_path = config.DB_PATH.with_name(config.DB_PATH.name + config.DB_BACKUP_SUFFIX)
+            shutil.copy2(config.DB_PATH, backup_path)
+            print(f"Backed up {config.DB_PATH} -> {backup_path}")
+
+        try:
+            report = section_store.migrate_sections(conn, dry_run=args.dry_run)
+        except (section_store.SqliteTooOldError, section_store.MigrationAbortedError) as exc:
+            raise SystemExit(str(exc)) from exc
+
+        print(report.summary())
+    finally:
+        conn.close()
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     conn = db.get_connection()
     try:
@@ -201,6 +222,16 @@ def build_parser() -> argparse.ArgumentParser:
         "backfill-manifests", help="Generate manifest.json for already-archived filings"
     )
 
+    p_migrate = sub.add_parser(
+        "migrate-sections",
+        help="One-time: move sections.text to content-addressed storage, drop the column",
+    )
+    p_migrate.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be written and verified, without writing files or touching the schema",
+    )
+
     sub.add_parser("status", help="Summarize filings by company, form, and status")
 
     return parser
@@ -219,6 +250,8 @@ def main(argv: list[str] | None = None) -> int:
         cmd_extract(args)
     elif args.command == "backfill-manifests":
         cmd_backfill_manifests(args)
+    elif args.command == "migrate-sections":
+        cmd_migrate_sections(args)
     elif args.command == "status":
         cmd_status(args)
 

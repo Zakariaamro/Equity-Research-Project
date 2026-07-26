@@ -1,11 +1,16 @@
 # Equity Research Platform — Architecture
 
-**Version:** 1.4
+**Version:** 1.5
 **Date:** 2026-07-26
 **Owner:** Zakaria
 **Status:** Approved for V1 implementation
 
 **Changelog**
+- v1.5 — SPEC-003: `sections.text` moved out of SQLite into content-addressed files at
+  `data/sections/{hash[:2]}/{hash}.txt.gz`; §6 `sections` schema drops the `text` column,
+  `text_hash` becomes the sole link to content. §4 gains a note that this stops future
+  repo growth but does not reclaim space already spent in `.git` history. Decision log
+  entry 12 added.
 - v1.4 — §3.7 added: R-files are served wrapped in an SGML `<DOCUMENT>...<TEXT>...
   </TEXT></DOCUMENT>` envelope, not bare HTML, confirmed against AMZN 10-K
   `0001018724-26-000004`'s `R18.htm`. `html_text.py` now strips this explicitly instead
@@ -237,6 +242,14 @@ since nothing consumes it yet.
 - GitHub Actions cron drifts 5–30 minutes. Irrelevant given filings are analysed within hours.
 - Streamlit Community Cloud apps are public. All source data is public; no secrets in the DB.
 
+**Note (SPEC-003):** section text was moved out of `app.db` into content-addressed files
+under `data/sections/` (§6) specifically because it was the dominant contributor to the
+33.7 MB `app.db` committed after SPEC-002. This stops *future* growth from repeating that
+pattern — it does not shrink `.git` history already spent on the pre-migration `app.db`
+blobs committed during SPEC-001 and SPEC-002. Reclaiming that would require a history
+rewrite, deliberately out of scope; the existing `.git` directory stays at its
+pre-migration size permanently.
+
 ---
 
 ## 5. Module Layout
@@ -305,8 +318,7 @@ CREATE TABLE sections (
     short_name    TEXT NOT NULL,         -- 'Income Taxes'
     source_file   TEXT,                  -- 'R14.htm' | 'primary'
     position      INTEGER,
-    text          TEXT NOT NULL,         -- cleaned plain text
-    text_hash     TEXT NOT NULL,         -- sha256, used as cache key
+    text_hash     TEXT NOT NULL,         -- sha256 of cleaned plain text; sole link to content
     UNIQUE(accession_no, category, short_name, source_file)
 );
 
@@ -369,6 +381,21 @@ CREATE TABLE findings (
     created_at   TEXT NOT NULL
 );
 ```
+
+### Note on `sections.text` (removed in SPEC-003)
+
+Cleaned section text is not stored in the database. It lives in gzipped,
+content-addressed files at `data/sections/{hash[:2]}/{hash}.txt.gz`, keyed by
+`text_hash`. The file path is never stored — it is derivable from the hash, and storing
+it would let the two disagree. `text_hash` is therefore not just a cache key (as it was
+under SPEC-002) but the sole link between a row and its content.
+
+Why: SQLite files don't delta-compress in git, and section text was ~32 MB of the 33.7 MB
+`app.db` committed after SPEC-002. Text is immutable — a filed note never changes — so it
+belongs in the same class of storage as `data/raw/`, not in the one file rewritten on
+every pipeline run. See SPEC-003 and the §4.1 note above. This is the reasoning future
+specs should follow when deciding where something belongs: **keep mutable state small;
+make large, immutable data content-addressed and out of the database.**
 
 ### Why these columns exist
 
@@ -471,3 +498,4 @@ write `NULL` — never a guess.
 | 9 | Archive original content, not SEC renderings | Ex-99.1 is unique and essential; R-files are regenerable | 2026-07-25 |
 | 10 | Build against Amazon first | Only watchlist member expected to file during the build window | 2026-07-25 |
 | 11 | Archiving unbounded; LLM analysis bounded by a configurable start date | Archiving is free and unbounded history is useful test material; unbounded analysis would burn the entire LLM budget on one run | 2026-07-26 |
+| 12 | Section text moved out of SQLite into content-addressed files (`data/sections/`); `sections.text_hash` is the sole link | Mutable state (`app.db`, rewritten every run) must stay small; large, immutable data belongs outside it, one write ever, mirroring `data/raw/` | 2026-07-26 |

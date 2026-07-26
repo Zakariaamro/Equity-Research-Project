@@ -68,6 +68,7 @@ PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 DATA_DIR: Path = PROJECT_ROOT / "data"
 DB_PATH: Path = DATA_DIR / "app.db"
 RAW_ARCHIVE_DIR: Path = DATA_DIR / "raw"
+SECTIONS_DIR: Path = DATA_DIR / "sections"
 
 # --- SPEC-002: manifests and section extraction ---
 
@@ -94,3 +95,11 @@ SECTION_MENUCATEGORIES: list[str] = [
 # SEC-declared document type (from the filing index's Document Format Files
 # table) identifying an earnings press release exhibit -- see ARCHITECTURE.md §3.6.
 EXHIBIT_991_TYPE: str = "EX-99.1"
+
+# --- SPEC-003: content-addressed section storage ---
+
+# ALTER TABLE ... DROP COLUMN requires this SQLite version or newer.
+MIN_SQLITE_VERSION_INFO: tuple[int, int, int] = (3, 35, 0)
+
+SECTION_STORE_SUFFIX: str = ".txt.gz"
+DB_BACKUP_SUFFIX: str = ".pre-migration.bak"

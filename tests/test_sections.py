@@ -14,7 +14,7 @@ import hashlib
 
 import pytest
 
-from edgar import db, sections
+from edgar import db, section_store, sections
 from edgar.edgar_client import EdgarNotFoundError
 from tests.conftest import FIXTURES_DIR
 
@@ -120,11 +120,12 @@ def test_income_taxes_text_has_intact_figures_and_no_markup(conn, archive_dir):
     sections.extract_filing(conn, client, ACCESSION)
 
     row = conn.execute(
-        "SELECT text FROM sections WHERE short_name = 'Income Taxes'"
+        "SELECT text_hash FROM sections WHERE short_name = 'Income Taxes'"
     ).fetchone()
     assert row is not None
-    assert "<" not in row["text"]
-    assert "$7.1 billion" in row["text"]
+    text = section_store.read_section_text(row["text_hash"])
+    assert "<" not in text
+    assert "$7.1 billion" in text
 
 
 def test_apostrophe_shortname_roundtrip(conn, archive_dir):
@@ -145,9 +146,10 @@ def test_text_hash_is_stable_across_whitespace_only_html_changes(conn, archive_d
     sections.extract_filing(conn, client, ACCESSION)
 
     row = conn.execute(
-        "SELECT text, text_hash FROM sections WHERE short_name = 'Income Taxes'"
+        "SELECT text_hash FROM sections WHERE short_name = 'Income Taxes'"
     ).fetchone()
-    assert row["text_hash"] == hashlib.sha256(row["text"].encode("utf-8")).hexdigest()
+    text = section_store.read_section_text(row["text_hash"])
+    assert row["text_hash"] == hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     # Re-extract from HTML with every existing newline doubled -- more
     # incidental whitespace, same content. (Padding before literal "<td"
@@ -239,6 +241,37 @@ def test_empty_extracted_text_writes_no_row(conn, archive_dir):
         "SELECT * FROM sections WHERE short_name = 'Consolidated Statements of Cash Flows'"
     ).fetchone()
     assert row is None
+
+
+def test_extract_writes_hash_only(conn, archive_dir):
+    insert_10k(conn, archive_dir)
+    sections.extract_filing(conn, FakeSectionsClient(), ACCESSION)
+
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(sections)")}
+    assert "text" not in columns
+
+    rows = conn.execute("SELECT text_hash FROM sections").fetchall()
+    assert rows
+    for row in rows:
+        assert row["text_hash"]
+        assert section_store.read_section_text(row["text_hash"])  # readable, no error
+
+
+def test_write_section_skips_db_write_when_hash_unchanged(conn, archive_dir):
+    insert_10k(conn, archive_dir)
+    report = sections.ReportRef(
+        short_name="Income Taxes", category="Notes", html_file_name="R18.htm", position=1
+    )
+    text = "Some income taxes text, unchanged across re-extraction."
+
+    sections._write_section(conn, ACCESSION, report, text)
+    conn.commit()
+
+    changes_before = conn.total_changes
+    sections._write_section(conn, ACCESSION, report, text)  # identical text again
+    changes_after = conn.total_changes
+
+    assert changes_after == changes_before  # no INSERT/UPDATE executed at all
 
 
 def test_8k_is_skipped_entirely(conn, tmp_path):

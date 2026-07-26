@@ -7,14 +7,13 @@ Factors, and Exhibit 99.1 extraction are SPEC-003 -- not this module.
 from __future__ import annotations
 
 import gzip
-import hashlib
 import logging
 import sqlite3
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
-from edgar import config
+from edgar import config, section_store
 from edgar.edgar_client import EdgarClient, EdgarError, EdgarNotFoundError
 from edgar.html_text import html_to_text
 
@@ -58,19 +57,33 @@ def _select_reports(filing_summary_xml: bytes) -> list[ReportRef]:
     return reports
 
 
-def _text_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
 def _write_section(conn: sqlite3.Connection, accession_no: str, report: ReportRef, text: str) -> None:
+    """Write text to the content-addressed store and record only the hash.
+
+    If a row for this (accession_no, category, short_name, source_file) already
+    carries the same hash, the DB write is skipped entirely -- re-extracting
+    identical text changes no row (SPEC-003 R5). Only a changed hash touches
+    the table.
+    """
+    text_hash = section_store.write_section_text(text)
+
+    existing = conn.execute(
+        """
+        SELECT text_hash FROM sections
+        WHERE accession_no = ? AND category = ? AND short_name = ? AND source_file = ?
+        """,
+        (accession_no, report.category, report.short_name, report.html_file_name),
+    ).fetchone()
+    if existing is not None and existing["text_hash"] == text_hash:
+        return
+
     conn.execute(
         """
         INSERT INTO sections (
-            accession_no, category, short_name, source_file, position, text, text_hash
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            accession_no, category, short_name, source_file, position, text_hash
+        ) VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(accession_no, category, short_name, source_file) DO UPDATE SET
             position = excluded.position,
-            text = excluded.text,
             text_hash = excluded.text_hash
         """,
         (
@@ -79,8 +92,7 @@ def _write_section(conn: sqlite3.Connection, accession_no: str, report: ReportRe
             report.short_name,
             report.html_file_name,
             report.position,
-            text,
-            _text_hash(text),
+            text_hash,
         ),
     )
 

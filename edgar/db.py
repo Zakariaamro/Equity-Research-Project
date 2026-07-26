@@ -40,7 +40,6 @@ CREATE TABLE IF NOT EXISTS sections (
     short_name    TEXT NOT NULL,
     source_file   TEXT,
     position      INTEGER,
-    text          TEXT NOT NULL,
     text_hash     TEXT NOT NULL,
     UNIQUE(accession_no, category, short_name, source_file)
 );
