@@ -1,0 +1,1116 @@
+"""Compute financial metrics from xbrl_facts (SPEC-004).
+
+Declarative registry in config.py (name, inputs, basis, plausible range,
+needs_prior) plus a small engine + primitives here. Concept alias resolution
+happens per period, never once per company (SPEC-004 R1a, ARCHITECTURE.md §6).
+Beneish/DuPont components are named exceptions per R6, each a small function
+built from the same primitives as everything else.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import sqlite3
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta
+from typing import Callable
+
+from edgar import config
+
+logger = logging.getLogger(__name__)
+
+
+# --- startup consistency checks (fail loudly at import, not silently at runtime) ---
+
+_ALIAS_TO_CANONICAL: dict[str, str] = {}
+for _canonical, _ci in config.CONCEPT_REGISTRY.items():
+    for _alias in _ci.aliases:
+        if _alias in _ALIAS_TO_CANONICAL:
+            raise RuntimeError(
+                f"XBRL alias {_alias!r} claimed by both "
+                f"{_ALIAS_TO_CANONICAL[_alias]!r} and {_canonical!r} -- "
+                "every alias must belong to exactly one canonical input"
+            )
+        _ALIAS_TO_CANONICAL[_alias] = _canonical
+
+for _name, _mdef in config.METRIC_REGISTRY.items():
+    for _input in _mdef.inputs:
+        if _input not in config.CONCEPT_REGISTRY:
+            raise RuntimeError(
+                f"Metric {_name!r} declares input {_input!r}, which is not in CONCEPT_REGISTRY"
+            )
+
+
+@dataclass(frozen=True)
+class Fact:
+    value: float
+    concept: str
+    filed_date: str | None
+    duration_days: int | None
+
+
+@dataclass(frozen=True)
+class MetricResult:
+    value: float | None
+    inputs_used: dict[str, float] = field(default_factory=dict)
+    formula: str = ""
+    null_reason: str | None = None
+
+
+def _record(inputs_used: dict[str, float], alias: str | None, value: float | None, suffix: str = "") -> None:
+    if alias is not None and value is not None:
+        inputs_used[f"{alias}{suffix}"] = value
+
+
+def _classify_duration(days: int | None) -> str:
+    if days is None:
+        return config.PERIOD_CLASS_INSTANT
+    for dc in config.PERIOD_CLASSES:
+        if dc.min_days <= days <= dc.max_days:
+            return dc.name
+    return config.PERIOD_CLASS_OTHER
+
+
+def _classes_for_basis(basis: str) -> tuple[str, ...]:
+    if basis == "annual":
+        return ("annual",)
+    if basis == "quarterly":
+        return ("quarterly",)
+    if basis == "both":
+        return ("annual", "quarterly")
+    raise ValueError(f"Unknown basis {basis!r}")
+
+
+# --- loading facts, restatement selection (SPEC-004 R4) ---
+
+
+def _load_facts(conn: sqlite3.Connection, cik: str) -> dict[str, dict[tuple[str | None, str], Fact]]:
+    """concept -> {(period_start, period_end): Fact}, latest filed_date wins per period."""
+    rows = conn.execute(
+        "SELECT concept, period_start, period_end, value, filed_date, duration_days "
+        "FROM xbrl_facts WHERE cik = ?",
+        (cik,),
+    ).fetchall()
+    by_concept: dict[str, dict[tuple[str | None, str], Fact]] = {}
+    for row in rows:
+        key = (row["period_start"], row["period_end"])
+        bucket = by_concept.setdefault(row["concept"], {})
+        existing = bucket.get(key)
+        if existing is None or (row["filed_date"] or "") >= (existing.filed_date or ""):
+            bucket[key] = Fact(row["value"], row["concept"], row["filed_date"], row["duration_days"])
+    return by_concept
+
+
+def _real_fiscal_period_ends(conn: sqlite3.Connection, cik: str) -> tuple[set[str], set[str]]:
+    """(annual_ends, quarterly_ends) from filings.period_end -- the authoritative set.
+
+    SPEC-004 R3a: a 350-380 day duration is not sufficient to identify a real
+    fiscal year-end -- Amazon directly tags an implicit Q4 (a genuine 3-month
+    fact ending on the fiscal year-end date) for several concepts, which is
+    not itself a fiscal year-end. filings.period_end comes from the SEC
+    submissions API, not from duration arithmetic, and is authoritative.
+    """
+    annual: set[str] = set()
+    quarterly: set[str] = set()
+    rows = conn.execute(
+        "SELECT form_type, period_end FROM filings WHERE cik = ? AND period_end IS NOT NULL", (cik,)
+    ).fetchall()
+    for row in rows:
+        if row["form_type"] == config.TENK_FORM_TYPE:
+            annual.add(row["period_end"])
+        elif row["form_type"] == config.TENQ_FORM_TYPE:
+            quarterly.add(row["period_end"])
+    return annual, quarterly
+
+
+def _build_periods_by_class(
+    facts_by_concept: dict[str, dict[tuple[str | None, str], Fact]],
+    real_annual_ends: set[str],
+    real_quarterly_ends: set[str],
+) -> dict[str, set[tuple[str, str]]]:
+    periods: dict[str, set[tuple[str, str]]] = {}
+    for concept, bucket in facts_by_concept.items():
+        canonical = _ALIAS_TO_CANONICAL.get(concept)
+        if canonical is None or config.CONCEPT_REGISTRY[canonical].instant:
+            continue
+        for (start, end), fact in bucket.items():
+            if start is None:
+                continue
+            cls = _classify_duration(fact.duration_days)
+            if cls == "annual" and end not in real_annual_ends:
+                continue
+            if cls == "quarterly" and end not in real_quarterly_ends:
+                continue
+            periods.setdefault(cls, set()).add((start, end))
+    return periods
+
+
+# --- per-period alias resolution (SPEC-004 R1a) ---
+
+
+def _resolve(
+    canonical: str,
+    facts_by_concept: dict[str, dict[tuple[str | None, str], Fact]],
+    period_start: str | None,
+    period_end: str,
+) -> tuple[float | None, str | None]:
+    """Try each alias in priority order; the first with a value for THIS exact
+    period wins. Never resolved once for a company's whole history."""
+    ci = config.CONCEPT_REGISTRY[canonical]
+    key = (None, period_end) if ci.instant else (period_start, period_end)
+    for alias in ci.aliases:
+        bucket = facts_by_concept.get(alias)
+        if bucket and key in bucket:
+            return bucket[key].value, alias
+    return None, None
+
+
+def _resolve_gross_profit(
+    facts_by_concept: dict, start: str, end: str
+) -> tuple[float | None, str, dict[str, float]]:
+    """(value, formula fragment, inputs_used) -- direct GrossProfit, else revenue - cogs."""
+    inputs_used: dict[str, float] = {}
+    val, alias = _resolve("gross_profit", facts_by_concept, start, end)
+    if val is not None:
+        _record(inputs_used, alias, val)
+        return val, alias, inputs_used
+    rev, rev_alias = _resolve("revenue", facts_by_concept, start, end)
+    cogs, cogs_alias = _resolve("cogs", facts_by_concept, start, end)
+    _record(inputs_used, rev_alias, rev)
+    _record(inputs_used, cogs_alias, cogs)
+    if rev is None or cogs is None:
+        return None, "gross_profit", inputs_used
+    return rev - cogs, f"({rev_alias} - {cogs_alias})", inputs_used
+
+
+def _resolve_ppe_net(facts_by_concept: dict, end: str) -> tuple[float | None, str | None, dict[str, float]]:
+    """(value, alias-or-note, inputs_used) -- pure ppe_net, else the broader
+    ppe_and_lease_net (SPEC-004 R1d: a separate canonical input, not an alias;
+    Micron folds finance-lease ROU assets into this line from FY2021)."""
+    inputs_used: dict[str, float] = {}
+    val, alias = _resolve("ppe_net", facts_by_concept, None, end)
+    if val is not None:
+        _record(inputs_used, alias, val)
+        return val, alias, inputs_used
+    broad, broad_alias = _resolve("ppe_and_lease_net", facts_by_concept, None, end)
+    if broad is not None:
+        _record(inputs_used, broad_alias, broad)
+        return broad, f"{broad_alias} [ppe_net absent, fell back to ppe_and_lease_net]", inputs_used
+    return None, None, inputs_used
+
+
+def _resolve_depreciation(
+    facts_by_concept: dict, start: str, end: str
+) -> tuple[float | None, str | None, dict[str, float]]:
+    """(value, alias-or-note, inputs_used) -- pure depreciation, else dep_amort (DD&A)
+    (SPEC-004 R1f: a separate canonical input, not an alias; DD&A differs from pure
+    depreciation by 20-40% -- it also includes amortization of intangibles)."""
+    inputs_used: dict[str, float] = {}
+    val, alias = _resolve("depreciation", facts_by_concept, start, end)
+    if val is not None:
+        _record(inputs_used, alias, val)
+        return val, alias, inputs_used
+    da, da_alias = _resolve("dep_amort", facts_by_concept, start, end)
+    if da is not None:
+        _record(inputs_used, da_alias, da)
+        return da, f"{da_alias} [pure depreciation absent, fell back to dep_amort]", inputs_used
+    return None, None, inputs_used
+
+
+def _resolve_borrowings(facts_by_concept: dict, end: str) -> tuple[float | None, str, dict[str, float]]:
+    """(value, formula fragment, inputs_used) -- combined tag preferred, else sum components.
+
+    "Borrowings" only -- notes, term loans, bonds. Finance leases are a
+    separate, additive component; see _resolve_total_debt.
+    """
+    inputs_used: dict[str, float] = {}
+    val, alias = _resolve("total_debt", facts_by_concept, None, end)
+    if val is not None:
+        _record(inputs_used, alias, val)
+        return val, alias, inputs_used
+    dn, dn_alias = _resolve("debt_noncurrent", facts_by_concept, None, end)
+    dc, dc_alias = _resolve("debt_current", facts_by_concept, None, end)
+    _record(inputs_used, dn_alias, dn)
+    _record(inputs_used, dc_alias, dc)
+    if dn is not None and dc is not None:
+        return dn + dc, f"({dn_alias} + {dc_alias}) [no combined tag for period]", inputs_used
+    return None, "borrowings", inputs_used
+
+
+def _resolve_total_debt(facts_by_concept: dict, end: str) -> tuple[float | None, str, dict[str, float]]:
+    """(value, formula fragment, inputs_used) -- borrowings + finance lease liabilities.
+
+    SPEC-004 R1b/R1h: Micron's real "Long-term debt" balance sheet line is
+    borrowings (LongTermDebt) PLUS FinanceLeaseLiabilityNoncurrent, not
+    borrowings alone. `borrowings` is a primary measure: NULL if absent,
+    same as ever. Finance lease liabilities are different -- an additive
+    component of a total the filer is REQUIRED to disclose under ASC 842,
+    so an absent one is treated as $0, not NULL (confirmed live: NVIDIA
+    tags OperatingLeaseLiability{Noncurrent,Current} but never
+    FinanceLeaseLiability{Noncurrent,Current} -- it has none, this is not
+    an ingestion gap). `formula` records whether each component was
+    observed or assumed zero, so the distinction stays visible.
+    """
+    borrowings, borrowings_note, inputs_used = _resolve_borrowings(facts_by_concept, end)
+    if borrowings is None:
+        return None, borrowings_note, inputs_used
+    fl_nc, fl_nc_alias = _resolve("finance_lease_liability_noncurrent", facts_by_concept, None, end)
+    fl_c, fl_c_alias = _resolve("finance_lease_liability_current", facts_by_concept, None, end)
+    if fl_nc is not None:
+        _record(inputs_used, fl_nc_alias, fl_nc)
+        fl_nc_term = fl_nc_alias
+    else:
+        fl_nc_term = "finance_lease_liability_noncurrent=$0 [assumed, ASC 842]"
+    if fl_c is not None:
+        _record(inputs_used, fl_c_alias, fl_c)
+        fl_c_term = fl_c_alias
+    else:
+        fl_c_term = "finance_lease_liability_current=$0 [assumed, ASC 842]"
+    total = borrowings + (fl_nc or 0.0) + (fl_c or 0.0)
+    note = f"({borrowings_note} + {fl_nc_term} + {fl_c_term})"
+    return total, note, inputs_used
+
+
+# --- fiscal-period prior-period matching (SPEC-004 R9: fiscal, never calendar) ---
+
+_YOY_OFFSET_DAYS = 365
+_YOY_TOLERANCE_DAYS = 20
+_QOQ_OFFSET_DAYS = 91
+_QOQ_TOLERANCE_DAYS = 15
+
+
+def _find_prior(
+    candidates: set[tuple[str, str]],
+    current_start: str,
+    current_end: str,
+    offset_days: int,
+    tolerance_days: int,
+) -> tuple[str, str] | None:
+    """Closest same-duration-class period to (current_end - offset_days), within tolerance.
+
+    Matches on fiscal alignment (same duration class, end date closest to the
+    target offset) rather than calendar dates or the API's fy/fp fields --
+    both NVIDIA and Micron have floating 52/53-week years, so a fixed
+    365-day subtraction with a tight tolerance would miss real prior periods.
+    """
+    current_end_date = date.fromisoformat(current_end)
+    target = current_end_date - timedelta(days=offset_days)
+    best: tuple[str, str] | None = None
+    best_diff: int | None = None
+    for start, end in candidates:
+        if (start, end) == (current_start, current_end):
+            continue
+        diff = abs((date.fromisoformat(end) - target).days)
+        if diff <= tolerance_days and (best_diff is None or diff < best_diff):
+            best, best_diff = (start, end), diff
+    return best
+
+
+def _find_prior_yoy(candidates: set[tuple[str, str]], start: str, end: str) -> tuple[str, str] | None:
+    return _find_prior(candidates, start, end, _YOY_OFFSET_DAYS, _YOY_TOLERANCE_DAYS)
+
+
+def _find_prior_qoq(candidates: set[tuple[str, str]], start: str, end: str) -> tuple[str, str] | None:
+    return _find_prior(candidates, start, end, _QOQ_OFFSET_DAYS, _QOQ_TOLERANCE_DAYS)
+
+
+# --- generic primitives for simple ratios and YoY-style growth metrics ---
+
+
+def _simple_ratio(num_canonical: str, den_canonical: str, guard: Callable[[float, float], str | None] | None = None):
+    def compute(facts, periods_by_class, start, end, cls) -> MetricResult:
+        num_ci = config.CONCEPT_REGISTRY[num_canonical]
+        den_ci = config.CONCEPT_REGISTRY[den_canonical]
+        num, num_alias = _resolve(num_canonical, facts, None if num_ci.instant else start, end)
+        den, den_alias = _resolve(den_canonical, facts, None if den_ci.instant else start, end)
+        inputs_used: dict[str, float] = {}
+        _record(inputs_used, num_alias, num)
+        _record(inputs_used, den_alias, den)
+        formula = f"{num_alias or num_canonical} / {den_alias or den_canonical}"
+        if num is None:
+            return MetricResult(None, inputs_used, formula, f"{num_canonical} missing")
+        if den is None:
+            return MetricResult(None, inputs_used, formula, f"{den_canonical} missing")
+        if den == 0:
+            return MetricResult(None, inputs_used, formula, f"{den_canonical} is zero")
+        if guard is not None:
+            reason = guard(num, den)
+            if reason:
+                return MetricResult(None, inputs_used, formula, reason)
+        return MetricResult(num / den, inputs_used, formula, None)
+
+    return compute
+
+
+def _yoy_metric(canonical: str, prior_finder, extra_guard: Callable[[float], str | None] | None = None):
+    def compute(facts, periods_by_class, start, end, cls) -> MetricResult:
+        prior = prior_finder(periods_by_class.get(cls, set()), start, end)
+        cur, cur_alias = _resolve(canonical, facts, start, end)
+        inputs_used: dict[str, float] = {}
+        _record(inputs_used, cur_alias, cur, "_t")
+        base_formula = f"{cur_alias or canonical}_t / {canonical}_t-1 - 1"
+        if prior is None:
+            return MetricResult(None, inputs_used, base_formula, "prior period not found")
+        p_start, p_end = prior
+        prev, prev_alias = _resolve(canonical, facts, p_start, p_end)
+        _record(inputs_used, prev_alias, prev, "_t-1")
+        formula = f"{cur_alias or canonical}_t / {prev_alias or canonical}_t-1 - 1"
+        if cur is None:
+            return MetricResult(None, inputs_used, formula, f"{canonical} missing (current period)")
+        if prev is None:
+            return MetricResult(None, inputs_used, formula, f"{canonical} missing (prior period)")
+        if extra_guard is not None:
+            reason = extra_guard(prev)
+            if reason:
+                return MetricResult(None, inputs_used, formula, reason)
+        if prev == 0:
+            return MetricResult(None, inputs_used, formula, "prior value is zero")
+        return MetricResult(cur / prev - 1, inputs_used, formula, None)
+
+    return compute
+
+
+def _ratio_of_ratios_index(num_canonical: str, den_canonical: str):
+    """(num/den)_t / (num/den)_t-1 -- DSRI and SGAI both match this shape exactly."""
+
+    def compute(facts, periods_by_class, start, end, cls) -> MetricResult:
+        prior = _find_prior_yoy(periods_by_class.get("annual", set()), start, end)
+        formula_stub = f"({num_canonical}/{den_canonical})_t / same_t-1"
+        if prior is None:
+            return MetricResult(None, {}, formula_stub, "prior period not found")
+        p_start, p_end = prior
+        num_ci = config.CONCEPT_REGISTRY[num_canonical]
+        den_ci = config.CONCEPT_REGISTRY[den_canonical]
+        n_t, n_t_alias = _resolve(num_canonical, facts, None if num_ci.instant else start, end)
+        d_t, d_t_alias = _resolve(den_canonical, facts, None if den_ci.instant else start, end)
+        n_p, n_p_alias = _resolve(num_canonical, facts, None if num_ci.instant else p_start, p_end)
+        d_p, d_p_alias = _resolve(den_canonical, facts, None if den_ci.instant else p_start, p_end)
+        inputs_used: dict[str, float] = {}
+        _record(inputs_used, n_t_alias, n_t, "_t")
+        _record(inputs_used, d_t_alias, d_t, "_t")
+        _record(inputs_used, n_p_alias, n_p, "_t-1")
+        _record(inputs_used, d_p_alias, d_p, "_t-1")
+        formula = (
+            f"({n_t_alias or num_canonical}_t/{d_t_alias or den_canonical}_t) / "
+            f"({n_p_alias or num_canonical}_t-1/{d_p_alias or den_canonical}_t-1)"
+        )
+        if n_t is None or d_t is None or n_p is None or d_p is None:
+            return MetricResult(None, inputs_used, formula, f"{num_canonical} or {den_canonical} missing in t or t-1")
+        if d_t == 0 or d_p == 0:
+            return MetricResult(None, inputs_used, formula, f"{den_canonical} is zero in t or t-1")
+        ratio_t, ratio_p = n_t / d_t, n_p / d_p
+        if ratio_p == 0:
+            return MetricResult(None, inputs_used, formula, "prior-period ratio is zero")
+        return MetricResult(ratio_t / ratio_p, inputs_used, formula, None)
+
+    return compute
+
+
+# --- Growth ---
+
+_compute_revenue_yoy = _yoy_metric("revenue", _find_prior_yoy)
+_compute_revenue_qoq = _yoy_metric("revenue", _find_prior_qoq)
+_compute_operating_income_yoy = _yoy_metric(
+    "operating_income", _find_prior_yoy, extra_guard=lambda prev: "prior period <= 0" if prev <= 0 else None
+)
+_compute_eps_diluted_yoy = _yoy_metric(
+    "eps_diluted", _find_prior_yoy, extra_guard=lambda prev: "prior period <= 0" if prev <= 0 else None
+)
+
+
+def _compute_inventory_growth_less_revenue_growth(facts, periods_by_class, start, end, cls) -> MetricResult:
+    inv = _yoy_metric("inventory", _find_prior_yoy)(facts, periods_by_class, start, end, cls)
+    rev = _yoy_metric("revenue", _find_prior_yoy)(facts, periods_by_class, start, end, cls)
+    inputs_used = {**inv.inputs_used, **rev.inputs_used}
+    formula = f"({inv.formula}) - ({rev.formula})"
+    if inv.value is None:
+        return MetricResult(None, inputs_used, formula, f"inventory_yoy unavailable: {inv.null_reason}")
+    if rev.value is None:
+        return MetricResult(None, inputs_used, formula, f"revenue_yoy unavailable: {rev.null_reason}")
+    return MetricResult(inv.value - rev.value, inputs_used, formula, None)
+
+
+# --- Margins ---
+
+_compute_operating_margin = _simple_ratio("operating_income", "revenue")
+_compute_net_margin = _simple_ratio("net_income", "revenue")
+_compute_rnd_intensity = _simple_ratio("rnd_expense", "revenue")
+_compute_sga_intensity = _simple_ratio("sga_expense", "revenue")
+
+
+def _compute_gross_margin(facts, periods_by_class, start, end, cls) -> MetricResult:
+    gp, gp_note, inputs_used = _resolve_gross_profit(facts, start, end)
+    rev, rev_alias = _resolve("revenue", facts, start, end)
+    _record(inputs_used, rev_alias, rev)
+    formula = f"({gp_note}) / {rev_alias or 'revenue'}"
+    if gp is None:
+        return MetricResult(None, inputs_used, formula, "gross_profit unresolved and revenue/cogs fallback unavailable")
+    if rev is None:
+        return MetricResult(None, inputs_used, formula, "revenue missing")
+    if rev == 0:
+        return MetricResult(None, inputs_used, formula, "revenue is zero")
+    return MetricResult(gp / rev, inputs_used, formula, None)
+
+
+def _compute_ebitda(facts, periods_by_class, start, end, cls) -> MetricResult:
+    oi, oi_alias = _resolve("operating_income", facts, start, end)
+    da, da_alias = _resolve("dep_amort", facts, start, end)
+    inputs_used: dict[str, float] = {}
+    _record(inputs_used, oi_alias, oi)
+    _record(inputs_used, da_alias, da)
+    formula = f"{oi_alias or 'operating_income'} + {da_alias or 'dep_amort'}"
+    if oi is None:
+        return MetricResult(None, inputs_used, formula, "operating_income missing")
+    if da is None:
+        return MetricResult(None, inputs_used, formula, "dep_amort missing")
+    return MetricResult(oi + da, inputs_used, formula, None)
+
+
+def _compute_ebitda_margin(facts, periods_by_class, start, end, cls) -> MetricResult:
+    ebitda = _compute_ebitda(facts, periods_by_class, start, end, cls)
+    rev, rev_alias = _resolve("revenue", facts, start, end)
+    inputs_used = dict(ebitda.inputs_used)
+    _record(inputs_used, rev_alias, rev)
+    formula = f"({ebitda.formula}) / {rev_alias or 'revenue'}"
+    if ebitda.value is None:
+        return MetricResult(None, inputs_used, formula, f"ebitda unavailable: {ebitda.null_reason}")
+    if rev is None:
+        return MetricResult(None, inputs_used, formula, "revenue missing")
+    if rev == 0:
+        return MetricResult(None, inputs_used, formula, "revenue is zero")
+    return MetricResult(ebitda.value / rev, inputs_used, formula, None)
+
+
+def _compute_incremental_gross_margin(facts, periods_by_class, start, end, cls) -> MetricResult:
+    prior = _find_prior_yoy(periods_by_class.get(cls, set()), start, end)
+    if prior is None:
+        return MetricResult(None, {}, "Δgross_profit / Δrevenue", "prior period not found")
+    p_start, p_end = prior
+    gp_t, gp_t_note, inputs_t = _resolve_gross_profit(facts, start, end)
+    gp_p, gp_p_note, inputs_p = _resolve_gross_profit(facts, p_start, p_end)
+    rev_t, rev_t_alias = _resolve("revenue", facts, start, end)
+    rev_p, rev_p_alias = _resolve("revenue", facts, p_start, p_end)
+    inputs_used = {f"{k}_t": v for k, v in inputs_t.items()}
+    inputs_used.update({f"{k}_t-1": v for k, v in inputs_p.items()})
+    _record(inputs_used, rev_t_alias, rev_t, "_t")
+    _record(inputs_used, rev_p_alias, rev_p, "_t-1")
+    formula = f"(({gp_t_note})_t - ({gp_p_note})_t-1) / ({rev_t_alias or 'revenue'}_t - {rev_p_alias or 'revenue'}_t-1)"
+    if gp_t is None or gp_p is None or rev_t is None or rev_p is None:
+        return MetricResult(None, inputs_used, formula, "gross_profit or revenue missing in t or t-1")
+    delta_rev = rev_t - rev_p
+    if rev_t != 0 and abs(delta_rev) < config.INCREMENTAL_MARGIN_MIN_REVENUE_DELTA_PCT * abs(rev_t):
+        return MetricResult(None, inputs_used, formula, "|delta revenue| < 1% of revenue")
+    if delta_rev == 0:
+        return MetricResult(None, inputs_used, formula, "delta revenue is zero")
+    return MetricResult((gp_t - gp_p) / delta_rev, inputs_used, formula, None)
+
+
+# --- Returns ---
+
+_compute_effective_tax_rate = _simple_ratio("tax_expense", "pretax_income")
+_compute_roe = _simple_ratio("net_income", "equity", guard=lambda n, d: "equity is negative" if d < 0 else None)
+_compute_asset_turnover = _simple_ratio("revenue", "total_assets")
+_compute_equity_multiplier = _simple_ratio(
+    "total_assets", "equity", guard=lambda n, d: "equity is negative" if d < 0 else None
+)
+def _compute_fixed_asset_turnover(facts, periods_by_class, start, end, cls) -> MetricResult:
+    rev, rev_alias = _resolve("revenue", facts, start, end)
+    ppe, ppe_note, inputs_used = _resolve_ppe_net(facts, end)
+    _record(inputs_used, rev_alias, rev)
+    formula = f"{rev_alias or 'revenue'} / {ppe_note or 'ppe_net'}"
+    if rev is None:
+        return MetricResult(None, inputs_used, formula, "revenue missing")
+    if ppe is None:
+        return MetricResult(None, inputs_used, formula, "ppe_net and ppe_and_lease_net both missing")
+    if ppe == 0:
+        return MetricResult(None, inputs_used, formula, "ppe_net is zero")
+    return MetricResult(rev / ppe, inputs_used, formula, None)
+
+
+def _compute_nopat(facts, periods_by_class, start, end, cls) -> MetricResult:
+    oi, oi_alias = _resolve("operating_income", facts, start, end)
+    tax, tax_alias = _resolve("tax_expense", facts, start, end)
+    pretax, pretax_alias = _resolve("pretax_income", facts, start, end)
+    inputs_used: dict[str, float] = {}
+    _record(inputs_used, oi_alias, oi)
+    _record(inputs_used, tax_alias, tax)
+    _record(inputs_used, pretax_alias, pretax)
+    formula = f"{oi_alias or 'operating_income'} * (1 - {tax_alias or 'tax_expense'}/{pretax_alias or 'pretax_income'})"
+    if oi is None:
+        return MetricResult(None, inputs_used, formula, "operating_income missing")
+    if tax is None or pretax is None:
+        return MetricResult(None, inputs_used, formula, "effective_tax_rate unavailable (tax_expense or pretax_income missing)")
+    if pretax == 0:
+        return MetricResult(None, inputs_used, formula, "pretax_income is zero")
+    return MetricResult(oi * (1 - tax / pretax), inputs_used, formula, None)
+
+
+def _compute_invested_capital(facts, periods_by_class, start, end, cls) -> MetricResult:
+    debt, debt_note, inputs_used = _resolve_total_debt(facts, end)
+    equity, equity_alias = _resolve("equity", facts, None, end)
+    cash, cash_alias = _resolve("cash", facts, None, end)
+    _record(inputs_used, equity_alias, equity)
+    _record(inputs_used, cash_alias, cash)
+    formula = f"({debt_note}) + {equity_alias or 'equity'} - {cash_alias or 'cash'}"
+    if debt is None:
+        return MetricResult(None, inputs_used, formula, "total_debt unresolved (no combined tag and components incomplete)")
+    if equity is None:
+        return MetricResult(None, inputs_used, formula, "equity missing")
+    if cash is None:
+        return MetricResult(None, inputs_used, formula, "cash missing")
+    return MetricResult(debt + equity - cash, inputs_used, formula, None)
+
+
+def _compute_roic(facts, periods_by_class, start, end, cls) -> MetricResult:
+    nopat = _compute_nopat(facts, periods_by_class, start, end, cls)
+    ic = _compute_invested_capital(facts, periods_by_class, start, end, cls)
+    inputs_used = {**nopat.inputs_used, **ic.inputs_used}
+    formula = f"({nopat.formula}) / ({ic.formula})"
+    if nopat.value is None:
+        return MetricResult(None, inputs_used, formula, f"nopat unavailable: {nopat.null_reason}")
+    if ic.value is None:
+        return MetricResult(None, inputs_used, formula, f"invested_capital unavailable: {ic.null_reason}")
+    if ic.value == 0:
+        return MetricResult(None, inputs_used, formula, "invested_capital is zero")
+    return MetricResult(nopat.value / ic.value, inputs_used, formula, None)
+
+
+# --- Capital and cash ---
+
+_compute_capex_to_revenue = _simple_ratio("capex", "revenue")
+def _compute_capex_to_depreciation(facts, periods_by_class, start, end, cls) -> MetricResult:
+    capex, capex_alias = _resolve("capex", facts, start, end)
+    dep, dep_note, inputs_used = _resolve_depreciation(facts, start, end)
+    _record(inputs_used, capex_alias, capex)
+    formula = f"{capex_alias or 'capex'} / {dep_note or 'depreciation'}"
+    if capex is None:
+        return MetricResult(None, inputs_used, formula, "capex missing")
+    if dep is None:
+        return MetricResult(None, inputs_used, formula, "depreciation and dep_amort both missing")
+    if dep == 0:
+        return MetricResult(None, inputs_used, formula, "depreciation is zero")
+    return MetricResult(capex / dep, inputs_used, formula, None)
+_compute_sbc_to_revenue = _simple_ratio("sbc", "revenue")
+
+
+def _compute_free_cash_flow(facts, periods_by_class, start, end, cls) -> MetricResult:
+    cfo, cfo_alias = _resolve("cfo", facts, start, end)
+    capex, capex_alias = _resolve("capex", facts, start, end)
+    inputs_used: dict[str, float] = {}
+    _record(inputs_used, cfo_alias, cfo)
+    _record(inputs_used, capex_alias, capex)
+    formula = f"{cfo_alias or 'cfo'} - {capex_alias or 'capex'}"
+    if cfo is None:
+        return MetricResult(None, inputs_used, formula, "cfo missing")
+    if capex is None:
+        return MetricResult(None, inputs_used, formula, "capex missing")
+    return MetricResult(cfo - capex, inputs_used, formula, None)
+
+
+def _compute_fcf_margin(facts, periods_by_class, start, end, cls) -> MetricResult:
+    fcf = _compute_free_cash_flow(facts, periods_by_class, start, end, cls)
+    rev, rev_alias = _resolve("revenue", facts, start, end)
+    inputs_used = dict(fcf.inputs_used)
+    _record(inputs_used, rev_alias, rev)
+    formula = f"({fcf.formula}) / {rev_alias or 'revenue'}"
+    if fcf.value is None:
+        return MetricResult(None, inputs_used, formula, f"free_cash_flow unavailable: {fcf.null_reason}")
+    if rev is None:
+        return MetricResult(None, inputs_used, formula, "revenue missing")
+    if rev == 0:
+        return MetricResult(None, inputs_used, formula, "revenue is zero")
+    return MetricResult(fcf.value / rev, inputs_used, formula, None)
+
+
+def _compute_fcf_conversion(facts, periods_by_class, start, end, cls) -> MetricResult:
+    fcf = _compute_free_cash_flow(facts, periods_by_class, start, end, cls)
+    ni, ni_alias = _resolve("net_income", facts, start, end)
+    inputs_used = dict(fcf.inputs_used)
+    _record(inputs_used, ni_alias, ni)
+    formula = f"({fcf.formula}) / {ni_alias or 'net_income'}"
+    if fcf.value is None:
+        return MetricResult(None, inputs_used, formula, f"free_cash_flow unavailable: {fcf.null_reason}")
+    if ni is None:
+        return MetricResult(None, inputs_used, formula, "net_income missing")
+    if ni <= 0:
+        return MetricResult(None, inputs_used, formula, "net_income <= 0")
+    return MetricResult(fcf.value / ni, inputs_used, formula, None)
+
+
+def _compute_depreciation_rate(facts, periods_by_class, start, end, cls) -> MetricResult:
+    dep, dep_note, inputs_used = _resolve_depreciation(facts, start, end)
+    ppe_g, ppe_g_alias = _resolve("ppe_gross", facts, None, end)
+    if ppe_g is not None:
+        denom_alias, denom_val, note = ppe_g_alias, ppe_g, ""
+        _record(inputs_used, ppe_g_alias, ppe_g)
+    else:
+        denom_val, denom_note, ppe_inputs = _resolve_ppe_net(facts, end)
+        inputs_used.update(ppe_inputs)
+        denom_alias = denom_note
+        note = " [ppe_gross absent, fell back to ppe_net/ppe_and_lease_net]" if denom_val is not None else ""
+    formula = f"{dep_note or 'depreciation'} / {denom_alias or 'ppe_gross/ppe_net'}{note}"
+    if dep is None:
+        return MetricResult(None, inputs_used, formula, "depreciation and dep_amort both missing")
+    if denom_val is None:
+        return MetricResult(None, inputs_used, formula, "ppe_gross, ppe_net, and ppe_and_lease_net all missing")
+    if denom_val == 0:
+        return MetricResult(None, inputs_used, formula, "denominator is zero")
+    return MetricResult(dep / denom_val, inputs_used, formula, None)
+
+
+# --- Working capital (annual only) ---
+
+
+def _compute_days_inventory(facts, periods_by_class, start, end, cls) -> MetricResult:
+    inv, inv_alias = _resolve("inventory", facts, None, end)
+    cogs, cogs_alias = _resolve("cogs", facts, start, end)
+    inputs_used: dict[str, float] = {}
+    _record(inputs_used, inv_alias, inv)
+    _record(inputs_used, cogs_alias, cogs)
+    formula = f"{inv_alias or 'inventory'} / {cogs_alias or 'cogs'} * 365"
+    if inv is None:
+        return MetricResult(None, inputs_used, formula, "inventory missing")
+    if cogs is None:
+        return MetricResult(None, inputs_used, formula, "cogs missing")
+    if cogs == 0:
+        return MetricResult(None, inputs_used, formula, "cogs is zero")
+    return MetricResult(inv / cogs * 365, inputs_used, formula, None)
+
+
+def _compute_days_receivables(facts, periods_by_class, start, end, cls) -> MetricResult:
+    rec, rec_alias = _resolve("receivables", facts, None, end)
+    rev, rev_alias = _resolve("revenue", facts, start, end)
+    inputs_used: dict[str, float] = {}
+    _record(inputs_used, rec_alias, rec)
+    _record(inputs_used, rev_alias, rev)
+    formula = f"{rec_alias or 'receivables'} / {rev_alias or 'revenue'} * 365"
+    if rec is None:
+        return MetricResult(None, inputs_used, formula, "receivables missing")
+    if rev is None:
+        return MetricResult(None, inputs_used, formula, "revenue missing")
+    if rev == 0:
+        return MetricResult(None, inputs_used, formula, "revenue is zero")
+    return MetricResult(rec / rev * 365, inputs_used, formula, None)
+
+
+def _compute_days_payables(facts, periods_by_class, start, end, cls) -> MetricResult:
+    pay, pay_alias = _resolve("payables", facts, None, end)
+    cogs, cogs_alias = _resolve("cogs", facts, start, end)
+    inputs_used: dict[str, float] = {}
+    _record(inputs_used, pay_alias, pay)
+    _record(inputs_used, cogs_alias, cogs)
+    formula = f"{pay_alias or 'payables'} / {cogs_alias or 'cogs'} * 365"
+    if pay is None:
+        return MetricResult(None, inputs_used, formula, "payables missing")
+    if cogs is None:
+        return MetricResult(None, inputs_used, formula, "cogs missing")
+    if cogs == 0:
+        return MetricResult(None, inputs_used, formula, "cogs is zero")
+    return MetricResult(pay / cogs * 365, inputs_used, formula, None)
+
+
+def _compute_cash_conversion_cycle(facts, periods_by_class, start, end, cls) -> MetricResult:
+    di = _compute_days_inventory(facts, periods_by_class, start, end, cls)
+    dr = _compute_days_receivables(facts, periods_by_class, start, end, cls)
+    dp = _compute_days_payables(facts, periods_by_class, start, end, cls)
+    inputs_used = {**di.inputs_used, **dr.inputs_used, **dp.inputs_used}
+    formula = f"({di.formula}) + ({dr.formula}) - ({dp.formula})"
+    if di.value is None:
+        return MetricResult(None, inputs_used, formula, f"days_inventory unavailable: {di.null_reason}")
+    if dr.value is None:
+        return MetricResult(None, inputs_used, formula, f"days_receivables unavailable: {dr.null_reason}")
+    if dp.value is None:
+        return MetricResult(None, inputs_used, formula, f"days_payables unavailable: {dp.null_reason}")
+    return MetricResult(di.value + dr.value - dp.value, inputs_used, formula, None)
+
+
+# --- Solvency ---
+
+
+def _compute_net_debt(facts, periods_by_class, start, end, cls) -> MetricResult:
+    debt, debt_note, inputs_used = _resolve_total_debt(facts, end)
+    cash, cash_alias = _resolve("cash", facts, None, end)
+    sti, sti_alias = _resolve("short_term_investments", facts, None, end)
+    _record(inputs_used, cash_alias, cash)
+    _record(inputs_used, sti_alias, sti)
+    formula = f"({debt_note}) - {cash_alias or 'cash'} - {sti_alias or 'short_term_investments'}"
+    if debt is None:
+        return MetricResult(None, inputs_used, formula, "total_debt unresolved (no combined tag and components incomplete)")
+    if cash is None:
+        return MetricResult(None, inputs_used, formula, "cash missing")
+    if sti is None:
+        return MetricResult(None, inputs_used, formula, "short_term_investments missing")
+    return MetricResult(debt - cash - sti, inputs_used, formula, None)
+
+
+def _compute_net_debt_to_ebitda(facts, periods_by_class, start, end, cls) -> MetricResult:
+    nd = _compute_net_debt(facts, periods_by_class, start, end, cls)
+    ebitda = _compute_ebitda(facts, periods_by_class, start, end, cls)
+    inputs_used = {**nd.inputs_used, **ebitda.inputs_used}
+    formula = f"({nd.formula}) / ({ebitda.formula})"
+    if nd.value is None:
+        return MetricResult(None, inputs_used, formula, f"net_debt unavailable: {nd.null_reason}")
+    if ebitda.value is None:
+        return MetricResult(None, inputs_used, formula, f"ebitda unavailable: {ebitda.null_reason}")
+    if ebitda.value <= 0:
+        return MetricResult(None, inputs_used, formula, "ebitda <= 0")
+    return MetricResult(nd.value / ebitda.value, inputs_used, formula, None)
+
+
+_compute_interest_coverage = _simple_ratio("operating_income", "interest_expense")
+_compute_current_ratio = _simple_ratio("current_assets", "current_liabilities")
+
+
+# --- Quality: Beneish M-score and its 8 stored components ---
+
+_compute_beneish_dsri = _ratio_of_ratios_index("receivables", "revenue")
+_compute_beneish_sgai = _ratio_of_ratios_index("sga_expense", "revenue")
+
+
+def _compute_beneish_sgi(facts, periods_by_class, start, end, cls) -> MetricResult:
+    prior = _find_prior_yoy(periods_by_class.get("annual", set()), start, end)
+    if prior is None:
+        return MetricResult(None, {}, "revenue_t / revenue_t-1", "prior period not found")
+    p_start, p_end = prior
+    rev_t, rev_t_alias = _resolve("revenue", facts, start, end)
+    rev_p, rev_p_alias = _resolve("revenue", facts, p_start, p_end)
+    inputs_used: dict[str, float] = {}
+    _record(inputs_used, rev_t_alias, rev_t, "_t")
+    _record(inputs_used, rev_p_alias, rev_p, "_t-1")
+    formula = f"{rev_t_alias or 'revenue'}_t / {rev_p_alias or 'revenue'}_t-1"
+    if rev_t is None or rev_p is None:
+        return MetricResult(None, inputs_used, formula, "revenue missing in t or t-1")
+    if rev_p == 0:
+        return MetricResult(None, inputs_used, formula, "prior revenue is zero")
+    return MetricResult(rev_t / rev_p, inputs_used, formula, None)
+
+
+def _compute_beneish_gmi(facts, periods_by_class, start, end, cls) -> MetricResult:
+    prior = _find_prior_yoy(periods_by_class.get("annual", set()), start, end)
+    if prior is None:
+        return MetricResult(None, {}, "gross_margin_t-1 / gross_margin_t", "prior period not found")
+    p_start, p_end = prior
+    gp_t, gp_t_note, inputs_t = _resolve_gross_profit(facts, start, end)
+    gp_p, gp_p_note, inputs_p = _resolve_gross_profit(facts, p_start, p_end)
+    rev_t, rev_t_alias = _resolve("revenue", facts, start, end)
+    rev_p, rev_p_alias = _resolve("revenue", facts, p_start, p_end)
+    inputs_used = {f"{k}_t": v for k, v in inputs_t.items()}
+    inputs_used.update({f"{k}_t-1": v for k, v in inputs_p.items()})
+    _record(inputs_used, rev_t_alias, rev_t, "_t")
+    _record(inputs_used, rev_p_alias, rev_p, "_t-1")
+    formula = f"(({gp_p_note})_t-1/{rev_p_alias or 'revenue'}_t-1) / (({gp_t_note})_t/{rev_t_alias or 'revenue'}_t)"
+    if gp_t is None or gp_p is None or rev_t is None or rev_p is None:
+        return MetricResult(None, inputs_used, formula, "gross_profit or revenue missing in t or t-1")
+    if rev_t == 0 or rev_p == 0:
+        return MetricResult(None, inputs_used, formula, "revenue is zero in t or t-1")
+    margin_t, margin_p = gp_t / rev_t, gp_p / rev_p
+    if margin_t == 0:
+        return MetricResult(None, inputs_used, formula, "current gross margin is zero")
+    return MetricResult(margin_p / margin_t, inputs_used, formula, None)
+
+
+def _compute_beneish_aqi(facts, periods_by_class, start, end, cls) -> MetricResult:
+    prior = _find_prior_yoy(periods_by_class.get("annual", set()), start, end)
+    if prior is None:
+        return MetricResult(
+            None, {}, "(1-(current_assets+ppe_net)/total_assets)_t / same_t-1", "prior period not found"
+        )
+    p_start, p_end = prior
+
+    def _term(period_end: str):
+        ca, ca_alias = _resolve("current_assets", facts, None, period_end)
+        ppe, ppe_note, ppe_inputs = _resolve_ppe_net(facts, period_end)
+        ta, ta_alias = _resolve("total_assets", facts, None, period_end)
+        used: dict[str, float] = {}
+        _record(used, ca_alias, ca)
+        used.update(ppe_inputs)
+        _record(used, ta_alias, ta)
+        aliases = (ca_alias, ppe_note, ta_alias)
+        if ca is None or ppe is None or ta is None or ta == 0:
+            return None, used, aliases
+        return 1 - (ca + ppe) / ta, used, aliases
+
+    term_t, used_t, (ca_a, ppe_a, ta_a) = _term(end)
+    term_p, used_p, _aliases_p = _term(p_end)
+    inputs_used = {f"{k}_t": v for k, v in used_t.items()}
+    inputs_used.update({f"{k}_t-1": v for k, v in used_p.items()})
+    formula = (
+        f"(1-({ca_a or 'current_assets'}+{ppe_a or 'ppe_net'})/{ta_a or 'total_assets'})_t / same_t-1 "
+        "[omits 'other securities' term, not reliably tagged in XBRL]"
+    )
+    if term_t is None or term_p is None:
+        return MetricResult(None, inputs_used, formula, "current_assets, ppe_net, or total_assets missing/zero in t or t-1")
+    if term_p == 0:
+        return MetricResult(None, inputs_used, formula, "prior-period term is zero")
+    return MetricResult(term_t / term_p, inputs_used, formula, None)
+
+
+def _compute_beneish_depi(facts, periods_by_class, start, end, cls) -> MetricResult:
+    prior = _find_prior_yoy(periods_by_class.get("annual", set()), start, end)
+    if prior is None:
+        return MetricResult(
+            None, {}, "(depreciation/(depreciation+ppe_net))_t-1 / same_t", "prior period not found"
+        )
+    p_start, p_end = prior
+
+    def _rate(period_start: str, period_end: str):
+        dep, dep_note, dep_inputs = _resolve_depreciation(facts, period_start, period_end)
+        ppe, ppe_note, ppe_inputs = _resolve_ppe_net(facts, period_end)
+        used: dict[str, float] = dict(dep_inputs)
+        used.update(ppe_inputs)
+        aliases = (dep_note, ppe_note)
+        if dep is None or ppe is None or (dep + ppe) == 0:
+            return None, used, aliases
+        return dep / (dep + ppe), used, aliases
+
+    rate_t, used_t, (dep_a, ppe_a) = _rate(start, end)
+    rate_p, used_p, _aliases_p = _rate(p_start, p_end)
+    inputs_used = {f"{k}_t": v for k, v in used_t.items()}
+    inputs_used.update({f"{k}_t-1": v for k, v in used_p.items()})
+    dep_term = f"{dep_a or 'depreciation'}/({dep_a or 'depreciation'}+{ppe_a or 'ppe_net'})"
+    formula = f"({dep_term})_t-1 / ({dep_term})_t"
+    if rate_t is None or rate_p is None:
+        return MetricResult(None, inputs_used, formula, "depreciation/dep_amort or ppe_net missing/zero-sum in t or t-1")
+    if rate_t == 0:
+        return MetricResult(None, inputs_used, formula, "current-period depreciation rate is zero")
+    return MetricResult(rate_p / rate_t, inputs_used, formula, None)
+
+
+def _compute_beneish_lvgi(facts, periods_by_class, start, end, cls) -> MetricResult:
+    prior = _find_prior_yoy(periods_by_class.get("annual", set()), start, end)
+    if prior is None:
+        return MetricResult(
+            None, {}, "((total_debt+current_liabilities)/total_assets)_t / same_t-1", "prior period not found"
+        )
+    p_start, p_end = prior
+
+    def _term(period_end: str):
+        debt, debt_note, used = _resolve_total_debt(facts, period_end)
+        cl, cl_alias = _resolve("current_liabilities", facts, None, period_end)
+        ta, ta_alias = _resolve("total_assets", facts, None, period_end)
+        used = dict(used)
+        _record(used, cl_alias, cl)
+        _record(used, ta_alias, ta)
+        if debt is None or cl is None or ta is None or ta == 0:
+            return None, used, debt_note, cl_alias, ta_alias
+        return (debt + cl) / ta, used, debt_note, cl_alias, ta_alias
+
+    term_t, used_t, note_t, cl_alias_t, ta_alias_t = _term(end)
+    term_p, used_p, note_p, _cl_alias_p, _ta_alias_p = _term(p_end)
+    inputs_used = {f"{k}_t": v for k, v in used_t.items()}
+    inputs_used.update({f"{k}_t-1": v for k, v in used_p.items()})
+    formula = (
+        f"(({note_t}+{cl_alias_t or 'current_liabilities'})/{ta_alias_t or 'total_assets'})_t / "
+        f"(({note_p}+{cl_alias_t or 'current_liabilities'})/{ta_alias_t or 'total_assets'})_t-1"
+    )
+    if term_t is None or term_p is None:
+        return MetricResult(None, inputs_used, formula, "total_debt, current_liabilities, or total_assets missing/zero in t or t-1")
+    if term_p == 0:
+        return MetricResult(None, inputs_used, formula, "prior-period term is zero")
+    return MetricResult(term_t / term_p, inputs_used, formula, None)
+
+
+def _compute_beneish_tata(facts, periods_by_class, start, end, cls) -> MetricResult:
+    # No prior period: TATA is the one Beneish index computed from a single period.
+    ni, ni_alias = _resolve("net_income", facts, start, end)
+    cfo, cfo_alias = _resolve("cfo", facts, start, end)
+    ta, ta_alias = _resolve("total_assets", facts, None, end)
+    inputs_used: dict[str, float] = {}
+    _record(inputs_used, ni_alias, ni)
+    _record(inputs_used, cfo_alias, cfo)
+    _record(inputs_used, ta_alias, ta)
+    formula = (
+        f"({ni_alias or 'net_income'} - {cfo_alias or 'cfo'}) / {ta_alias or 'total_assets'} "
+        "[net income substituted for income from continuing operations]"
+    )
+    if ni is None or cfo is None:
+        return MetricResult(None, inputs_used, formula, "net_income or cfo missing")
+    if ta is None:
+        return MetricResult(None, inputs_used, formula, "total_assets missing")
+    if ta == 0:
+        return MetricResult(None, inputs_used, formula, "total_assets is zero")
+    return MetricResult((ni - cfo) / ta, inputs_used, formula, None)
+
+
+_BENEISH_COMPONENT_FUNCS: dict[str, Callable] = {
+    "DSRI": _compute_beneish_dsri,
+    "GMI": _compute_beneish_gmi,
+    "AQI": _compute_beneish_aqi,
+    "SGI": _compute_beneish_sgi,
+    "DEPI": _compute_beneish_depi,
+    "SGAI": _compute_beneish_sgai,
+    "TATA": _compute_beneish_tata,
+    "LVGI": _compute_beneish_lvgi,
+}
+
+
+def _compute_beneish_m_score(facts, periods_by_class, start, end, cls) -> MetricResult:
+    # M-score's own inputs are the 8 index values -- the raw XBRL concepts
+    # behind each index are already recorded on that index's own metric row
+    # (beneish_dsri, beneish_gmi, ...); re-flattening them here would just
+    # duplicate that data on every M-score row.
+    components = {
+        idx: fn(facts, periods_by_class, start, end, cls) for idx, fn in _BENEISH_COMPONENT_FUNCS.items()
+    }
+    inputs_used: dict[str, float] = {idx: r.value for idx, r in components.items() if r.value is not None}
+    coeff_terms = " + ".join(f"({config.BENEISH_COEFFICIENTS[idx]})*{idx}" for idx in components)
+    formula = f"{config.BENEISH_INTERCEPT} + {coeff_terms}"
+    missing = [idx for idx, r in components.items() if r.value is None]
+    if missing:
+        return MetricResult(None, inputs_used, formula, f"components missing: {', '.join(missing)}")
+    score = config.BENEISH_INTERCEPT + sum(
+        config.BENEISH_COEFFICIENTS[idx] * components[idx].value for idx in components
+    )
+    return MetricResult(score, inputs_used, formula, None)
+
+
+# --- registry dispatch ---
+
+COMPUTE_FUNCS: dict[str, Callable] = {
+    "revenue_yoy": _compute_revenue_yoy,
+    "revenue_qoq": _compute_revenue_qoq,
+    "operating_income_yoy": _compute_operating_income_yoy,
+    "eps_diluted_yoy": _compute_eps_diluted_yoy,
+    "gross_margin": _compute_gross_margin,
+    "operating_margin": _compute_operating_margin,
+    "net_margin": _compute_net_margin,
+    "ebitda": _compute_ebitda,
+    "ebitda_margin": _compute_ebitda_margin,
+    "rnd_intensity": _compute_rnd_intensity,
+    "sga_intensity": _compute_sga_intensity,
+    "incremental_gross_margin": _compute_incremental_gross_margin,
+    "effective_tax_rate": _compute_effective_tax_rate,
+    "nopat": _compute_nopat,
+    "invested_capital": _compute_invested_capital,
+    "roic": _compute_roic,
+    "roe": _compute_roe,
+    "asset_turnover": _compute_asset_turnover,
+    "equity_multiplier": _compute_equity_multiplier,
+    "fixed_asset_turnover": _compute_fixed_asset_turnover,
+    "capex_to_revenue": _compute_capex_to_revenue,
+    "capex_to_depreciation": _compute_capex_to_depreciation,
+    "free_cash_flow": _compute_free_cash_flow,
+    "fcf_margin": _compute_fcf_margin,
+    "fcf_conversion": _compute_fcf_conversion,
+    "sbc_to_revenue": _compute_sbc_to_revenue,
+    "depreciation_rate": _compute_depreciation_rate,
+    "days_inventory": _compute_days_inventory,
+    "days_receivables": _compute_days_receivables,
+    "days_payables": _compute_days_payables,
+    "cash_conversion_cycle": _compute_cash_conversion_cycle,
+    "inventory_growth_less_revenue_growth": _compute_inventory_growth_less_revenue_growth,
+    "net_debt": _compute_net_debt,
+    "net_debt_to_ebitda": _compute_net_debt_to_ebitda,
+    "interest_coverage": _compute_interest_coverage,
+    "current_ratio": _compute_current_ratio,
+    "beneish_m_score": _compute_beneish_m_score,
+    "beneish_dsri": _compute_beneish_dsri,
+    "beneish_gmi": _compute_beneish_gmi,
+    "beneish_aqi": _compute_beneish_aqi,
+    "beneish_sgi": _compute_beneish_sgi,
+    "beneish_depi": _compute_beneish_depi,
+    "beneish_sgai": _compute_beneish_sgai,
+    "beneish_lvgi": _compute_beneish_lvgi,
+    "beneish_tata": _compute_beneish_tata,
+}
+
+assert set(COMPUTE_FUNCS) == set(config.METRIC_REGISTRY), (
+    f"COMPUTE_FUNCS / METRIC_REGISTRY mismatch: "
+    f"{set(config.METRIC_REGISTRY) ^ set(COMPUTE_FUNCS)}"
+)
+
+
+# --- persistence ---
+
+
+def _now_iso() -> str:
+    return datetime.now(UTC).replace(microsecond=0, tzinfo=None).isoformat()
+
+
+def _write_metric(
+    conn: sqlite3.Connection,
+    cik: str,
+    period_start: str,
+    period_end: str,
+    name: str,
+    value: float | None,
+    formula: str,
+    inputs_json: str,
+) -> bool:
+    """Insert or update one metric row. Returns True if a row changed.
+
+    Keyed on (cik, period_start, period_end, name, calc_version) -- period_end
+    alone is not sufficient. Real data confirms this: Amazon has a
+    365-day-duration fact and a 90-day-duration fact that both end on
+    2025-06-30 (a trailing-twelve-month figure happens to close on the same
+    date as an ordinary quarter). A basis="both" metric computed for both the
+    annual and quarterly instance of that end date would silently overwrite
+    one with the other on every run if period_start weren't part of the key.
+    """
+    existing = conn.execute(
+        "SELECT value, formula, inputs_json FROM metrics "
+        "WHERE cik = ? AND period_start = ? AND period_end = ? AND name = ? AND calc_version = ?",
+        (cik, period_start, period_end, name, config.CALC_VERSION),
+    ).fetchone()
+    if existing is not None:
+        if existing["value"] == value and existing["formula"] == formula and existing["inputs_json"] == inputs_json:
+            return False
+        conn.execute(
+            "UPDATE metrics SET value = ?, formula = ?, inputs_json = ?, computed_at = ? "
+            "WHERE cik = ? AND period_start = ? AND period_end = ? AND name = ? AND calc_version = ?",
+            (value, formula, inputs_json, _now_iso(), cik, period_start, period_end, name, config.CALC_VERSION),
+        )
+        return True
+    conn.execute(
+        "INSERT INTO metrics (cik, accession_no, period_start, period_end, name, value, formula, inputs_json, calc_version, computed_at) "
+        "VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (cik, period_start, period_end, name, value, formula, inputs_json, config.CALC_VERSION, _now_iso()),
+    )
+    return True
+
+
+def compute_metrics(
+    conn: sqlite3.Connection, tickers: list[str] | None = None, metric_names: list[str] | None = None
+) -> list[dict]:
+    """Compute every registered metric for every applicable period. Idempotent."""
+    companies = [c for c in config.WATCHLIST if tickers is None or c.ticker in tickers]
+    written: list[dict] = []
+    null_count = 0
+    computed_count = 0
+    for company in companies:
+        facts_by_concept = _load_facts(conn, company.cik)
+        real_annual_ends, real_quarterly_ends = _real_fiscal_period_ends(conn, company.cik)
+        periods_by_class = _build_periods_by_class(facts_by_concept, real_annual_ends, real_quarterly_ends)
+        for name, mdef in config.METRIC_REGISTRY.items():
+            if metric_names is not None and name not in metric_names:
+                continue
+            fn = COMPUTE_FUNCS[name]
+            for cls in _classes_for_basis(mdef.basis):
+                for start, end in sorted(periods_by_class.get(cls, set())):
+                    result = fn(facts_by_concept, periods_by_class, start, end, cls)
+                    if result.value is None:
+                        inputs_json = json.dumps(
+                            {**result.inputs_used, "_null_reason": result.null_reason}, sort_keys=True
+                        )
+                        null_count += 1
+                    else:
+                        inputs_json = json.dumps(result.inputs_used, sort_keys=True)
+                        computed_count += 1
+                    changed = _write_metric(
+                        conn, company.cik, start, end, name, result.value, result.formula, inputs_json
+                    )
+                    if changed:
+                        written.append(
+                            {
+                                "ticker": company.ticker,
+                                "name": name,
+                                "period_end": end,
+                                "class": cls,
+                                "value": result.value,
+                                "null_reason": result.null_reason,
+                            }
+                        )
+    conn.commit()
+    logger.info("compute_metrics: %d computed, %d NULL", computed_count, null_count)
+    return written

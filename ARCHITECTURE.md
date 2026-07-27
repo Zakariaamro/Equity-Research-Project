@@ -1,11 +1,36 @@
 # Equity Research Platform — Architecture
 
-**Version:** 1.5
-**Date:** 2026-07-26
+**Version:** 1.8
+**Date:** 2026-07-27
 **Owner:** Zakaria
 **Status:** Approved for V1 implementation
 
 **Changelog**
+- v1.8 — SPEC-004 category-6 (alias agreement) findings, resolved. Five more registry
+  splits (§2.1): `dep_amort`/`depreciation`, `interest_expense`/`interest_expense_debt`,
+  `equity`/`equity_including_nci`, `net_income`/`net_income_including_nci`, and
+  `sbc` trimmed with no replacement. New §2.2: alias-agreement exceptions register, for
+  the one disagreement (`capex`) kept as a true alias pair despite disagreeing, with a
+  written, hand-verified reason. §6 NULL-discipline note refined: absence means zero for
+  an additive component of a total the filer is required to disclose (ASC 842 finance
+  leases), not for a primary measure — narrow, named exception to the general rule.
+  Decision log entries 20–22 added.
+- v1.7 — SPEC-004 post-implementation findings, resolved. §6 `fiscal_period` note
+  corrected: Amazon directly tags a genuine implicit Q4 for several concepts; derivation
+  is a fallback, not the default. §2.1 alias-purity rule reinforced by two more real
+  cases (`ppe_and_lease_net`, finance lease liabilities) — both given their own
+  canonical inputs rather than folded into existing ones. Decision log entries 17–19
+  added.
+- v1.6 — SPEC-004 pre-implementation review, verified live against `companyfacts` for
+  all three companies. §1 watchlist table corrected: NVIDIA and Micron both run floating
+  52/53-week fiscal years (was implied to be a Micron-only quirk; NVIDIA's `01-31` year
+  end is not fixed). New §2.1 alias-list purity rule, added after finding two alias
+  entries that paired a canonical input with a *different* accounting quantity rather
+  than a true synonym (`LongTermDebt`, `ReceivablesNetCurrent`). §6 gains `xbrl_facts`
+  columns `duration_days`/`filed_date` and a corrected note on Amazon's `GrossProfit`
+  tag (it existed, but only for FY2007–2008 filings, not "never"). §7 replaced: metrics
+  are now a declarative registry of 37 named metrics plus 8 Beneish components, not the
+  10 hand-coded V1 ratios. Decision log entries 13–15 added.
 - v1.5 — SPEC-003: `sections.text` moved out of SQLite into content-addressed files at
   `data/sections/{hash[:2]}/{hash}.txt.gz`; §6 `sections` schema drops the `text` column,
   `text_hash` becomes the sole link to content. §4 gains a note that this stops future
@@ -34,17 +59,26 @@ Automatically detect new SEC filings by a watchlist of companies, extract financ
 statements and narrative sections, compute ratios, analyse the narrative with an LLM,
 and surface the results on a dashboard — without the operator's laptop being on.
 
-### Watchlist (verified against SEC 2026-07-25)
+### Watchlist (verified against SEC 2026-07-25; fiscal calendar corrected 2026-07-26)
 
-| Company | Ticker | CIK | Fiscal year end | 10-K typically filed |
-|---|---|---|---|---|
-| Amazon.com Inc | AMZN | `0001018724` | 12-31 | Early February |
-| NVIDIA Corp | NVDA | `0001045810` | 01-31 | Late February |
-| Micron Technology Inc | MU | `0000723125` | 09-03 | Early October |
+| Company | Ticker | CIK | Fiscal year end | Calendar | 10-K typically filed |
+|---|---|---|---|---|---|
+| Amazon.com Inc | AMZN | `0001018724` | 12-31 | Fixed calendar date | Early February |
+| NVIDIA Corp | NVDA | `0001045810` | ~01-31 | **Floating 52/53-week** (last Sunday in January) | Late February |
+| Micron Technology Inc | MU | `0000723125` | ~09-03 | **Floating 52/53-week** (Thursday closest to Aug/Sep boundary) | Early October |
 
 **Three different fiscal calendars.** This is a feature, not an annoyance — it forces the
 system to treat fiscal periods as data rather than assume calendar quarters, which is
 correct behaviour for any real research tool. Never infer a period from a filing date.
+
+**NVIDIA and Micron both run floating 52/53-week fiscal years, not fixed calendar year
+ends.** Confirmed live during SPEC-004's pre-implementation review: NVDA's annual XBRL
+durations are 363 or 370 days (never a flat 365), and its quarters run 90 or 97 days,
+from the same extra-week mechanism as Micron's. Only Amazon has a truly fixed December 31
+year end. The `fiscal_year_end` values above (`MMDD`) are the *typical* date, not an
+exact one — **nothing in the codebase may assume a fixed year-end date for NVDA or MU**;
+period boundaries must always be read from the filing's own reported dates, never
+computed from `fiscal_year_end` + an offset.
 
 **Development order:** Amazon first. It is the only watchlist member expected to file
 during the V1 build window (Q2 10-Q, historically the first days of August). NVIDIA's
@@ -73,6 +107,63 @@ Every AI-generated row records the model, prompt version, and the source section
 
 This is not a documentation convention. It is the schema. Violating it requires
 restructuring tables, which is deliberately harder than doing it correctly.
+
+### 2.1 Alias-list purity rule
+
+Wherever a canonical input maps to an ordered list of source tags (concept aliases in
+`xbrl.py`/`config.py`, and any future registry of the same shape), **every alias in the
+list must denote the same accounting quantity under a different name — never a broader
+or narrower quantity that merely resembles it.** A tag that represents a different fact
+is a separate canonical input, not a fallback alias for an existing one.
+
+Found and corrected during SPEC-004's pre-implementation review, against live data:
+
+- `LongTermDebt` was listed as a fallback alias for `debt_noncurrent`. It is not a
+  synonym — confirmed against all three watchlist companies, `LongTermDebt` is the
+  *total* long-term debt (current + noncurrent combined; exact match against
+  `LongTermDebtNoncurrent + LongTermDebtCurrent` in every period checked). Using it as a
+  same-quantity fallback meant that summing `debt_noncurrent + debt_current` downstream
+  double-counted the current portion for any company whose noncurrent-only tag had gone
+  stale (Micron, whose `LongTermDebtNoncurrent` has no entries after FY2013).
+- `ReceivablesNetCurrent` was listed as a fallback alias for `receivables`
+  (`AccountsReceivableNetCurrent`). Not a synonym either — Micron tags both
+  *simultaneously* across the same 15+ year span, and the values never match;
+  `ReceivablesNetCurrent` is a consistently larger, broader figure.
+
+Both were removed from their respective alias lists. Where a broader/narrower
+relationship like this is genuinely useful (e.g. a reconciling total), it gets its own
+canonical input — see `total_debt` in SPEC-004 R1b, which prefers a real combined-total
+tag and only falls back to summing components when no combined tag exists for that
+period, with the difference asserted by `validate` rather than assumed.
+
+**Confirmed at scale (SPEC-004 R8 category 6, live):** once alias agreement was checked
+automatically across the whole registry instead of relying on this being re-discovered
+by hand, five more real violations of this rule turned up in one run —
+`dep_amort`/`Depreciation`, `interest_expense`/`InterestExpenseDebt`,
+`equity`/`...IncludingNoncontrollingInterest`, `net_income`/`ProfitLoss`, and
+`sbc`/`AllocatedShareBasedCompensationExpense`. All five were the same shape: a
+consistent, non-random disagreement across many periods, meaning the two tags describe
+different quantities, not the same fact under different names. Each got the same
+treatment as `LongTermDebt`/`ReceivablesNetCurrent` — split into its own canonical
+input, never patched over as a fallback. The `equity`/`net_income` case was worse than
+"imprecise" — it was a live ROE-correctness bug (§6, "Note on `metrics.equity`/`net_income`
+parent vs. NCI" below) that DuPont's own reconciliation structurally could not detect.
+
+### 2.2 Alias-agreement exceptions register
+
+Not every disagreement category 6 finds is a broader/narrower split waiting to happen.
+`capex`'s two aliases (`PaymentsToAcquirePropertyPlantAndEquipment`,
+`PaymentsToAcquireProductiveAssets`) disagree by ~16% for Amazon in exactly one period —
+the real 2017 tag transition (§3, concept drift) — not a *consistent* pattern across many
+periods the way the five §2.1 cases were. `free_cash_flow` computed from
+`PaymentsToAcquireProductiveAssets` was already hand-verified against Amazon's archived
+FY2025 cash flow statement (SPEC-003/004 AC9), confirming that alias is trustworthy.
+
+`config.ALIAS_AGREEMENT_EXCEPTIONS` holds this kind of case: canonical input → a written
+reason. `validate` category 6 reports an excepted canonical's disagreements
+informationally, alongside the reason, instead of as a hard failure. A canonical input
+*not* in the register still hard-fails on any disagreement — the register documents an
+accepted exception, it does not silence a finding.
 
 ---
 
@@ -333,8 +424,10 @@ CREATE TABLE xbrl_facts (
     fiscal_year   INTEGER,
     fiscal_period TEXT,                  -- 'FY' | 'Q1' | 'Q2' | 'Q3'
     value         REAL NOT NULL,
-    accession_no  TEXT,
+    accession_no  TEXT,                  -- NULL if the source accn isn't in `filings`
     form_type     TEXT,
+    duration_days INTEGER,               -- period_end - period_start; NULL for instant facts
+    filed_date    TEXT,                  -- the API's `filed` value; latest wins at compute time
     UNIQUE(cik, concept, unit, period_start, period_end, accession_no)
 );
 
@@ -343,6 +436,7 @@ CREATE TABLE metrics (
     id           INTEGER PRIMARY KEY,
     cik          TEXT NOT NULL REFERENCES companies(cik),
     accession_no TEXT REFERENCES filings(accession_no),
+    period_start TEXT NOT NULL,          -- SPEC-004: part of the key, see note below
     period_end   TEXT NOT NULL,
     name         TEXT NOT NULL,          -- 'operating_margin'
     value        REAL,
@@ -350,7 +444,7 @@ CREATE TABLE metrics (
     inputs_json  TEXT NOT NULL,
     calc_version TEXT NOT NULL,
     computed_at  TEXT NOT NULL,
-    UNIQUE(cik, period_end, name, calc_version)
+    UNIQUE(cik, period_start, period_end, name, calc_version)
 );
 
 -- ============ LAYER 3: AI INTERPRETATION ============
@@ -382,6 +476,25 @@ CREATE TABLE findings (
 );
 ```
 
+### Note on `xbrl_facts.duration_days` / `filed_date` (SPEC-004)
+
+Both are observed values or pure arithmetic over observed values — `duration_days` is
+`period_end − period_start`, `filed_date` is the API's own `filed` field — so they
+belong in the facts layer, not derived later. `duration_days` is what period
+classification (quarterly/half-year/three-quarter/annual/other) is computed from; the
+API's own `frame` field is deliberately never used for this. `filed_date` is what
+restatement selection (latest `filed_date` wins, per concept) is computed from.
+
+**Concept alias resolution happens per period, never once per company.** For a given
+canonical input (e.g. `revenue`, `debt_noncurrent`) and a given `(period_start,
+period_end)`, the first alias with a value *for that period* wins — which alias won for
+an earlier or later period is irrelevant and may differ. Resolving "which alias does
+this company use" once, company-wide, is a different and wrong algorithm: Amazon tagged
+`GrossProfit` in filings covering FY2007–2008 and has not since (zero entries with
+`fy >= 2018`, confirmed live). A company-wide resolution would treat `GrossProfit` as
+"available" for Amazon based on that seventeen-year-old tag and silently fail to compute
+`gross_margin` via the revenue−cogs fallback for every modern period. See SPEC-004 R1a.
+
 ### Note on `sections.text` (removed in SPEC-003)
 
 Cleaned section text is not stored in the database. It lives in gzipped,
@@ -396,6 +509,52 @@ belongs in the same class of storage as `data/raw/`, not in the one file rewritt
 every pipeline run. See SPEC-003 and the §4.1 note above. This is the reasoning future
 specs should follow when deciding where something belongs: **keep mutable state small;
 make large, immutable data content-addressed and out of the database.**
+
+### Note on `metrics.period_start` (SPEC-004, added during implementation)
+
+`period_end` alone is not a sufficient key for a metric row. Discovered against real
+data while testing idempotency: Amazon has a 365-day-duration fact and a 90-day-duration
+fact that both end on `2025-06-30` (an XBRL trailing-twelve-month figure happens to close
+on the same calendar date as an ordinary quarter). A `basis="both"` metric (e.g.
+`revenue_yoy`, computed once for the annual period and once for the quarterly period
+sharing that end date) was silently overwriting one instance with the other on every
+`compute-metrics` run — the two computations never diverged in *content* by more than
+their own correct values, but the row alternated between them forever, which is exactly
+the non-idempotency this project's tests exist to catch. `period_start` was added to the
+key specifically because `period_end` collisions across duration classes are real, not
+hypothetical — this is the same class of risk as R3's "quarterly and YTD share an end
+date," just one level more surprising (annual and quarterly sharing an end date).
+
+### Note on `metrics.equity` / `metrics.net_income`: parent vs. NCI-inclusive (SPEC-004)
+
+`net_margin` uses `net_income`; `equity_multiplier` and `roe` use `equity`. Before
+SPEC-004's category-6 fix, `net_income` could resolve via `ProfitLoss`
+(noncontrolling-interest-inclusive) in a period where `equity` resolved via
+`StockholdersEquity` (parent-level only) — a real basis mismatch producing a wrong `roe`,
+not just an imprecise one. **This could not have been caught by DuPont's own
+reconciliation** (`net_margin × asset_turnover × equity_multiplier` vs. `roe`): all three
+factors and the target are built from the same (possibly mismatched) `net_income` and
+`equity` values, so a consistent wrong basis reconciles perfectly with itself. It took a
+check against the *other* alias (validate category 6, alias agreement) to surface it.
+`net_income` and `equity` now each have exactly one alias, removing the possibility
+structurally rather than relying on catching it downstream every time.
+
+### Note on NULL discipline: primary measures vs. required-disclosure components (SPEC-004)
+
+The general rule remains "absence is not zero" (SPEC-002 R9 origin, applied throughout
+this project). SPEC-004's `total_debt` needed a narrow, named exception: finance lease
+liabilities are an *additive component of a total the filer is required to disclose* —
+ASC 842 requires a lessee with finance leases to recognize and tag
+`FinanceLeaseLiability{Noncurrent,Current}`. A company that never tags them has no
+finance leases; the absence itself is the disclosure, not an unknown. Contrast with a
+*primary* measure like `borrowings` (still NULL if absent — a missing tag there could
+mean anything) or `interest_expense` (unchanged — absence still NULL). This distinction
+is worth naming explicitly because it is easy to over-generalize either direction: reading
+"absence is not zero" too literally made `total_debt` permanently NULL for NVIDIA
+(confirmed: it discloses only operating leases); reading this exception too broadly would
+license guessing zero for inputs where absence is genuinely ambiguous. It applies to
+finance lease liabilities specifically, because ASC 842 is what makes the absence
+diagnostic — not to XBRL inputs in general.
 
 ### Why these columns exist
 
@@ -425,35 +584,79 @@ SEC value. Because the table was empty, this was a schema edit, not a migration.
 ### Note on `fiscal_period`
 
 There is deliberately no `Q4`. Companies do not file a Q4 10-Q; the fourth quarter is
-covered by the 10-K. SEC XBRL reports `FY` for annual figures, and Q4 must be *derived*
-(FY minus Q1 + Q2 + Q3). When that derivation is implemented it belongs in `metrics`,
-not `xbrl_facts` — it is a calculation, not an observed fact.
+covered by the 10-K, and SEC XBRL reports `FY` for annual figures, not a `Q4` `fp` value.
+
+**Correction (SPEC-004, found live):** an earlier version of this note said Q4 "must be
+derived" (FY minus Q1+Q2+Q3) as if no directly-tagged quarterly figure ever existed for
+it. That's not quite right. Amazon's 10-K directly tags a genuine three-month duration
+fact ending on the fiscal year-end date — for revenue, operating income, net income, tax
+expense, and diluted EPS — as part of its own supplementary disclosure, alongside the
+full-year figure. That fact is real, company-reported, and distinct from the annual one
+(same end date, different start date); it is not a derived value and should be used
+directly where present, exactly like any other quarterly fact. Derivation (FY − Q1 − Q2
+− Q3) is needed **only** where no such directly-tagged fact exists for a given company
+or concept — it is a fallback, not the default path. When implemented, the derivation
+still belongs in `metrics`, not `xbrl_facts` — it would be a calculation, not an
+observed fact — but "belongs in metrics" no longer means "always computed," since the
+fact frequently already exists in `xbrl_facts`.
+
+Consequence for period classification: a genuine implicit-Q4 fact and the annual fact
+for the same fiscal year necessarily share an end date. This is not period-mixing (see
+SPEC-004 R3a) — the two facts have different `period_start` values and the engine keys
+on the full `(period_start, period_end)` pair, never on `period_end` alone — but any
+code that assumes "annual metrics come only from `filings` rows shaped like a 10-K
+period" must still restrict to real `filings.period_end` values (SPEC-004 R3a), since
+duration alone (350–380 days) is not sufficient to distinguish a real fiscal year-end
+from an unrelated 365-day window that happens to end nearby.
 
 ---
 
-## 7. V1 Metric Set
+## 7. Metric Set
 
-Computed in `metrics.py` from `xbrl_facts`. Version as `v1`.
+Computed in `metrics.py` from `xbrl_facts`. Version as `CALC_VERSION` (`v1`). Superseded
+the original 10-ratio V1 list with SPEC-004: metrics are now a **declarative registry**
+in `config.py` (name, canonical inputs, basis, plausible range, whether a prior period is
+needed) plus a small computation engine in `metrics.py`, rather than hand-written
+per-ratio functions. Adding a metric is a config entry; if it requires new code, the
+design is wrong (exceptions — Beneish, DuPont components — are named and justified,
+never silent).
 
-| Metric | Definition |
+**37 named metrics, plus the 8 Beneish component indices stored individually** (see
+SPEC-004 R6/R7 for full definitions and formulas):
+
+| Category | Metrics |
 |---|---|
-| `revenue_yoy` | Revenue / prior-year same-period revenue − 1 |
-| `gross_margin` | (Revenue − COGS) / Revenue |
-| `operating_margin` | Operating income / Revenue |
-| `net_margin` | Net income / Revenue |
-| `rnd_intensity` | R&D expense / Revenue |
-| `current_ratio` | Current assets / Current liabilities |
-| `net_debt` | Total debt − cash and equivalents − short-term investments |
-| `interest_coverage` | Operating income / Interest expense |
-| `free_cash_flow` | Cash from operations − capital expenditures |
-| `fcf_margin` | Free cash flow / Revenue |
+| Growth | `revenue_yoy`, `revenue_qoq`, `operating_income_yoy`, `eps_diluted_yoy` |
+| Margins | `gross_margin`, `operating_margin`, `net_margin`, `ebitda`, `ebitda_margin`, `rnd_intensity`, `sga_intensity`, `incremental_gross_margin` |
+| Returns | `effective_tax_rate`, `nopat`, `invested_capital`, `roic`, `roe`, `asset_turnover`, `equity_multiplier`, `fixed_asset_turnover` |
+| Capital & cash | `capex_to_revenue`, `capex_to_depreciation`, `free_cash_flow`, `fcf_margin`, `fcf_conversion`, `sbc_to_revenue`, `depreciation_rate` |
+| Working capital (annual basis) | `days_inventory`, `days_receivables`, `days_payables`, `cash_conversion_cycle`, `inventory_growth_less_revenue_growth` |
+| Solvency | `net_debt`, `net_debt_to_ebitda`, `interest_coverage`, `current_ratio` |
+| Quality | `beneish_m_score` (+ 8 stored components: DSRI, GMI, AQI, SGI, DEPI, SGAI, LVGI, TATA) |
+
+`net_margin × asset_turnover × equity_multiplier` is the DuPont decomposition of `roe`
+and must reconcile to it within 1% — asserted directly by `validate`, not assumed.
+Balance-sheet inputs use ending balances, not averages, throughout.
 
 **Implementation note — concept aliasing.** Companies tag the same idea differently.
 Amazon reports net sales as `RevenueFromContractWithCustomerExcludingAssessedTax`, not
-`Revenues`, and does not report gross profit directly. Micron and NVIDIA, as semiconductor
-manufacturers, do report gross profit. `config.py` must hold an ordered alias list per
-canonical concept; `metrics.py` takes the first that resolves. Where no input resolves,
-write `NULL` — never a guess.
+`Revenues`. `config.py` holds an ordered alias list per canonical concept; resolution
+happens **per period, never once per company** (§6 note above) — `metrics.py` takes the
+first alias with a value for that specific period. Where no input resolves for a period,
+write `NULL` — never a guess. See §2.1 for the rule on what may and may not appear in an
+alias list: every alias must be the same fact under a different name, never a broader or
+narrower quantity (`total_debt` exists as its own canonical input for exactly this
+reason — it is not an alias of `debt_noncurrent`).
+
+**Amazon's `GrossProfit` history, corrected.** Earlier revisions of this document said
+Amazon "does not report gross profit directly," implying the tag was simply never used.
+Confirmed live: Amazon *did* tag `GrossProfit`, but only in filings covering fiscal years
+2007–2008 (filed 2009–2010); it has not appeared in any filing covering `fy >= 2018`.
+`gross_margin` still falls back to (revenue − cogs) ÷ revenue for Amazon in every modern
+period — the mechanism is unchanged — but the reason is "stopped tagging it sixteen years
+ago," not "never had it," and getting this precisely right is what motivated the
+per-period (rather than per-company) resolution rule above. Micron and NVIDIA, as
+semiconductor manufacturers, do report `GrossProfit` currently.
 
 ---
 
@@ -463,7 +666,7 @@ write `NULL` — never a guess.
 - Poll for new 10-K, 10-Q, and Item 2.02 8-K filings for the watchlist
 - Store raw filings permanently per §4.1
 - Extract statements, notes, and MD&A into `sections`
-- Ingest XBRL facts; compute the ten metrics above
+- Ingest XBRL facts; compute the metric set above (§7)
 - LLM analysis of notes and MD&A producing quote-anchored findings
 - Streamlit dashboard showing statements, ratios, findings, and provenance
 - Runs unattended on GitHub Actions
@@ -499,3 +702,13 @@ write `NULL` — never a guess.
 | 10 | Build against Amazon first | Only watchlist member expected to file during the build window | 2026-07-25 |
 | 11 | Archiving unbounded; LLM analysis bounded by a configurable start date | Archiving is free and unbounded history is useful test material; unbounded analysis would burn the entire LLM budget on one run | 2026-07-26 |
 | 12 | Section text moved out of SQLite into content-addressed files (`data/sections/`); `sections.text_hash` is the sole link | Mutable state (`app.db`, rewritten every run) must stay small; large, immutable data belongs outside it, one write ever, mirroring `data/raw/` | 2026-07-26 |
+| 13 | Concept alias resolution is per-period, never per-company | Amazon's `GrossProfit` tag is real but stale (FY2007–2008 only); a company-wide resolution would silently break the modern-period fallback it exists to provide | 2026-07-26 |
+| 14 | Alias lists may only contain true synonyms; a broader/narrower quantity gets its own canonical input (`total_debt`) | `LongTermDebt` (total) and `ReceivablesNetCurrent` (broader) were found paired as "aliases" for narrower quantities, risking silent double-counting (Micron debt) or wrong substitution | 2026-07-26 |
+| 15 | NVIDIA and Micron watchlist entries corrected to floating 52/53-week fiscal years | Confirmed live (NVDA annual durations of 363/370 days); prevents any future code from assuming a fixed year-end date for either company | 2026-07-26 |
+| 16 | `metrics.period_start` added to the table and its UNIQUE key | Found via real Amazon data during implementation: a 365-day and a 90-day duration fact end on the same calendar date, so `period_end` alone let a `basis="both"` metric silently overwrite one class's row with the other every run | 2026-07-26 |
+| 17 | `ppe_and_lease_net` added as its own canonical input; never an alias of `ppe_net` | Micron folded finance-lease ROU assets into its PP&E line from FY2021 — a broader measure, same shape of problem as `LongTermDebt`/`ReceivablesNetCurrent` (§2.1) | 2026-07-27 |
+| 18 | `total_debt` now adds finance lease liabilities; NULL (not zero) for companies that never tag them | Micron's real "Long-term debt" balance sheet line includes finance leases; a company with only operating leases (NVIDIA) genuinely may have none, but "never tagged" and "zero" stay different statements per R9 | 2026-07-27 |
+| 19 | Annual/quarterly metrics restricted to real `filings.period_end` values, not any 350–380/80–100-day duration fact | Amazon's directly-tagged implicit Q4 (corrected fiscal_period note above) shares an end date with the annual figure but is not itself a fiscal year-end; computing a full metric sweep against it produced phantom chart points | 2026-07-27 |
+| 20 | Five more canonical-input splits (`depreciation`, `interest_expense_debt`, `equity_including_nci`, `net_income_including_nci`; `sbc` trimmed with no replacement) | Live alias-agreement check (validate category 6) found consistent, non-random disagreements — same shape as `LongTermDebt`/`ReceivablesNetCurrent`, confirming §2.1's rule generalizes | 2026-07-27 |
+| 21 | Alias-agreement exceptions register added (`config.ALIAS_AGREEMENT_EXCEPTIONS`) | `capex`'s one-period Amazon disagreement is a real tag-transition artifact, not a broader/narrower split, and is already hand-verified via AC9 — needed a place to write down an accepted exception rather than either hard-failing forever or silently dropping the check | 2026-07-27 |
+| 22 | NULL discipline narrowly refined: absence = zero for a required-disclosure additive component (finance leases, ASC 842), still NULL for primary measures | Applying "absence is not zero" literally made `total_debt` permanently NULL for NVIDIA; ASC 842 makes the absence itself diagnostic for finance leases specifically, so the exception is named and scoped rather than a general loosening | 2026-07-27 |

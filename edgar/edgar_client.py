@@ -22,6 +22,7 @@ FILING_INDEX_URL = "https://www.sec.gov/Archives/edgar/data/{cik_no_zeros}/{acce
 ARCHIVE_FILE_URL = (
     "https://www.sec.gov/Archives/edgar/data/{cik_no_zeros}/{accession_no_nodash}/{filename}"
 )
+COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 
 # Transient failures worth retrying. 404 is deliberately excluded -- it means
 # the resource does not exist, not that the request failed transiently.
@@ -175,6 +176,16 @@ class EdgarClient:
         )
         data = self._get(url).json()
         return data.get("directory", {}).get("item", [])
+
+    def get_company_facts(self, cik: str) -> dict[str, Any]:
+        """Fetch the full XBRL companyfacts response for a company.
+
+        Several MB. Raises EdgarNotFoundError if the CIK has no XBRL facts
+        (SPEC-004 edge case: typed error naming the company is the caller's
+        job, since this layer only knows the CIK).
+        """
+        url = COMPANYFACTS_URL.format(cik=cik)
+        return self._get(url).json()
 
     def get_archive_file(self, cik: str, accession_no: str, filename: str) -> bytes:
         url = ARCHIVE_FILE_URL.format(

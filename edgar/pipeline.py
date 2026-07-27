@@ -12,7 +12,7 @@ import shutil
 import sqlite3
 import sys
 
-from edgar import config, db, fetch, monitor, section_store, sections
+from edgar import config, db, fetch, metrics, monitor, section_store, sections, validate, xbrl
 from edgar.edgar_client import EdgarClient
 from edgar.monitor import DiscoveredFiling
 
@@ -174,6 +174,71 @@ def cmd_migrate_sections(args: argparse.Namespace) -> None:
         conn.close()
 
 
+def cmd_ingest_xbrl(args: argparse.Namespace) -> None:
+    tickers = None
+    if args.ticker:
+        _validate_ticker(args.ticker)
+        tickers = [args.ticker]
+
+    conn = db.get_connection()
+    try:
+        client = EdgarClient()
+        results = xbrl.ingest_xbrl(conn, client, tickers=tickers)
+        for r in results:
+            if "error" in r:
+                print(f"{r['ticker']}: ERROR - {r['error']}")
+                continue
+            total_written = sum(r["written_by_concept"].values())
+            print(f"{r['ticker']}: {total_written} fact(s) written across {len(r['written_by_concept'])} concept(s)")
+            for concept, n in sorted(r["written_by_concept"].items()):
+                print(f"    {concept}: {n}")
+            if r["unresolved"]:
+                print(f"    unresolved (no alias has any data): {', '.join(sorted(r['unresolved']))}")
+    finally:
+        conn.close()
+
+
+def cmd_compute_metrics(args: argparse.Namespace) -> None:
+    tickers = None
+    if args.ticker:
+        _validate_ticker(args.ticker)
+        tickers = [args.ticker]
+    metric_names = [args.metric] if args.metric else None
+
+    conn = db.get_connection()
+    try:
+        results = metrics.compute_metrics(conn, tickers=tickers, metric_names=metric_names)
+        computed = [r for r in results if r["value"] is not None]
+        nulls = [r for r in results if r["value"] is None]
+        print(f"{len(results)} metric row(s) written/updated: {len(computed)} computed, {len(nulls)} NULL.")
+        if nulls:
+            reason_counts: dict[str, int] = {}
+            for r in nulls:
+                reason = r["null_reason"] or "unknown"
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            print("  NULL reasons:")
+            for reason, count in sorted(reason_counts.items(), key=lambda kv: -kv[1]):
+                print(f"    {count:4d}  {reason}")
+    finally:
+        conn.close()
+
+
+def cmd_validate(args: argparse.Namespace) -> None:
+    tickers = None
+    if args.ticker:
+        _validate_ticker(args.ticker)
+        tickers = [args.ticker]
+
+    conn = db.get_connection()
+    try:
+        report = validate.run_validate(conn, tickers=tickers)
+        print(validate.format_report(report))
+        if report.hard_failure_count:
+            raise SystemExit(1)
+    finally:
+        conn.close()
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     conn = db.get_connection()
     try:
@@ -187,10 +252,38 @@ def cmd_status(args: argparse.Namespace) -> None:
         ).fetchall()
         if not rows:
             print("No filings recorded yet.")
-            return
-        _print_row("TICKER", "FORM", "STATUS", "COUNT")
-        for row in rows:
-            _print_row(row["ticker"], row["form_type"], row["status"], str(row["n"]))
+        else:
+            _print_row("TICKER", "FORM", "STATUS", "COUNT")
+            for row in rows:
+                _print_row(row["ticker"], row["form_type"], row["status"], str(row["n"]))
+
+        fact_rows = conn.execute(
+            """
+            SELECT c.ticker, COUNT(*) AS n FROM xbrl_facts x
+            JOIN companies c ON c.cik = x.cik
+            GROUP BY c.ticker ORDER BY c.ticker
+            """
+        ).fetchall()
+        print("\nXBRL facts:")
+        if not fact_rows:
+            print("  (none)")
+        else:
+            for row in fact_rows:
+                print(f"  {row['ticker']}: {row['n']}")
+
+        metric_rows = conn.execute(
+            """
+            SELECT c.ticker, COUNT(*) AS n FROM metrics m
+            JOIN companies c ON c.cik = m.cik
+            GROUP BY c.ticker ORDER BY c.ticker
+            """
+        ).fetchall()
+        print("\nMetrics:")
+        if not metric_rows:
+            print("  (none)")
+        else:
+            for row in metric_rows:
+                print(f"  {row['ticker']}: {row['n']}")
     finally:
         conn.close()
 
@@ -232,6 +325,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Report what would be written and verified, without writing files or touching the schema",
     )
 
+    p_ingest = sub.add_parser("ingest-xbrl", help="Fetch companyfacts and store configured concepts")
+    p_ingest.add_argument("--ticker", help="Restrict to one watchlist ticker")
+
+    p_compute = sub.add_parser("compute-metrics", help="Compute the metric registry from xbrl_facts")
+    p_compute.add_argument("--ticker", help="Restrict to one watchlist ticker")
+    p_compute.add_argument("--metric", help="Recompute a single metric by name")
+
+    p_validate = sub.add_parser("validate", help="Run data-quality checks against the real database")
+    p_validate.add_argument("--ticker", help="Restrict to one watchlist ticker")
+
     sub.add_parser("status", help="Summarize filings by company, form, and status")
 
     return parser
@@ -252,6 +355,12 @@ def main(argv: list[str] | None = None) -> int:
         cmd_backfill_manifests(args)
     elif args.command == "migrate-sections":
         cmd_migrate_sections(args)
+    elif args.command == "ingest-xbrl":
+        cmd_ingest_xbrl(args)
+    elif args.command == "compute-metrics":
+        cmd_compute_metrics(args)
+    elif args.command == "validate":
+        cmd_validate(args)
     elif args.command == "status":
         cmd_status(args)
 

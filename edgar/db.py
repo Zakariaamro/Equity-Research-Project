@@ -57,6 +57,8 @@ CREATE TABLE IF NOT EXISTS xbrl_facts (
     value         REAL NOT NULL,
     accession_no  TEXT,
     form_type     TEXT,
+    duration_days INTEGER,
+    filed_date    TEXT,
     UNIQUE(cik, concept, unit, period_start, period_end, accession_no)
 );
 
@@ -64,6 +66,7 @@ CREATE TABLE IF NOT EXISTS metrics (
     id           INTEGER PRIMARY KEY,
     cik          TEXT NOT NULL REFERENCES companies(cik),
     accession_no TEXT REFERENCES filings(accession_no),
+    period_start TEXT NOT NULL,
     period_end   TEXT NOT NULL,
     name         TEXT NOT NULL,
     value        REAL,
@@ -71,7 +74,7 @@ CREATE TABLE IF NOT EXISTS metrics (
     inputs_json  TEXT NOT NULL,
     calc_version TEXT NOT NULL,
     computed_at  TEXT NOT NULL,
-    UNIQUE(cik, period_end, name, calc_version)
+    UNIQUE(cik, period_start, period_end, name, calc_version)
 );
 
 CREATE TABLE IF NOT EXISTS analyses (
