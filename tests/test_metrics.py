@@ -50,8 +50,12 @@ def conn(tmp_path):
 
 
 def _ingest(conn, cik: str) -> None:
-    xbrl.ingest_company(conn, FakeXbrlClient(FIXTURES_BY_CIK[cik]), cik)
+    # filings rows must exist before xbrl ingest runs -- matches the real
+    # pipeline order (discover/fetch before ingest-xbrl) and is required for
+    # xbrl.ingest_company's filings.fiscal_year/fiscal_period backfill
+    # (SPEC-005 change 9) to have any known accessions to update.
     insert_fixture_filings(conn, ciks=[cik])
+    xbrl.ingest_company(conn, FakeXbrlClient(FIXTURES_BY_CIK[cik]), cik)
 
 
 def _ingest_all(conn) -> None:

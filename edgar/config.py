@@ -401,6 +401,17 @@ class MetricDef:
     cross-company bound is meaningful; ratios/percentages/indices get wide,
     deliberately generous bounds -- catching sign and magnitude errors, not
     precision.
+
+    `extreme_informative` (SPEC-005 change, post-implementation) gates
+    `metric_multi_year_extreme` (observations.py): False for compounding
+    dollar-level metrics, where a "record" restates growth rather than
+    reporting an event -- a growing company setting a revenue-scale record
+    every few quarters says nothing an analyst doesn't already know from the
+    growth-rate metrics themselves. A five-year low in a *ratio* (margin,
+    return, days-outstanding) is information; a five-year high in a *level*
+    (ebitda, free cash flow, invested capital, net debt) usually is not.
+    True for everything else, including growth-RATE metrics (revenue_yoy,
+    ...) and quality indices (Beneish) -- those are not compounding levels.
     """
 
     name: str
@@ -409,6 +420,7 @@ class MetricDef:
     plausible_range: tuple[float, float] | None
     needs_prior: bool = False
     category: str = ""
+    extreme_informative: bool = True
 
 
 METRIC_REGISTRY: dict[str, MetricDef] = {
@@ -434,7 +446,10 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
     "net_margin": MetricDef(
         "net_margin", ("net_income", "revenue"), "both", (-2.0, 1.0), False, "margins"
     ),
-    "ebitda": MetricDef("ebitda", ("operating_income", "dep_amort"), "both", None, False, "margins"),
+    "ebitda": MetricDef(
+        "ebitda", ("operating_income", "dep_amort"), "both", None, False, "margins",
+        extreme_informative=False,
+    ),
     "ebitda_margin": MetricDef(
         "ebitda_margin", ("operating_income", "dep_amort", "revenue"), "both", (-2.0, 1.0), False, "margins"
     ),
@@ -461,7 +476,8 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         "effective_tax_rate", ("tax_expense", "pretax_income"), "both", (-3.0, 2.0), False, "returns"
     ),
     "nopat": MetricDef(
-        "nopat", ("operating_income", "tax_expense", "pretax_income"), "both", None, False, "returns"
+        "nopat", ("operating_income", "tax_expense", "pretax_income"), "both", None, False, "returns",
+        extreme_informative=False,
     ),
     "invested_capital": MetricDef(
         "invested_capital",
@@ -474,6 +490,7 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         None,
         False,
         "returns",
+        extreme_informative=False,
     ),
     "roic": MetricDef(
         "roic",
@@ -506,7 +523,8 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         "capex_to_depreciation", ("capex", "depreciation", "dep_amort"), "both", (0.0, 10.0), False, "capital_cash"
     ),
     "free_cash_flow": MetricDef(
-        "free_cash_flow", ("cfo", "capex"), "both", None, False, "capital_cash"
+        "free_cash_flow", ("cfo", "capex"), "both", None, False, "capital_cash",
+        extreme_informative=False,
     ),
     "fcf_margin": MetricDef(
         "fcf_margin", ("cfo", "capex", "revenue"), "both", (-2.0, 1.0), False, "capital_cash"
@@ -563,6 +581,7 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         None,
         False,
         "solvency",
+        extreme_informative=False,
     ),
     "net_debt_to_ebitda": MetricDef(
         "net_debt_to_ebitda",
@@ -671,3 +690,273 @@ ALIAS_AGREEMENT_TOLERANCE: float = 0.01
 # Raised 1% -> 2% live (R6a): the 1% floor let a near-zero Δrevenue amplify noise into
 # a range-shaped outlier. Guarding the denominator, not the output range.
 INCREMENTAL_MARGIN_MIN_REVENUE_DELTA_PCT: float = 0.02
+
+# --- SPEC-005: readability and observations ---
+
+# R1: normalized_text_hash normalization. text_hash means content identity
+# (any byte differs -> different hash); normalized_text_hash means wording
+# identity (the prose reads the same, modulo the version stamp and rolling
+# numeric disclosures within it).
+
+# The XBRL viewer template prepends a bare version stamp (e.g. "v3.25.0.1")
+# as the literal first line of every R-file's rendered body -- confirmed
+# live, ARCHITECTURE.md §3.7. It is a rendering artifact, not content, and
+# changes on every viewer upgrade regardless of whether the underlying text
+# changed. Stripped entirely rather than number-masked: masking alone would
+# still leave a different token shape across versions with a different
+# number of dot-separated segments (v3.25.0.1 -> v3.25.4).
+XBRL_VIEWER_VERSION_LINE_PATTERN: str = r"\Av\d+(?:\.\d+)+[ \t]*\n?"
+
+# Masks every run of digits (with embedded commas/periods) to one placeholder
+# token, so a rolling disclosure figure ("$1.3 billion, $1.4 billion, and
+# $1.4 billion as of December 31, 2022, 2023, and 2024") does not register
+# as a wording change when only the trailing figures roll forward a year.
+# Confirmed necessary live: Amazon's FY2024->FY2025 Policies text differs in
+# its normalized_text_hash-less form on essentially every rolling figure
+# embedded in otherwise-unchanged policy paragraphs.
+NUMERIC_TOKEN_PATTERN: str = r"\d[\d,]*\.?\d*"
+NUMERIC_TOKEN_PLACEHOLDER: str = "<NUM>"
+
+# R1: readability. Syllable heuristic is crude, pure-Python, and deliberately
+# not a dependency -- the project relies on it only for *change over time*
+# (a consistently-imperfect measure supports "this note got harder to read"
+# even though it cannot support an absolute Gunning Fog score). See
+# readability.py and ARCHITECTURE.md.
+COMPLEX_WORD_MIN_SYLLABLES: int = 3
+
+# Edge case: a one-sentence section produces a computable but meaningless fog
+# index. No readability_change observation below this many words in EITHER
+# the current or the prior-year section.
+READABILITY_MIN_WORD_COUNT: int = 50
+READABILITY_CHANGE_PCT: float = 0.15
+
+# R5: rule registry.
+
+
+@dataclass(frozen=True)
+class RuleDef:
+    """Declarative metadata for one observation rule. Firing logic lives in
+    observations.py -- this dataclass holds only what a config entry should
+    hold, matching MetricDef's split between config.py (data) and metrics.py
+    (computation).
+
+    `version` is this rule's own calc_version-equivalent: observations are
+    keyed and filtered on it exactly as metrics are filtered on
+    config.CALC_VERSION (SPEC-005 change 8), but per-rule rather than global
+    -- bumping one rule's threshold must not invalidate every other rule's
+    history.
+
+    `severity` is None for metric_threshold_cross, whose severity varies per
+    declared threshold (DECLARED_THRESHOLDS below) -- never assigned by
+    judgement, always derived from the rule and its magnitude (R4).
+    """
+
+    name: str
+    version: str
+    severity: str | None
+    subject_kind: str  # "metric" | "section" -- which table this rule reads
+
+
+RULE_REGISTRY: dict[str, RuleDef] = {
+    # v2: MetricDef.extreme_informative added post-implementation, excluding
+    # compounding dollar-level metrics (ebitda, nopat, invested_capital,
+    # free_cash_flow, net_debt) -- a real behavior change, so the version
+    # bumps; v1's observations on those metrics remain in the table for
+    # comparison but drop out of every current-version query (R4/R8).
+    "metric_multi_year_extreme": RuleDef("metric_multi_year_extreme", "v2", "medium", "metric"),
+    "metric_sigma_move": RuleDef("metric_sigma_move", "v1", "medium", "metric"),
+    "metric_threshold_cross": RuleDef("metric_threshold_cross", "v1", None, "metric"),
+    "metric_divergence": RuleDef("metric_divergence", "v1", "high", "metric"),
+    # Renamed from accounting_policy_changed (SPEC-005 change 2): driven by
+    # normalized_text_hash, not text_hash, and its firing threshold is a
+    # measured calibration -- see SECTION_WORDING_SIMILARITY_THRESHOLD below
+    # and SPEC-005 R5a / ARCHITECTURE.md.
+    "section_wording_changed": RuleDef("section_wording_changed", "v1", "high", "section"),
+    "section_length_change": RuleDef("section_length_change", "v1", "medium", "section"),
+    "section_appeared": RuleDef("section_appeared", "v1", "high", "section"),
+    "section_disappeared": RuleDef("section_disappeared", "v1", "high", "section"),
+    "metric_stopped_computing": RuleDef("metric_stopped_computing", "v1", "medium", "metric"),
+    "readability_change": RuleDef("readability_change", "v1", "low", "section"),
+}
+
+
+@dataclass(frozen=True)
+class ThresholdRule:
+    """One declared threshold for metric_threshold_cross (SPEC-005 R5)."""
+
+    metric: str
+    comparator: str  # "above" | "below" | "crosses_zero"
+    value: float | None  # None for crosses_zero
+    severity: str
+
+
+DECLARED_THRESHOLDS: tuple[ThresholdRule, ...] = (
+    ThresholdRule("beneish_m_score", "above", BENEISH_FLAG_THRESHOLD, "high"),
+    ThresholdRule("current_ratio", "below", 1.0, "medium"),
+    ThresholdRule("net_debt", "crosses_zero", None, "medium"),
+    ThresholdRule("fcf_conversion", "below", 0.5, "medium"),
+    ThresholdRule("interest_coverage", "below", 3.0, "high"),
+)
+
+
+@dataclass(frozen=True)
+class DivergenceRule:
+    """One declared divergence for metric_divergence (SPEC-005 R5). Severity
+    is uniformly "high" for this rule -- see RULE_REGISTRY."""
+
+    metric: str
+    shape: str  # "above" | "yoy_decline"
+    value: float
+
+
+DECLARED_DIVERGENCES: tuple[DivergenceRule, ...] = (
+    DivergenceRule("inventory_growth_less_revenue_growth", "above", 0.15),
+    DivergenceRule("capex_to_depreciation", "above", 1.5),
+    DivergenceRule("depreciation_rate", "yoy_decline", 0.15),
+)
+
+# SPEC-005 change 3 -- governing principle: a state-based rule (one whose
+# condition can hold for many consecutive periods) fires only on the
+# transition INTO the condition, never while it persists. Verified live
+# against real data before this was adopted: without it, capex_to_depreciation
+# fired on 71% of eligible periods (both AMZN and NVDA/MU are in sustained
+# capex-expansion mode, so "capex > 1.5x depreciation" is close to their
+# normal state, not an event) and fcf_conversion fired on 50% ("currently
+# below 0.5" vs. "just crossed below 0.5" are very different claims). Applies
+# to metric_threshold_cross and metric_divergence only -- NOT to
+# metric_multi_year_extreme or metric_sigma_move, whose own mathematical
+# definitions (a new record; a >2-sigma move) are already self-limiting.
+
+# SPEC-005 change 4: minimum-history requirements split by basis for
+# metric_multi_year_extreme. Quarterly cadence needs more periods before a
+# "record" means anything than annual cadence does -- 5 years is 20 quarters
+# but only 5 annual periods, and requiring 8 annual periods would make the
+# rule permanently dead for every annual-only metric at current corpus depth
+# (confirmed live: 0 eligible periods, ever, for any company, under a flat
+# 8-prior-period rule applied to beneish_m_score or
+# inventory_growth_less_revenue_growth). 4 is the smallest window in which
+# "a new low" still means something for a metric reported once a year.
+EXTREME_MIN_PRIOR_PERIODS: dict[str, int] = {"quarterly": 8, "annual": 4}
+EXTREME_WINDOW_PERIODS: dict[str, int] = {"quarterly": 20, "annual": 5}  # "prior 5 years"
+
+# metric_sigma_move remains quarterly-only, unlike metric_multi_year_extreme:
+# ordering (is this the highest/lowest of N) is robust with few points; a
+# standard deviation computed from 4-8 annual points is not a reliable
+# dispersion estimate the same way. Never evaluated against annual-basis
+# periods -- an intentional exclusion, not a miscalibration, and every
+# annual-only metric (Beneish, working capital) will show zero
+# metric_sigma_move observations by design.
+SIGMA_MIN_PRIOR_PERIODS: int = 8
+SIGMA_STD_DEV_THRESHOLD: float = 2.0
+
+SECTION_LENGTH_CHANGE_PCT: float = 0.25
+
+# SPEC-005 change 6: note-name aliases, same discipline as CONCEPT_REGISTRY
+# aliases (ARCHITECTURE.md §2.1) -- an entry here must be a verified rename
+# of the SAME note, never a broader/narrower relationship, and never a
+# guess. Every entry below was confirmed two ways against live data: (1) the
+# two names never co-occur in the same filing, anywhere in the company's
+# history, and (2) the actual section text on either side of the transition
+# describes the same underlying disclosure (same XBRL [Abstract] element,
+# same opening sentence). Checked across all three watchlist companies;
+# genuine renames were found only for Micron.
+
+
+@dataclass(frozen=True)
+class NoteNameAlias:
+    alias: str
+    canonical: str
+    reason: str
+
+
+_NOTE_NAME_ALIAS_ENTRIES: tuple[NoteNameAlias, ...] = (
+    NoteNameAlias(
+        "Basis of Presentation Basis of Presentation",
+        "Basis of Presentation",
+        "Micron 10-Q 2018-12-19 only: FilingSummary.xml renders this one filing's "
+        "heading doubled ('Basis of Presentation Basis of Presentation'). Content "
+        "confirmed identical topic (Organization, Consolidation and Presentation of "
+        "Financial Statements) to every adjacent filing's plain 'Basis of "
+        "Presentation' -- a rendering artifact for this one filing, not a second note.",
+    ),
+    NoteNameAlias(
+        "Segment Information",
+        "Segment and Other Information",
+        "Micron's FilingSummary ShortName for its segment-reporting note flickered "
+        "between 'Segment Information' and 'Segment and Other Information' from "
+        "2018 to 2021 before settling permanently on the latter. Content confirmed "
+        "identical (same 'Segment Reporting [Abstract]' XBRL element, same opening "
+        "sentence) on both sides -- one note, two labels in use during the transition.",
+    ),
+    NoteNameAlias(
+        "Equity Plans",
+        "Equity Compensation Plans",
+        "Micron renamed this note's FilingSummary ShortName in its FY2024 10-K "
+        "(2024-10-04), permanently. Content confirmed identical topic (same "
+        "'Share-Based Payment Arrangement [Abstract]' XBRL element) on both sides.",
+    ),
+)
+
+NOTE_NAME_ALIASES: dict[str, str] = {e.alias: e.canonical for e in _NOTE_NAME_ALIAS_ENTRIES}
+
+# SPEC-005 change 2, calibration finding: measured live against the real
+# corpus, EXACT normalized_text_hash equality changes on 98.9% of
+# fiscal-year-matched Policies comparisons and 98.3% of Notes comparisons --
+# both far above the 33% ceiling (R8), and nearly identical to each other.
+# Confirmed by direct diff, not a normalization bug: filers genuinely
+# rewrite a sentence or two in nearly every note nearly every year (real
+# examples found live: Amazon added a healthcare-services clause and a new
+# "Derivative Instruments" policy; Micron's "Restructure and Asset
+# Impairments" note, ~400 words, changed in 100% of the years compared).
+# Byte-for-byte wording identity is therefore not a usable firing signal in
+# EITHER category -- the fix is a materiality threshold, not a category
+# choice. section_wording_changed uses normalized_text_hash as a fast exact
+# match (skip trivially-identical wording, cheaply) and, for everything
+# else, a real similarity ratio between the two normalized texts
+# (difflib.SequenceMatcher.quick_ratio) against this threshold. Measured at
+# 0.85: Policies fires on 14.6% of comparisons, Notes on 13.3% -- both
+# comfortably under the ceiling and, again, nearly identical between
+# categories. That similarity between categories is itself the calibration
+# finding: Notes does not need excluding once real per-period noise
+# (numbers, and now materiality) is controlled for.
+SECTION_WORDING_SIMILARITY_THRESHOLD: float = 0.85
+
+# Notes whose PRESENCE legitimately fluctuates period to period (e.g. a
+# "pending ASU" housekeeping note that is only written when one is actually
+# pending) -- excluded from section_appeared/section_disappeared specifically,
+# because that rule means "a new or discontinued disclosure," not "nothing
+# was pending this quarter." Confirmed live: this note toggled in and out of
+# Micron's filings repeatedly across adjacent quarters, which is a recurring
+# housekeeping pattern, not an event. section_length_change and
+# section_wording_changed still apply normally whenever the note IS present
+# in both compared periods -- only appeared/disappeared skips these names.
+FLUCTUATING_NOTE_NAMES: frozenset[str] = frozenset({
+    "Recently Issued Accounting Standards Not Yet Adopted",
+})
+
+# --- SPEC-005 R8: validate additions ---
+FIRING_RATE_WARNING_PCT: float = 0.33
+
+# --- SPEC-005 R10 (AC14 amendment): app.db size is a growth measure, not an
+# absolute ceiling -- the absolute number was already relaxed twice during
+# SPEC-004 (5 MB -> 6 MB) and needed relaxing again after SPEC-005 shipped.
+# DB_SIZE_SOFT_CEILING_BYTES is informational only -- validate reports
+# against it but never hard-fails on it; crossing it is a prompt to revisit
+# the SQLite-in-git storage design (ARCHITECTURE.md §4.1), not a build break.
+DB_SIZE_SOFT_CEILING_BYTES: int = 15 * 1024 * 1024
+
+# Measured once, live, against a scratch copy of the real database: deleted
+# one real Micron 10-Q's rows (filings/sections/xbrl_facts/metrics/
+# observations), VACUUMed, then reprocessed it end to end through the real
+# pipeline (extract -> ingest-xbrl -> compute-metrics -> backfill-readability
+# -> compute-observations) and VACUUMed again. This is a point measurement,
+# not something validate recomputes on every run -- doing that live would
+# mean network calls and a scratch-copy side effect on every invocation,
+# which contradicts validate's own zero-side-effects design. Re-measure by
+# hand (see ARCHITECTURE.md §7a / decision log 32) if the marginal cost is
+# ever suspected to have shifted materially (e.g. a new company added).
+DB_SIZE_MEASURED_MARGINAL_BYTES_PER_FILING: int = 73_728
+DB_SIZE_MEASURED_MARGINAL_FILING_DESCRIPTION: str = (
+    "one MU 10-Q (0000723125-26-000015): 90 XBRL facts, 31 metric rows, several "
+    "sections, 51 observations -- measured 2026-07-27"
+)

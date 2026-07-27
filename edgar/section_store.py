@@ -10,6 +10,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import os
+import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,32 @@ class MigrationAbortedError(Exception):
 
 def _hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# --- SPEC-005: normalized_text_hash (wording identity, not content identity) ---
+
+_VERSION_LINE_RE = re.compile(config.XBRL_VIEWER_VERSION_LINE_PATTERN)
+_NUMERIC_TOKEN_RE = re.compile(config.NUMERIC_TOKEN_PATTERN)
+
+
+def normalize_for_wording_hash(text: str) -> str:
+    """Strip the XBRL viewer version line, then mask every numeric token.
+
+    Order matters: the version line ("v3.25.0.1") is removed outright rather
+    than number-masked, because masking alone leaves a different token shape
+    when the viewer's dot-separated segment count changes between versions
+    (v3.25.0.1 -> v3.25.4 has 4 segments then 2). Everything else numeric --
+    dollar figures, percentages, dates, share counts -- is masked to one
+    placeholder so a rolling disclosure figure inside an otherwise-unchanged
+    sentence does not register as a wording change.
+    """
+    text = _VERSION_LINE_RE.sub("", text)
+    text = _NUMERIC_TOKEN_RE.sub(config.NUMERIC_TOKEN_PLACEHOLDER, text)
+    return text
+
+
+def hash_normalized_text(text: str) -> str:
+    return hashlib.sha256(normalize_for_wording_hash(text).encode("utf-8")).hexdigest()
 
 
 def section_path(text_hash: str) -> Path:

@@ -44,9 +44,13 @@ def conn(tmp_path):
 def _ingest_and_compute(conn, tickers: list[str]) -> None:
     cik_by_ticker = {"AMZN": AMZN_CIK, "NVDA": NVDA_CIK, "MU": MU_CIK}
     ciks = [cik_by_ticker[t] for t in tickers]
+    # filings rows must exist before xbrl ingest runs -- matches the real
+    # pipeline order (discover/fetch before ingest-xbrl) and is required for
+    # xbrl.ingest_company's filings.fiscal_year/fiscal_period backfill
+    # (SPEC-005 change 9) to have any known accessions to update.
+    insert_fixture_filings(conn, ciks=ciks)
     for cik in ciks:
         xbrl.ingest_company(conn, FakeXbrlClient(FIXTURES_BY_CIK[cik]), cik)
-    insert_fixture_filings(conn, ciks=ciks)
     metrics.compute_metrics(conn, tickers=tickers)
 
 
@@ -212,6 +216,9 @@ def test_hard_failure_count_reflects_categories_1_through_6(conn):
         + len(report.debt_reconciliation_violations)
         + len(report.period_mixing_violations)
         + len(report.alias_agreement_violations)
+        + len(report.observation_lookahead_violations)
+        + len(report.observation_determinism_violations)
+        + len(report.observation_orphan_refs)
     )
 
 
@@ -294,3 +301,17 @@ def test_format_report_is_readable_text(conn):
     assert "Alias agreement" in text
     assert "Unverified YoY drift" in text
     assert "Finance lease zero-assumption" in text
+    assert "Database size" in text
+
+
+def test_db_size_reports_real_file_size_and_never_hard_fails(conn):
+    # `conn` is a real on-disk tmp_path database (not :memory:), so this
+    # exercises the real PRAGMA database_list lookup, not a mock.
+    _ingest_and_compute(conn, ["AMZN"])
+    report = validate.run_validate(conn, tickers=["AMZN"])
+    assert report.db_size["size_bytes"] is not None
+    assert report.db_size["size_bytes"] > 0
+    assert report.db_size["soft_ceiling_bytes"] == config.DB_SIZE_SOFT_CEILING_BYTES
+    assert report.db_size["over_soft_ceiling"] is False  # a tiny test db is nowhere near 15 MB
+    assert report.db_size["measured_marginal_bytes_per_filing"] > 0
+    assert report.hard_failure_count == 0  # db_size never contributes to hard failures

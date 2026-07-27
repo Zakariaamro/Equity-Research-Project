@@ -12,7 +12,7 @@ import shutil
 import sqlite3
 import sys
 
-from edgar import config, db, fetch, metrics, monitor, section_store, sections, validate, xbrl
+from edgar import config, db, fetch, metrics, monitor, observations, section_store, sections, validate, xbrl
 from edgar.edgar_client import EdgarClient
 from edgar.monitor import DiscoveredFiling
 
@@ -223,6 +223,46 @@ def cmd_compute_metrics(args: argparse.Namespace) -> None:
         conn.close()
 
 
+def cmd_backfill_readability(args: argparse.Namespace) -> None:
+    conn = db.get_connection()
+    try:
+        result = sections.backfill_readability(conn, force=args.force)
+        print(
+            f"{result['updated']} section(s) updated, {result['missing_content']} missing content "
+            f"({result['eligible']}/{result['total']} eligible)."
+        )
+    finally:
+        conn.close()
+
+
+def cmd_compute_observations(args: argparse.Namespace) -> None:
+    tickers = None
+    if args.ticker:
+        _validate_ticker(args.ticker)
+        tickers = [args.ticker]
+    rule_names = [args.rule] if args.rule else None
+
+    conn = db.get_connection()
+    try:
+        written = observations.compute_observations(conn, tickers=tickers, rule_names=rule_names)
+        print(f"{len(written)} observation(s) written/updated.")
+        by_rule: dict[str, int] = {}
+        by_ticker: dict[str, int] = {}
+        for w in written:
+            by_rule[w["rule_name"]] = by_rule.get(w["rule_name"], 0) + 1
+            by_ticker[w["ticker"]] = by_ticker.get(w["ticker"], 0) + 1
+        if by_rule:
+            print("  By rule:")
+            for name, n in sorted(by_rule.items(), key=lambda kv: -kv[1]):
+                print(f"    {n:4d}  {name}")
+        if by_ticker:
+            print("  By company:")
+            for ticker, n in sorted(by_ticker.items()):
+                print(f"    {n:4d}  {ticker}")
+    finally:
+        conn.close()
+
+
 def cmd_validate(args: argparse.Namespace) -> None:
     tickers = None
     if args.ticker:
@@ -284,6 +324,20 @@ def cmd_status(args: argparse.Namespace) -> None:
         else:
             for row in metric_rows:
                 print(f"  {row['ticker']}: {row['n']}")
+
+        observation_rows = conn.execute(
+            """
+            SELECT c.ticker, COUNT(*) AS n FROM observations o
+            JOIN companies c ON c.cik = o.cik
+            GROUP BY c.ticker ORDER BY c.ticker
+            """
+        ).fetchall()
+        print("\nObservations:")
+        if not observation_rows:
+            print("  (none)")
+        else:
+            for row in observation_rows:
+                print(f"  {row['ticker']}: {row['n']}")
     finally:
         conn.close()
 
@@ -332,6 +386,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_compute.add_argument("--ticker", help="Restrict to one watchlist ticker")
     p_compute.add_argument("--metric", help="Recompute a single metric by name")
 
+    p_backfill_readability = sub.add_parser(
+        "backfill-readability", help="Populate normalized_text_hash and readability columns on sections"
+    )
+    p_backfill_readability.add_argument(
+        "--force", action="store_true", help="Recompute rows already populated"
+    )
+
+    p_compute_obs = sub.add_parser(
+        "compute-observations", help="Run the observation rule registry over metrics and sections"
+    )
+    p_compute_obs.add_argument("--ticker", help="Restrict to one watchlist ticker")
+    p_compute_obs.add_argument("--rule", help="Recompute a single rule by name")
+
     p_validate = sub.add_parser("validate", help="Run data-quality checks against the real database")
     p_validate.add_argument("--ticker", help="Restrict to one watchlist ticker")
 
@@ -359,6 +426,10 @@ def main(argv: list[str] | None = None) -> int:
         cmd_ingest_xbrl(args)
     elif args.command == "compute-metrics":
         cmd_compute_metrics(args)
+    elif args.command == "backfill-readability":
+        cmd_backfill_readability(args)
+    elif args.command == "compute-observations":
+        cmd_compute_observations(args)
     elif args.command == "validate":
         cmd_validate(args)
     elif args.command == "status":

@@ -13,7 +13,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
-from edgar import config, section_store
+from edgar import config, readability, section_store
 from edgar.edgar_client import EdgarClient, EdgarError, EdgarNotFoundError
 from edgar.html_text import html_to_text
 
@@ -58,7 +58,8 @@ def _select_reports(filing_summary_xml: bytes) -> list[ReportRef]:
 
 
 def _write_section(conn: sqlite3.Connection, accession_no: str, report: ReportRef, text: str) -> None:
-    """Write text to the content-addressed store and record only the hash.
+    """Write text to the content-addressed store and record the hash plus
+    readability columns (SPEC-005 R1).
 
     If a row for this (accession_no, category, short_name, source_file) already
     carries the same hash, the DB write is skipped entirely -- re-extracting
@@ -77,14 +78,22 @@ def _write_section(conn: sqlite3.Connection, accession_no: str, report: ReportRe
     if existing is not None and existing["text_hash"] == text_hash:
         return
 
+    normalized_text_hash = section_store.hash_normalized_text(text)
+    counts = readability.compute_counts(text)
+
     conn.execute(
         """
         INSERT INTO sections (
-            accession_no, category, short_name, source_file, position, text_hash
-        ) VALUES (?, ?, ?, ?, ?, ?)
+            accession_no, category, short_name, source_file, position, text_hash,
+            normalized_text_hash, word_count, sentence_count, complex_word_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(accession_no, category, short_name, source_file) DO UPDATE SET
             position = excluded.position,
-            text_hash = excluded.text_hash
+            text_hash = excluded.text_hash,
+            normalized_text_hash = excluded.normalized_text_hash,
+            word_count = excluded.word_count,
+            sentence_count = excluded.sentence_count,
+            complex_word_count = excluded.complex_word_count
         """,
         (
             accession_no,
@@ -93,6 +102,10 @@ def _write_section(conn: sqlite3.Connection, accession_no: str, report: ReportRe
             report.html_file_name,
             report.position,
             text_hash,
+            normalized_text_hash,
+            counts.word_count,
+            counts.sentence_count,
+            counts.complex_word_count,
         ),
     )
 
@@ -244,3 +257,41 @@ def extract_pending(
             status = "failed"
         results.append({"accession_no": accession_no, "status": status})
     return results
+
+
+def backfill_readability(conn: sqlite3.Connection, force: bool = False) -> dict[str, int]:
+    """Populate normalized_text_hash/word_count/sentence_count/complex_word_count
+    for every section (SPEC-005 R1/AC1). Idempotent: skips rows already
+    populated unless force=True. All four columns are pure functions of the
+    immutable section text (read via its text_hash), so recomputing never
+    changes an already-populated row -- `force` exists for re-running after a
+    normalization or heuristic change, not for correctness.
+    """
+    total = conn.execute("SELECT COUNT(*) AS n FROM sections").fetchone()["n"]
+    query = "SELECT id, text_hash FROM sections"
+    if not force:
+        query += " WHERE word_count IS NULL"
+    rows = conn.execute(query).fetchall()
+
+    updated = 0
+    missing_content = 0
+    for row in rows:
+        try:
+            text = section_store.read_section_text(row["text_hash"])
+        except section_store.SectionContentMissingError:
+            logger.warning("No content on disk for section id=%s (hash=%s)", row["id"], row["text_hash"])
+            missing_content += 1
+            continue
+        normalized_text_hash = section_store.hash_normalized_text(text)
+        counts = readability.compute_counts(text)
+        conn.execute(
+            """
+            UPDATE sections SET
+                normalized_text_hash = ?, word_count = ?, sentence_count = ?, complex_word_count = ?
+            WHERE id = ?
+            """,
+            (normalized_text_hash, counts.word_count, counts.sentence_count, counts.complex_word_count, row["id"]),
+        )
+        updated += 1
+    conn.commit()
+    return {"total": total, "eligible": len(rows), "updated": updated, "missing_content": missing_content}

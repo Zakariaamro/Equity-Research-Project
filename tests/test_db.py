@@ -20,7 +20,7 @@ def test_db_init_idempotent(tmp_path):
         conn.close()
 
 
-def test_db_has_seven_tables(tmp_path):
+def test_db_has_all_tables(tmp_path):
     db_path = tmp_path / "test.db"
     db.init_db(db_path)
 
@@ -31,7 +31,7 @@ def test_db_has_seven_tables(tmp_path):
         ).fetchall()
         names = {row["name"] for row in rows}
         assert names == set(db.TABLE_NAMES)
-        assert len(names) == 7
+        assert len(names) == len(db.TABLE_NAMES)
     finally:
         conn.close()
 

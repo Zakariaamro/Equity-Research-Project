@@ -11,9 +11,11 @@ import json
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import date
+from pathlib import Path
 
 from edgar import config
 from edgar import metrics as metrics_mod
+from edgar import observations as observations_mod
 
 
 @dataclass
@@ -32,6 +34,12 @@ class ValidationReport:
     coverage: list[dict] = field(default_factory=list)
     unresolved_concepts: list[dict] = field(default_factory=list)
     finance_lease_zero_assumptions: list[dict] = field(default_factory=list)
+    observation_firing_rates: list[dict] = field(default_factory=list)
+    observation_dead_rules: list[dict] = field(default_factory=list)
+    observation_lookahead_violations: list[dict] = field(default_factory=list)
+    observation_determinism_violations: list[dict] = field(default_factory=list)
+    observation_orphan_refs: list[dict] = field(default_factory=list)
+    db_size: dict = field(default_factory=dict)
 
     @property
     def hard_failure_count(self) -> int:
@@ -42,6 +50,9 @@ class ValidationReport:
             + len(self.debt_reconciliation_violations)
             + len(self.period_mixing_violations)
             + len(self.alias_agreement_violations)
+            + len(self.observation_lookahead_violations)
+            + len(self.observation_determinism_violations)
+            + len(self.observation_orphan_refs)
         )
 
 
@@ -588,6 +599,165 @@ def _check_finance_lease_zero_assumptions(conn: sqlite3.Connection, tickers: lis
     return findings
 
 
+# --- SPEC-005 R8: observation checks. All queries filter on each rule's own
+# CURRENT rule_version (config.RULE_REGISTRY[name].version) -- exactly as
+# metrics checks filter on config.CALC_VERSION (SPEC-005 change 8) -- so a
+# stale prior-version row never counts toward firing-rate or coverage stats.
+
+
+def _observations_for_rule(conn: sqlite3.Connection, tickers: list[str] | None, rule_name: str) -> list[dict]:
+    ciks = _ciks_for_tickers(tickers)
+    if not ciks:
+        return []
+    version = config.RULE_REGISTRY[rule_name].version
+    placeholders = ",".join("?" for _ in ciks)
+    rows = conn.execute(
+        f"SELECT id, cik, period_end, subject, severity, statement, refs_json FROM observations "
+        f"WHERE cik IN ({placeholders}) AND rule_name = ? AND rule_version = ?",
+        (*ciks, rule_name, version),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _check_observation_firing_rates(conn: sqlite3.Connection, tickers: list[str] | None) -> list[dict]:
+    """Per rule, share of eligible periods where it fired. Informational --
+    flagged (not hard-failed) above config.FIRING_RATE_WARNING_PCT (R8)."""
+    findings = []
+    for rule_name in config.RULE_REGISTRY:
+        fired = len(_observations_for_rule(conn, tickers, rule_name))
+        eligible = sum(
+            observations_mod.ELIGIBLE_COUNT_FUNCS[rule_name](conn, cik) for cik in _ciks_for_tickers(tickers)
+        )
+        rate = fired / eligible if eligible else 0.0
+        if eligible and rate > config.FIRING_RATE_WARNING_PCT:
+            findings.append({"rule_name": rule_name, "fired": fired, "eligible": eligible, "rate": rate})
+    return findings
+
+
+def _check_observation_dead_rules(conn: sqlite3.Connection, tickers: list[str] | None) -> list[dict]:
+    """A rule that never fires across the whole corpus, informational (R8) --
+    either miscalibrated or dead code, reported either way."""
+    findings = []
+    for rule_name in config.RULE_REGISTRY:
+        fired = len(_observations_for_rule(conn, tickers, rule_name))
+        eligible = sum(
+            observations_mod.ELIGIBLE_COUNT_FUNCS[rule_name](conn, cik) for cik in _ciks_for_tickers(tickers)
+        )
+        if fired == 0:
+            findings.append({"rule_name": rule_name, "eligible": eligible})
+    return findings
+
+
+def _resolve_ref(conn: sqlite3.Connection, ref: dict) -> sqlite3.Row | None:
+    if ref["table"] == "metrics":
+        return conn.execute("SELECT period_end FROM metrics WHERE id = ?", (ref["id"],)).fetchone()
+    if ref["table"] == "sections":
+        return conn.execute(
+            "SELECT f.period_end FROM sections s JOIN filings f ON f.accession_no = s.accession_no WHERE s.id = ?",
+            (ref["id"],),
+        ).fetchone()
+    return None
+
+
+def _check_observation_lookahead(conn: sqlite3.Connection, tickers: list[str] | None) -> list[dict]:
+    """Hard failure (R3/R8): no observation may reference data with
+    period_end later than its own -- re-verified against the PERSISTED
+    table, independently of the write-time assertion in compute_observations."""
+    violations = []
+    for rule_name in config.RULE_REGISTRY:
+        for row in _observations_for_rule(conn, tickers, rule_name):
+            for ref in json.loads(row["refs_json"]):
+                resolved = _resolve_ref(conn, ref)
+                if resolved is not None and resolved["period_end"] > row["period_end"]:
+                    violations.append(
+                        {
+                            "rule_name": rule_name, "cik": row["cik"], "period_end": row["period_end"],
+                            "subject": row["subject"], "ref": ref, "ref_period_end": resolved["period_end"],
+                        }
+                    )
+    return violations
+
+
+def _check_observation_determinism(conn: sqlite3.Connection, tickers: list[str] | None) -> list[dict]:
+    """Hard failure (R8): recompute every rule in memory (no write) and
+    assert the statement is byte-identical to what is persisted.
+
+    Iterates over PERSISTED rows, not over every possible recomputed
+    observation -- an observations table that simply hasn't been computed
+    yet (e.g. right after compute-metrics, before compute-observations ever
+    ran) has nothing persisted to compare against and must read as zero
+    violations, not "everything mismatches." Determinism means "recomputing
+    something already written reproduces it," not "everything computable
+    has been computed."
+    """
+    violations = []
+    for cik, ticker in _companies(tickers):
+        recomputed_by_key = {
+            (obs.rule_name, obs.period_end, obs.subject): obs.statement
+            for obs in observations_mod._observations_for_company(conn, cik, None)
+        }
+        persisted_rows = conn.execute(
+            "SELECT rule_name, period_end, subject, statement, rule_version FROM observations WHERE cik = ?",
+            (cik,),
+        ).fetchall()
+        for row in persisted_rows:
+            if row["rule_version"] != config.RULE_REGISTRY[row["rule_name"]].version:
+                continue  # stale version -- not part of the current determinism check
+            key = (row["rule_name"], row["period_end"], row["subject"])
+            recomputed = recomputed_by_key.get(key)
+            if recomputed is None or recomputed != row["statement"]:
+                violations.append(
+                    {
+                        "ticker": ticker, "rule_name": row["rule_name"], "period_end": row["period_end"],
+                        "subject": row["subject"], "recomputed": recomputed, "persisted": row["statement"],
+                    }
+                )
+    return violations
+
+
+def _check_observation_orphan_refs(conn: sqlite3.Connection, tickers: list[str] | None) -> list[dict]:
+    """Hard failure (R2/R8): every id in refs_json must resolve to an existing row."""
+    violations = []
+    for rule_name in config.RULE_REGISTRY:
+        for row in _observations_for_rule(conn, tickers, rule_name):
+            for ref in json.loads(row["refs_json"]):
+                if _resolve_ref(conn, ref) is None:
+                    violations.append(
+                        {
+                            "rule_name": rule_name, "cik": row["cik"], "period_end": row["period_end"],
+                            "subject": row["subject"], "ref": ref,
+                        }
+                    )
+    return violations
+
+
+# --- SPEC-005 R10 (AC14 amendment): database size, a growth measure ---
+
+
+def _db_file_path(conn: sqlite3.Connection) -> Path | None:
+    for row in conn.execute("PRAGMA database_list"):
+        if row["name"] == "main" and row["file"]:
+            return Path(row["file"])
+    return None
+
+
+def _check_db_size(conn: sqlite3.Connection) -> dict:
+    """Informational, never hard-failing (R10): current app.db size against
+    the 15 MB soft ceiling, plus the last hand-measured marginal cost of one
+    additional filing (config.DB_SIZE_MEASURED_MARGINAL_BYTES_PER_FILING --
+    a point measurement, not recomputed live here; see that constant's
+    docstring for why)."""
+    path = _db_file_path(conn)
+    size_bytes = path.stat().st_size if path is not None and path.exists() else None
+    return {
+        "size_bytes": size_bytes,
+        "soft_ceiling_bytes": config.DB_SIZE_SOFT_CEILING_BYTES,
+        "over_soft_ceiling": size_bytes is not None and size_bytes > config.DB_SIZE_SOFT_CEILING_BYTES,
+        "measured_marginal_bytes_per_filing": config.DB_SIZE_MEASURED_MARGINAL_BYTES_PER_FILING,
+        "measured_marginal_filing_description": config.DB_SIZE_MEASURED_MARGINAL_FILING_DESCRIPTION,
+    }
+
+
 def run_validate(conn: sqlite3.Connection, tickers: list[str] | None = None) -> ValidationReport:
     return ValidationReport(
         range_violations=_check_range_violations(conn, tickers),
@@ -604,6 +774,12 @@ def run_validate(conn: sqlite3.Connection, tickers: list[str] | None = None) -> 
         coverage=_check_coverage(conn, tickers),
         unresolved_concepts=_check_unresolved_concepts(conn, tickers),
         finance_lease_zero_assumptions=_check_finance_lease_zero_assumptions(conn, tickers),
+        observation_firing_rates=_check_observation_firing_rates(conn, tickers),
+        observation_dead_rules=_check_observation_dead_rules(conn, tickers),
+        observation_lookahead_violations=_check_observation_lookahead(conn, tickers),
+        observation_determinism_violations=_check_observation_determinism(conn, tickers),
+        observation_orphan_refs=_check_observation_orphan_refs(conn, tickers),
+        db_size=_check_db_size(conn),
     )
 
 
@@ -701,10 +877,52 @@ def format_report(report: ValidationReport) -> str:
         report.finance_lease_zero_assumptions,
         lambda v: f"{v['ticker']}: total_debt assumed $0 finance lease in {v['periods_affected']} period(s)",
     )
+    _section(
+        "12. Observation firing rates (informational -- flagged above 33%)",
+        report.observation_firing_rates,
+        lambda v: f"{v['rule_name']}: {v['fired']}/{v['eligible']} eligible periods ({v['rate']:.0%})",
+    )
+    _section(
+        "13. Dead observation rules (informational)",
+        report.observation_dead_rules,
+        lambda v: f"{v['rule_name']}: never fired ({v['eligible']} eligible period(s))",
+    )
+    _section(
+        "14. Observation lookahead violations",
+        report.observation_lookahead_violations,
+        lambda v: f"{v['rule_name']} cik={v['cik']} {v['period_end']} subject={v['subject']}: "
+        f"ref {v['ref']} has period_end {v['ref_period_end']}",
+    )
+    _section(
+        "15. Observation determinism violations",
+        report.observation_determinism_violations,
+        lambda v: f"{v['ticker']} {v['rule_name']} {v['period_end']} subject={v['subject']}: "
+        f"recomputed={v['recomputed']!r} vs persisted={v['persisted']!r}",
+    )
+    _section(
+        "16. Observation orphan references",
+        report.observation_orphan_refs,
+        lambda v: f"{v['rule_name']} cik={v['cik']} {v['period_end']} subject={v['subject']}: "
+        f"unresolved ref {v['ref']}",
+    )
+    lines.append("\n=== 17. Database size (informational -- growth measure, not a hard ceiling) ===")
+    d = report.db_size
+    if d.get("size_bytes") is None:
+        lines.append("  (could not determine app.db file size)")
+    else:
+        mb = d["size_bytes"] / (1024 * 1024)
+        ceiling_mb = d["soft_ceiling_bytes"] / (1024 * 1024)
+        flag = "  ** OVER SOFT CEILING **" if d["over_soft_ceiling"] else ""
+        lines.append(f"  app.db: {mb:.2f} MB (soft ceiling {ceiling_mb:.0f} MB){flag}")
+        lines.append(
+            f"  measured marginal cost of one filing: {d['measured_marginal_bytes_per_filing']:,} bytes "
+            f"({d['measured_marginal_filing_description']})"
+        )
 
     lines.append(
-        f"\n{report.hard_failure_count} finding(s) in categories 1-6 (would exit non-zero)."
+        f"\n{report.hard_failure_count} finding(s) in hard-failing categories "
+        "(1, 2, 3, 4, 5, 6, 14, 15, 16) -- would exit non-zero."
         if report.hard_failure_count
-        else "\nCategories 1-6 clean."
+        else "\nAll hard-failing categories clean."
     )
     return "\n".join(lines)

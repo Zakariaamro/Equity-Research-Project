@@ -1,11 +1,41 @@
 # Equity Research Platform — Architecture
 
-**Version:** 1.9
+**Version:** 2.1
 **Date:** 2026-07-27
 **Owner:** Zakaria
 **Status:** Approved for V1 implementation
 
 **Changelog**
+- v2.1 — Three SPEC-005 post-implementation refinements. `MetricDef.extreme_informative`
+  (§7a) excludes five compounding dollar-level metrics from `metric_multi_year_extreme`
+  (a record in a growing company's `ebitda`/`nopat`/`invested_capital`/`free_cash_flow`/
+  `net_debt` restates growth, not an event); firing rate 37.7% → 34.4%, still above the
+  33% design ceiling. AC6 amended: verified live that no watchlist company files a Q4
+  10-Q (`{Q1, Q2, Q3}` only, all three companies, confirmed, not an NVDA/MU-specific
+  quirk) — quarterly chains are 3 real periods per fiscal year, not 4, which is why
+  NVIDIA's Q2 FY2023 `incremental_gross_margin` had only 3 valid prior quarters at that
+  point; the 8-quarter minimum was not lowered to force it through. Derived Q4 figures
+  (already in §8's V2 scope) flagged as the direct future fix. The absolute `app.db` size
+  ceiling — already relaxed twice during SPEC-004 — is replaced by two reported figures
+  (current size; measured marginal cost of one filing, 72 KB, measured live against a
+  scratch copy of the real database) and a 15 MB soft ceiling for revisiting the storage
+  design, rather than raising the number a fourth time. Decision log entries 30–32 added.
+- v2.0 — SPEC-005 implemented: the Observations layer (§2 now five layers, not four).
+  `sections` gains `normalized_text_hash` (wording identity, distinct from `text_hash`'s
+  content identity) and readability columns; `filings` gains `fiscal_year`/`fiscal_period`,
+  populated at XBRL ingest from companyfacts' own `fy`/`fp` labels, used for every
+  fiscal-period prior-year match this spec needs instead of date arithmetic or a join into
+  `xbrl_facts` (§6). New §2.3: state-based rules (ones whose condition can hold for many
+  consecutive periods) fire only entering the condition, never while it persists —
+  verified live as necessary (`capex_to_depreciation` fired on 71% of eligible periods
+  without this). Two calibration findings surfaced live and resolved rather than
+  patched over: `section_wording_changed` (renamed from `accounting_policy_changed`)
+  measured 98.9%/98.3% exact-hash-change rates for Policies/Notes alike — not a
+  normalization bug, filers really do lightly edit prose most years — so the rule uses a
+  measured similarity-ratio materiality threshold instead of a category restriction; and
+  `metric_multi_year_extreme` measures 38% overall (just above the 33% design ceiling),
+  mechanically driven by the very small annual-history window at current corpus depth.
+  Decision log entries 24–29 added.
 - v1.9 — SPEC-004's last two live-validation residuals closed. Two more exceptions
   registers, same pattern as §2.2's alias-agreement one: `DEBT_RECONCILIATION_EXCEPTIONS`
   (keyed per `(cik, period_end)` — Amazon's real 2015-2016 ASU 2015-03 transition) and
@@ -96,16 +126,18 @@ test of whether the architecture is right.
 
 ## 2. Core Design Rule
 
-Four layers of information, never mixed, enforced by separate tables:
+Five layers of information, never mixed, enforced by separate tables:
 
 ```
 FACTS            filings, sections, xbrl_facts     observed from SEC, never derived
    ↓
 CALCULATIONS     metrics                           deterministic, reproducible, auditable
    ↓
+OBSERVATIONS     observations                       deterministic, rule-based, verified by Python
+   ↓
 INTERPRETATION   analyses, findings                LLM output, always attributed
    ↓
-PRESENTATION     dashboard                         reads all three, labels each clearly
+PRESENTATION     dashboard                          reads all four, labels each clearly
 ```
 
 Dependencies point **downward only**. A row in `xbrl_facts` never references a finding.
@@ -113,6 +145,14 @@ Every AI-generated row records the model, prompt version, and the source section
 
 This is not a documentation convention. It is the schema. Violating it requires
 restructuring tables, which is deliberately harder than doing it correctly.
+
+**Observations (SPEC-005).** The layer between Calculations and Interpretation exists
+specifically so the LLM is never asked to do two jobs at once: decide what matters, and
+write about it. Python decides what matters — deterministically, via the rule registry in
+`config.py` plus the engine in `observations.py` — and records a small, verified statement
+with pointers back to the exact `metrics`/`sections` rows behind it. SPEC-006's LLM narrates
+from these statements, never from raw metrics or raw section text, so it cannot invent a
+trend that Python did not already establish as true.
 
 ### 2.1 Alias-list purity rule
 
@@ -170,6 +210,29 @@ reason. `validate` category 6 reports an excepted canonical's disagreements
 informationally, alongside the reason, instead of as a hard failure. A canonical input
 *not* in the register still hard-fails on any disagreement — the register documents an
 accepted exception, it does not silence a finding.
+
+### 2.3 State-based rules fire only on transition (SPEC-005)
+
+Wherever a deterministic rule's condition is a **state** that can hold true for many
+consecutive periods (a metric currently above/below a threshold; two metrics currently
+diverging beyond a bound), the rule must fire only on the **transition into** that state,
+never on every period the state persists. A rule that cannot tell "just crossed" from
+"has been true for two years" will drown its own signal in repetition.
+
+This is not a hypothetical concern — measured live, before the fix, against the real
+database: `capex_to_depreciation` (SPEC-005's `metric_divergence`, naive "is it currently
+above 1.5") fired on **71%** of eligible periods, because both Amazon and NVIDIA/Micron
+are in sustained capex-expansion mode, so the condition is close to their normal state,
+not an event. `fcf_conversion` (`metric_threshold_cross`, naive "is it currently below
+0.5") fired on **50%** the same way. After requiring a transition (condition true this
+period, false the immediately preceding period), the same checks measure 14.0% and well
+under the design ceiling for every other declared threshold/divergence.
+
+The principle does **not** apply to rules whose own mathematical shape is already
+self-limiting: `metric_multi_year_extreme` ("is this a new record over the trailing
+window") and `metric_sigma_move` ("is this more than 2σ from a moving trailing mean")
+both naturally stop firing once a metric stabilizes, without needing an explicit
+transition check — a moving window is already a kind of transition detector.
 
 ---
 
@@ -383,7 +446,7 @@ data/
 
 ## 6. Database Schema
 
-Seven tables.
+Eight tables.
 
 ```sql
 -- ============ REFERENCE ============
@@ -401,6 +464,8 @@ CREATE TABLE filings (
     form_type      TEXT NOT NULL,        -- '10-K' | '10-Q' | '8-K'
     filing_date    TEXT NOT NULL,        -- ISO 8601
     period_end     TEXT,                 -- ISO 8601
+    fiscal_year    INTEGER,              -- SPEC-005: companyfacts fy label; NULL for 8-K
+    fiscal_period  TEXT,                 -- SPEC-005: companyfacts fp label; NULL for 8-K
     items          TEXT,                 -- 8-K items, comma-separated; NULL otherwise
     primary_doc    TEXT,                 -- 'amzn-20260331.htm'
     raw_path       TEXT,                 -- directory holding gzipped archives
@@ -409,13 +474,17 @@ CREATE TABLE filings (
 );
 
 CREATE TABLE sections (
-    id            INTEGER PRIMARY KEY,
-    accession_no  TEXT NOT NULL REFERENCES filings(accession_no),
-    category      TEXT NOT NULL,         -- Statements|Notes|Policies|MDA|RiskFactors|Exhibit
-    short_name    TEXT NOT NULL,         -- 'Income Taxes'
-    source_file   TEXT,                  -- 'R14.htm' | 'primary'
-    position      INTEGER,
-    text_hash     TEXT NOT NULL,         -- sha256 of cleaned plain text; sole link to content
+    id                    INTEGER PRIMARY KEY,
+    accession_no          TEXT NOT NULL REFERENCES filings(accession_no),
+    category              TEXT NOT NULL,  -- Statements|Notes|Policies|MDA|RiskFactors|Exhibit
+    short_name            TEXT NOT NULL,  -- 'Income Taxes'
+    source_file           TEXT,           -- 'R14.htm' | 'primary'
+    position              INTEGER,
+    text_hash             TEXT NOT NULL,  -- sha256 of cleaned plain text; sole link to content
+    normalized_text_hash  TEXT,           -- SPEC-005: wording identity, see note below
+    word_count            INTEGER,        -- SPEC-005
+    sentence_count        INTEGER,        -- SPEC-005
+    complex_word_count    INTEGER,        -- SPEC-005
     UNIQUE(accession_no, category, short_name, source_file)
 );
 
@@ -479,6 +548,22 @@ CREATE TABLE findings (
     detail       TEXT,
     quote        TEXT,                   -- verbatim text from the filing
     created_at   TEXT NOT NULL
+);
+
+-- ============ SPEC-005: OBSERVATIONS (between Calculations and Interpretation) ============
+CREATE TABLE observations (
+    id            INTEGER PRIMARY KEY,
+    cik           TEXT NOT NULL REFERENCES companies(cik),
+    accession_no  TEXT REFERENCES filings(accession_no),  -- the CURRENT period's filing
+    period_end    TEXT NOT NULL,
+    rule_name     TEXT NOT NULL,
+    rule_version  TEXT NOT NULL,
+    subject       TEXT NOT NULL,         -- metric name or section short_name
+    severity      TEXT NOT NULL,         -- high | medium | low
+    statement     TEXT NOT NULL,
+    refs_json     TEXT NOT NULL,         -- BOTH sides of any comparison, see note below
+    created_at    TEXT NOT NULL,
+    UNIQUE(cik, period_end, rule_name, rule_version, subject)
 );
 ```
 
@@ -615,6 +700,58 @@ period" must still restrict to real `filings.period_end` values (SPEC-004 R3a), 
 duration alone (350–380 days) is not sufficient to distinguish a real fiscal year-end
 from an unrelated 365-day window that happens to end nearby.
 
+### Note on `sections.text_hash` vs. `normalized_text_hash` (SPEC-005)
+
+`text_hash` means **content identity**: any byte differs, the hash differs, and it
+remains the sole link to the content-addressed store (§4.1, SPEC-003). `normalized_text_hash`
+means **wording identity**: computed over the text after stripping the XBRL viewer's
+version-stamp line (a rendering artifact present at the start of every R-file's body,
+confirmed §3.7, unrelated to content) and masking every numeric token to one placeholder.
+
+Measured live before this was relied on for anything: exact `normalized_text_hash`
+equality still changes on 98.9% of fiscal-year-matched Policies comparisons and 98.3% of
+Notes comparisons — confirmed by direct diff to be genuine, small, real prose edits
+(filers do lightly rewrite disclosure language most years), not a normalization gap. The
+column's *meaning* (wording identity, exact) stays as specified; SPEC-005's
+`section_wording_changed` rule additionally computes a similarity ratio for anything the
+hash says differs, and fires only past a measured materiality threshold — the hash
+answers "identical or not," the rule answers "materially different or not," and those are
+deliberately different questions. See SPEC-005 R1a/R5a.
+
+### Note on `filings.fiscal_year` / `fiscal_period` (SPEC-005)
+
+Populated at XBRL ingest time (`xbrl.ingest_company`) from the companyfacts API's own
+`fy`/`fp` labels — scanned across every concept in the payload, not just configured ones,
+so coverage does not depend on which canonical inputs happen to be tagged in a given
+filing. NULL for 8-Ks (companyfacts has no entries for them).
+
+Verified live before this was written: every one of 61 real NVDA/MU accessions checked
+maps to exactly one consistent `(fy, fp)` pair across all of its own facts — the API's
+fiscal labels are internally self-consistent per filing, with no observed exceptions. If
+a future filing ever produces conflicting labels for the same accession, the ingest code
+leaves it unresolved (NULL) rather than guessing.
+
+This is what makes SPEC-005's section prior-year matching robust to NVIDIA's and
+Micron's floating 52/53-week fiscal years **by construction**: the columns are not
+derived from any date at all, so unlike a calendar-day-window heuristic there is no
+tolerance value to get wrong when a fiscal year runs 371 days instead of 364. Section
+prior-year matching, and the fiscal-period lookups `metric_stopped_computing` and
+`depreciation_rate`'s YoY divergence need, all use these columns exclusively — never date
+arithmetic, never a join into `xbrl_facts`. (`metrics.py`'s own SPEC-004 YoY/QoQ
+mechanism — date-offset with a tolerance window, §7 below — is unchanged; it was already
+live-verified and SPEC-005 does not touch it. This column is for what SPEC-005 itself
+introduces.)
+
+### Note on `observations.accession_no` / `refs_json` (SPEC-005)
+
+`accession_no` holds the **current period's** filing only — the filing the observation is
+*for*. A comparison rule (most of them: everything except the single-period Beneish-style
+checks) necessarily reads two periods' worth of data; the prior period's row id goes in
+`refs_json` alongside the current period's, never into `accession_no`. `refs_json` is a
+JSON list of `{"table": "metrics"|"sections", "id": <int>}` covering every row behind the
+statement, both sides of any comparison — an observation whose `refs_json` cannot be
+walked back to the exact rows that produced it is a bug (SPEC-005 R2).
+
 ---
 
 ## 7. Metric Set
@@ -663,6 +800,46 @@ period — the mechanism is unchanged — but the reason is "stopped tagging it 
 ago," not "never had it," and getting this precisely right is what motivated the
 per-period (rather than per-company) resolution rule above. Micron and NVIDIA, as
 semiconductor manufacturers, do report `GrossProfit` currently.
+
+---
+
+## 7a. Observation Rule Set (SPEC-005)
+
+Ten rules (nine `SPEC-005 R5` table rows — `section_appeared`/`section_disappeared` share
+one row), declarative in `config.RULE_REGISTRY` plus a small engine in `observations.py`,
+mirroring §7's metric-registry split exactly. Full definitions, thresholds, and the
+governing transition-only-firing principle (§2.3) are in SPEC-005 R5; not duplicated here.
+
+| Rule | Reads | Severity |
+|---|---|---|
+| `metric_multi_year_extreme` | `metrics` | medium |
+| `metric_sigma_move` (quarterly-only) | `metrics` | medium |
+| `metric_threshold_cross` | `metrics` | varies by declared threshold |
+| `metric_divergence` | `metrics` | high |
+| `section_wording_changed` | `sections` (Policies + Notes) | high |
+| `section_length_change` | `sections` (Policies + Notes) | medium |
+| `section_appeared` / `section_disappeared` | `sections` (Notes) | high |
+| `metric_stopped_computing` | `metrics` | medium |
+| `readability_change` | `sections` (Policies + Notes) | low |
+
+Measured live against the real database (all three companies): every one of the ten
+rules fires at least once (zero dead rules) — `metric_threshold_cross` 4.6%,
+`metric_divergence` 11.7%, `section_wording_changed` 13.3%, `section_length_change`
+18.6%, `section_appeared` 9.0%, `section_disappeared` 9.2%, `metric_stopped_computing`
+11.0%, `readability_change` 22.0%, `metric_sigma_move` 24.9% — all comfortably under the
+33% ceiling. `metric_multi_year_extreme` measures **34.4%** (347/1010) after excluding
+five compounding dollar-level metrics via `MetricDef.extreme_informative` (down from
+37.7%/438/1162) — still the one rule above the design ceiling, mechanically driven by the
+very small annual-history window at current corpus depth (as few as 4–6 total fiscal
+years per company), where a genuinely trending metric sets a "new record" on most
+eligible annual points almost by construction — expected to fall further as more fiscal
+years of history accumulate, not a false-positive class. One further gap, narrower than a
+dead rule: NVIDIA's Q2 FY2023 `incremental_gross_margin` (the AC6 case) does not itself
+fire, because only 3 valid prior quarters exist for that specific metric at that point —
+short of the 8-quarter minimum, and verified to trace back to a structural fact true for
+all three companies (none files a Q4 10-Q, so every quarterly chain is 3 real periods per
+fiscal year, not 4). Both are reported, not patched around; see the SPEC-005 changelog
+and decision log entries 30–31.
 
 ---
 
@@ -719,3 +896,12 @@ semiconductor manufacturers, do report `GrossProfit` currently.
 | 21 | Alias-agreement exceptions register added (`config.ALIAS_AGREEMENT_EXCEPTIONS`) | `capex`'s one-period Amazon disagreement is a real tag-transition artifact, not a broader/narrower split, and is already hand-verified via AC9 — needed a place to write down an accepted exception rather than either hard-failing forever or silently dropping the check | 2026-07-27 |
 | 22 | NULL discipline narrowly refined: absence = zero for a required-disclosure additive component (finance leases, ASC 842), still NULL for primary measures | Applying "absence is not zero" literally made `total_debt` permanently NULL for NVIDIA; ASC 842 makes the absence itself diagnostic for finance leases specifically, so the exception is named and scoped rather than a general loosening | 2026-07-27 |
 | 23 | Debt-reconciliation and range exceptions registers added, keyed per-period (not per-canonical, unlike the alias register) | Amazon's ASU 2015-03 debt transition and NVIDIA's/Micron's real range findings are checked, one-off, explained values, not standing properties of an input or metric — a future unrelated finding for the same company/metric must still hard-fail | 2026-07-27 |
+| 24 | `section_wording_changed` (renamed from `accounting_policy_changed`) applies to both Policies and Notes, gated by a measured similarity-ratio threshold, not a category restriction | Live measurement: exact `normalized_text_hash` equality changes on 98.9%/98.3% of Policies/Notes comparisons — nearly identical between categories, and confirmed by direct diff to be genuine incremental prose editing, not a normalization bug. A category choice cannot fix a materiality problem | 2026-07-27 |
+| 25 | State-based observation rules (`metric_threshold_cross`, `metric_divergence`) fire only entering a condition, never while it persists (§2.3) | Live measurement before the fix: `capex_to_depreciation` fired on 71% of eligible periods, `fcf_conversion` on 50% — both are sustained-state conditions for this watchlist, not events | 2026-07-27 |
+| 26 | `metric_multi_year_extreme` minimum history split by basis (8 prior quarterly periods, 4 annual); `metric_sigma_move` stays quarterly-only at 8 | A flat 8-period rule left every annual-only metric (Beneish, working capital) permanently dead at current corpus depth (0 eligible periods for any company, ever); ordering-based extremes are robust with few points, a standard deviation is not | 2026-07-27 |
+| 27 | `metric_stopped_computing` requires the same metric to have computed at the same fiscal period one year earlier (via `filings.fiscal_year`/`fiscal_period`), not merely "non-null last period" | Without this, `revenue_qoq` "stopped computing" on every single Q1 for every company, forever — a structural gap (no directly-tagged Q4 to compare against), rediscovered as a false event every year | 2026-07-27 |
+| 28 | `config.NOTE_NAME_ALIASES` / `FLUCTUATING_NOTE_NAMES` added | Same alias-purity discipline as §2.1, applied to SEC's own FilingSummary `ShortName` values: three verified Micron renames (never co-occurring, same underlying XBRL element) would otherwise register as false `section_appeared`+`section_disappeared` pairs; one housekeeping note's presence legitimately toggles quarter to quarter and is excluded from those two rules only | 2026-07-27 |
+| 29 | `filings.fiscal_year`/`fiscal_period` added, populated at XBRL ingest from companyfacts' own `fy`/`fp` labels | Verified live: every one of 61 real NVDA/MU accessions maps to exactly one consistent `(fy, fp)` pair. Gives SPEC-005's section prior-year matching an authoritative label immune to 52/53-week calendar drift by construction, replacing the date-window heuristic used only during this spec's own live calibration measurements | 2026-07-27 |
+| 30 | `MetricDef.extreme_informative` added, excluding `ebitda`/`nopat`/`invested_capital`/`free_cash_flow`/`net_debt` from `metric_multi_year_extreme`; rule bumped to `rule_version` `v2` | A "record" in a compounding dollar-level metric mostly restates that a growing company grew, not that something happened; a record in a ratio (margin, return, days-outstanding) is information regardless of the dollar scale underneath it. Measured live: firing rate 37.7% → 34.4% | 2026-07-27 |
+| 31 | AC6 amended rather than the 8-quarter minimum lowered | Verified live: no watchlist company files a Q4 10-Q (`{Q1, Q2, Q3}` only, confirmed for all three companies) — every quarterly chain is 3 real periods per fiscal year, not 4, which is why NVIDIA's Q2 FY2023 `incremental_gross_margin` had only 3 valid prior quarters at that point. A structural, self-resolving gap, verified and documented rather than closed by weakening the general minimum-history rule for every metric on every company. Derived Q4 figures (already in §8's V2 scope) flagged as the direct future fix | 2026-07-27 |
+| 32 | `app.db`'s absolute size ceiling replaced by a growth measure (current size + measured marginal cost per filing) and a 15 MB soft ceiling | The absolute number had already been relaxed twice during SPEC-004 (5 MB → 6 MB) and needed relaxing again after SPEC-005; a number that keeps moving was never the right criterion. Measured live (scratch copy of the real database, one Micron 10-Q reprocessed end to end): 72 KB per filing — at that rate the 15 MB soft ceiling is roughly a decade away at current watchlist size | 2026-07-27 |

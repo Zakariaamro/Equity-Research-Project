@@ -92,6 +92,45 @@ def _write_fact(
     return True
 
 
+def _extract_fiscal_labels(
+    taxonomy_facts: dict[str, Any], known_accessions: set[str]
+) -> dict[str, tuple[int | None, str | None]]:
+    """accession_no -> (fiscal_year, fiscal_period), scanned across EVERY
+    concept in the payload -- not just configured ones -- so coverage does
+    not depend on which canonical inputs happen to be tagged in a given
+    filing (SPEC-005 change 9).
+
+    Verified live before this was written: every one of 61 real NVDA/MU
+    accessions maps to exactly one consistent (fy, fp) pair across all of
+    its own facts. If a future filing ever violates that (multiple distinct
+    pairs for the same accn), it is left unresolved rather than guessed --
+    the whole point of this column is to be an authoritative label, not an
+    inferred one.
+    """
+    labels: dict[str, tuple[int | None, str | None]] = {}
+    conflicting: set[str] = set()
+    for concept_data in taxonomy_facts.values():
+        for entries in concept_data.get("units", {}).values():
+            for entry in entries:
+                accn = entry.get("accn")
+                if accn not in known_accessions or accn in conflicting:
+                    continue
+                fy, fp = entry.get("fy"), entry.get("fp")
+                if fy is None or fp is None:
+                    continue
+                existing = labels.get(accn)
+                if existing is None:
+                    labels[accn] = (fy, fp)
+                elif existing != (fy, fp):
+                    logger.warning(
+                        "Conflicting fiscal labels for accession %s: %s vs %s -- leaving unresolved",
+                        accn, existing, (fy, fp),
+                    )
+                    del labels[accn]
+                    conflicting.add(accn)
+    return labels
+
+
 def ingest_company(conn: sqlite3.Connection, client: EdgarClient, cik: str) -> dict[str, Any]:
     """Ingest every configured concept present for one company.
 
@@ -99,6 +138,11 @@ def ingest_company(conn: sqlite3.Connection, client: EdgarClient, cik: str) -> d
     `unresolved` names canonical inputs where no alias has any data at all for
     this company, in the declared unit -- a signal the registry may need
     widening (SPEC-004 R2/R10), not an error.
+
+    Also backfills filings.fiscal_year/fiscal_period (SPEC-005 change 9) for
+    every 10-K/10-Q filing already known to `filings` -- NULL is left in
+    place for 8-Ks (companyfacts has no entries for them) and for any
+    accession this company's companyfacts payload doesn't mention.
     """
     try:
         payload = client.get_company_facts(cik)
@@ -107,8 +151,12 @@ def ingest_company(conn: sqlite3.Connection, client: EdgarClient, cik: str) -> d
 
     taxonomy_facts = payload.get("facts", {}).get(config.COMPANYFACTS_TAXONOMY, {})
 
-    known_accessions = {
-        row["accession_no"] for row in conn.execute("SELECT accession_no FROM filings").fetchall()
+    filing_rows = conn.execute("SELECT accession_no, form_type FROM filings").fetchall()
+    known_accessions = {row["accession_no"] for row in filing_rows}
+    fiscal_eligible = {
+        row["accession_no"]
+        for row in filing_rows
+        if row["form_type"] in (config.TENK_FORM_TYPE, config.TENQ_FORM_TYPE)
     }
 
     written_by_concept: dict[str, int] = {}
@@ -130,6 +178,14 @@ def ingest_company(conn: sqlite3.Connection, client: EdgarClient, cik: str) -> d
             written_by_concept[alias] = written_by_concept.get(alias, 0) + written
         if not any_resolved:
             unresolved.append(canonical)
+
+    fiscal_labels = _extract_fiscal_labels(taxonomy_facts, known_accessions)
+    for accn, (fy, fp) in fiscal_labels.items():
+        if accn not in fiscal_eligible:
+            continue
+        conn.execute(
+            "UPDATE filings SET fiscal_year = ?, fiscal_period = ? WHERE accession_no = ?", (fy, fp, accn)
+        )
 
     conn.commit()
     return {"written_by_concept": written_by_concept, "unresolved": unresolved}
