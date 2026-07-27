@@ -23,7 +23,7 @@ import json
 import logging
 import sqlite3
 import statistics
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from typing import Callable
 
@@ -220,12 +220,21 @@ def _assert_no_lookahead(conn: sqlite3.Connection, obs: Observation) -> None:
 # --- R5 rule 1: metric_multi_year_extreme ---
 
 
+def _severity_for_extreme(mdef: config.MetricDef) -> str:
+    """SPEC-005 post-implementation round 2: severity by analytical
+    materiality, not by detection method -- "high" only where a multi-year
+    record is itself the analytical claim (margins, returns, working-capital
+    days); "medium" for every other eligible category."""
+    return "high" if mdef.category in config.EXTREME_HIGH_SEVERITY_CATEGORIES else "medium"
+
+
 def _rule_metric_multi_year_extreme(conn: sqlite3.Connection, cik: str) -> list[Observation]:
     rdef = config.RULE_REGISTRY["metric_multi_year_extreme"]
     obs: list[Observation] = []
     for name, mdef in config.METRIC_REGISTRY.items():
-        if not mdef.extreme_informative:
+        if not mdef.extreme_informative or not mdef.headline:
             continue
+        severity = _severity_for_extreme(mdef)
         rows_all = [r for r in _metric_rows(conn, cik, name) if r["value"] is not None]
         by_cls: dict[str, list[dict]] = {}
         for r in rows_all:
@@ -255,7 +264,7 @@ def _rule_metric_multi_year_extreme(conn: sqlite3.Connection, cik: str) -> list[
                 refs = [_ref("metrics", row["id"])] + [_ref("metrics", p["id"]) for p in prior]
                 obs.append(
                     Observation(
-                        cik, accession_no, row["period_end"], rdef.name, rdef.version, name, rdef.severity,
+                        cik, accession_no, row["period_end"], rdef.name, rdef.version, name, severity,
                         statement, refs,
                     )
                 )
@@ -268,7 +277,9 @@ def _rule_metric_multi_year_extreme(conn: sqlite3.Connection, cik: str) -> list[
 def _rule_metric_sigma_move(conn: sqlite3.Connection, cik: str) -> list[Observation]:
     rdef = config.RULE_REGISTRY["metric_sigma_move"]
     obs: list[Observation] = []
-    for name in config.METRIC_REGISTRY:
+    for name, mdef in config.METRIC_REGISTRY.items():
+        if not mdef.headline:
+            continue
         rows = [r for r in _metric_rows(conn, cik, name) if r["value"] is not None and r["cls"] == "quarterly"]
         for i, row in enumerate(rows):
             prior = rows[:i]
@@ -426,7 +437,7 @@ def _rule_section_wording_changed(conn: sqlite3.Connection, cik: str) -> list[Ob
             text_prior = section_store.normalize_for_wording_hash(
                 section_store.read_section_text(prior["text_hash"])
             )
-            similarity = difflib.SequenceMatcher(None, text_cur, text_prior).quick_ratio()
+            similarity = difflib.SequenceMatcher(None, text_cur, text_prior).ratio()
             if similarity >= config.SECTION_WORDING_SIMILARITY_THRESHOLD:
                 continue
             noun = _wording_category_noun(category)
@@ -473,9 +484,51 @@ def _rule_section_length_change(conn: sqlite3.Connection, cik: str) -> list[Obse
 # --- R5 rule 7/8: section_appeared / section_disappeared ---
 
 
+def _detect_renames(
+    disappeared_names: set[str], appeared_names: set[str], prior_names: dict, names: dict
+) -> list[tuple[str, str, float]]:
+    """Greedy best-match pairing within one year-over-year transition (R5e):
+    a disappeared name and an appeared name whose actual section text is
+    similar above SECTION_RENAME_SIMILARITY_THRESHOLD are the same
+    continuing note under a new title, not a genuine disappear+appear pair.
+    Reuses section_wording_changed's exact similarity function (normalized
+    text, difflib.SequenceMatcher.ratio -- the real ratio, not quick_ratio;
+    quick_ratio is a fast upper-bound heuristic based on character-multiset
+    overlap, not actual sequence matching, and is unreliable for this use:
+    checked live, two genuinely unrelated MU notes scored quick_ratio=0.87
+    against a real ratio() of 0.03). Deterministic: both name sets are
+    walked in sorted order.
+    """
+    pairs: list[tuple[str, str, float]] = []
+    remaining_appeared = set(appeared_names)
+    for old_name in sorted(disappeared_names):
+        old_row = prior_names[old_name]
+        try:
+            old_text = section_store.normalize_for_wording_hash(section_store.read_section_text(old_row["text_hash"]))
+        except section_store.SectionContentMissingError:
+            continue
+        best_name, best_ratio = None, 0.0
+        for new_name in sorted(remaining_appeared):
+            new_row = names[new_name]
+            try:
+                new_text = section_store.normalize_for_wording_hash(
+                    section_store.read_section_text(new_row["text_hash"])
+                )
+            except section_store.SectionContentMissingError:
+                continue
+            ratio = difflib.SequenceMatcher(None, old_text, new_text).ratio()
+            if ratio > best_ratio:
+                best_name, best_ratio = new_name, ratio
+        if best_name is not None and best_ratio > config.SECTION_RENAME_SIMILARITY_THRESHOLD:
+            pairs.append((old_name, best_name, best_ratio))
+            remaining_appeared.discard(best_name)
+    return pairs
+
+
 def _rule_section_appeared_disappeared(conn: sqlite3.Connection, cik: str) -> list[Observation]:
     rdef_a = config.RULE_REGISTRY["section_appeared"]
     rdef_d = config.RULE_REGISTRY["section_disappeared"]
+    rdef_r = config.RULE_REGISTRY["section_renamed"]
     obs: list[Observation] = []
     presence = _section_presence_map(conn, cik, config.MENUCATEGORY_NOTES)
     for (form_type, fiscal_period), by_fy in presence.items():
@@ -483,7 +536,40 @@ def _rule_section_appeared_disappeared(conn: sqlite3.Connection, cik: str) -> li
             prior_names = by_fy.get(fy - 1)
             if prior_names is None:
                 continue
-            for name in set(names) - set(prior_names):
+            appeared_names = set(names) - set(prior_names)
+            disappeared_names = set(prior_names) - set(names)
+
+            # Boilerplate names never participate in rename detection (R5f):
+            # they are already forced "low" via BOILERPLATE_NOTE_NAMES
+            # regardless of which rule reports them, so no signal is lost,
+            # and it removes a real false-positive class -- checked live,
+            # "Pay vs Performance Disclosure" repeatedly paired with an
+            # unrelated "Recently Adopted and Recently Issued Accounting
+            # Standards" note at the 70% boundary, two boilerplate-adjacent
+            # notes sharing enough generic disclosure boilerplate to look
+            # similar without being the same note.
+            rename_candidates_disappeared = disappeared_names - config.BOILERPLATE_NOTE_NAMES
+            rename_candidates_appeared = appeared_names - config.BOILERPLATE_NOTE_NAMES
+            renamed = _detect_renames(rename_candidates_disappeared, rename_candidates_appeared, prior_names, names)
+            renamed_old = {old for old, _new, _ratio in renamed}
+            renamed_new = {new for _old, new, _ratio in renamed}
+
+            for old_name, new_name, ratio in renamed:
+                new_row = names[new_name]
+                old_row = prior_names[old_name]
+                statement = (
+                    f"The {old_name} note appears to have been renamed {new_name} "
+                    f"({ratio:.0%} text similarity to a year ago)."
+                )
+                obs.append(
+                    Observation(
+                        cik, new_row["accession_no"], new_row["period_end"], rdef_r.name, rdef_r.version,
+                        f"{old_name} -> {new_name}", rdef_r.severity, statement,
+                        [_ref("sections", new_row["id"]), _ref("sections", old_row["id"])],
+                    )
+                )
+
+            for name in appeared_names - renamed_new:
                 row = names[name]
                 statement = f"The {name} note is present this year and was absent a year ago."
                 obs.append(
@@ -492,7 +578,7 @@ def _rule_section_appeared_disappeared(conn: sqlite3.Connection, cik: str) -> li
                         rdef_a.severity, statement, [_ref("sections", row["id"])],
                     )
                 )
-            for name in set(prior_names) - set(names):
+            for name in disappeared_names - renamed_old:
                 prior_row = prior_names[name]
                 current_filing = _filing_for_fiscal_label(conn, cik, form_type, fy, fiscal_period)
                 if current_filing is None:
@@ -600,7 +686,7 @@ def _rule_readability_change(conn: sqlite3.Connection, cik: str) -> list[Observa
 def _eligible_metric_multi_year_extreme(conn: sqlite3.Connection, cik: str) -> int:
     total = 0
     for name, mdef in config.METRIC_REGISTRY.items():
-        if not mdef.extreme_informative:
+        if not mdef.extreme_informative or not mdef.headline:
             continue
         rows_all = [r for r in _metric_rows(conn, cik, name) if r["value"] is not None]
         by_cls: dict[str, list[dict]] = {}
@@ -616,7 +702,9 @@ def _eligible_metric_multi_year_extreme(conn: sqlite3.Connection, cik: str) -> i
 
 def _eligible_metric_sigma_move(conn: sqlite3.Connection, cik: str) -> int:
     total = 0
-    for name in config.METRIC_REGISTRY:
+    for name, mdef in config.METRIC_REGISTRY.items():
+        if not mdef.headline:
+            continue
         rows = [r for r in _metric_rows(conn, cik, name) if r["value"] is not None and r["cls"] == "quarterly"]
         total += sum(1 for i in range(len(rows)) if i >= config.SIGMA_MIN_PRIOR_PERIODS)
     return total
@@ -718,12 +806,16 @@ ELIGIBLE_COUNT_FUNCS: dict[str, Callable[[sqlite3.Connection, str], int]] = {
     "section_length_change": _eligible_section_length_change,
     "readability_change": _eligible_readability_change,
     "metric_stopped_computing": _eligible_metric_stopped_computing,
-    # section_appeared and section_disappeared share one eligibility universe
-    # (the same name-union check simultaneously decides appear-or-disappear-
-    # or-neither for every name), so both keys point at the same counter.
+    # section_appeared, section_disappeared, and section_renamed all share
+    # one eligibility universe (the same name-union check simultaneously
+    # decides appear, disappear, rename, or neither for every name pair), so
+    # all three keys point at the same counter.
     "section_appeared": _eligible_section_appeared_disappeared,
     "section_disappeared": _eligible_section_appeared_disappeared,
+    "section_renamed": _eligible_section_appeared_disappeared,
 }
+
+_SECTION_APPEARED_DISAPPEARED_RULE_NAMES = {"section_appeared", "section_disappeared", "section_renamed"}
 
 
 # --- registry dispatch ---
@@ -739,26 +831,124 @@ _RULE_FUNCS: dict[str, Callable[[sqlite3.Connection, str], list[Observation]]] =
     "readability_change": _rule_readability_change,
 }
 
-assert set(_RULE_FUNCS) | {"section_appeared", "section_disappeared"} == set(config.RULE_REGISTRY), (
+assert set(_RULE_FUNCS) | _SECTION_APPEARED_DISAPPEARED_RULE_NAMES == set(config.RULE_REGISTRY), (
     f"observations.py rule dispatch / config.RULE_REGISTRY mismatch: "
-    f"{(set(_RULE_FUNCS) | {'section_appeared', 'section_disappeared'}) ^ set(config.RULE_REGISTRY)}"
+    f"{(set(_RULE_FUNCS) | _SECTION_APPEARED_DISAPPEARED_RULE_NAMES) ^ set(config.RULE_REGISTRY)}"
 )
 
 
-def _observations_for_company(
+def _raw_observations_for_company(
     conn: sqlite3.Connection, cik: str, rule_names: list[str] | None
 ) -> list[Observation]:
+    """Every rule's output for one company, BEFORE the severity-override
+    pass (boilerplate-note / cross-company-simultaneity demotion, R5d) --
+    see _observations_for_company for the version callers should normally
+    use."""
     obs: list[Observation] = []
     for name, fn in _RULE_FUNCS.items():
         if rule_names is not None and name not in rule_names:
             continue
         obs.extend(fn(conn, cik))
-    if rule_names is None or "section_appeared" in rule_names or "section_disappeared" in rule_names:
+    if rule_names is None or _SECTION_APPEARED_DISAPPEARED_RULE_NAMES & set(rule_names or ()):
         pair = _rule_section_appeared_disappeared(conn, cik)
         if rule_names is not None:
             pair = [o for o in pair if o.rule_name in rule_names]
         obs.extend(pair)
     return obs
+
+
+# --- R5d: severity overrides (boilerplate notes, cross-company simultaneity) ---
+
+
+def _has_cross_company_peer(
+    conn: sqlite3.Connection,
+    cik: str,
+    rule_name: str,
+    subject: str,
+    rule_version: str,
+    period_end: str,
+    extra_peers: list[tuple[str, str]],
+) -> bool:
+    """True if another watchlist company has a matching (rule_name, subject)
+    observation within CROSS_COMPANY_SIMULTANEITY_WINDOW_DAYS -- checked
+    against both the DB (already-persisted rows from a prior run) and
+    `extra_peers` (other companies' observations computed in the SAME batch,
+    not yet written). Existence only, not severity -- so this is stable to
+    recompute regardless of what those peer rows' own severity ended up
+    being (no circularity, see observations.py's severity-override note).
+    """
+    target = date.fromisoformat(period_end)
+    db_rows = conn.execute(
+        "SELECT cik, period_end FROM observations WHERE rule_name = ? AND rule_version = ? AND subject = ? AND cik != ?",
+        (rule_name, rule_version, subject, cik),
+    ).fetchall()
+    candidates = [(r["cik"], r["period_end"]) for r in db_rows]
+    candidates += [(c, p) for c, p in extra_peers if c != cik]
+    for _other_cik, other_period_end in candidates:
+        if abs((date.fromisoformat(other_period_end) - target).days) <= config.CROSS_COMPANY_SIMULTANEITY_WINDOW_DAYS:
+            return True
+    return False
+
+
+_CROSS_COMPANY_NOTE = (
+    " Also observed for another watchlist company around the same time -- likely a "
+    "taxonomy or regulatory change, not company-specific information."
+)
+
+
+def _apply_severity_overrides(conn: sqlite3.Connection, obs_list: list[Observation]) -> list[Observation]:
+    """Boilerplate-note override, then cross-company-simultaneity demotion
+    (SPEC-005 post-implementation round 2, R5d). Both only ever LOWER
+    severity, never raise it. Boilerplate wins outright -- a subject already
+    forced "low" for being boilerplate does not also need the simultaneity
+    note, which would just restate the same conclusion a second way.
+
+    Builds its own in-memory peer index from `obs_list` -- correct whether
+    called with one company's raw output (peer index empty, falls back to
+    the DB entirely -- this is what validate's determinism check exercises)
+    or with a full multi-company batch (peer index does the work directly,
+    no DB round-trip needed for companies in the same batch).
+
+    Cross-company simultaneity applies to SECTION-subject rules only
+    (config.RuleDef.subject_kind == "section"), matching the user's own
+    framing ("the same rule fires on the same SECTION NAME") -- not to
+    metric-subject rules. A metric subject like "asset_turnover" is the same
+    literal string for every company by construction (every company has an
+    asset_turnover metric), and every company files an annual 10-K within
+    roughly the same 12 months every year regardless of any real event, so
+    a same-subject metric match within the window is not a signal at all --
+    checked live before this scoping was added: it silently demoted every
+    single metric_multi_year_extreme observation on Amazon's most recent
+    10-K to "low", which is exactly the over-firing this whole round of
+    changes exists to fix, not reproduce differently.
+    """
+    peers_by_key: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for o in obs_list:
+        peers_by_key.setdefault((o.rule_name, o.subject), []).append((o.cik, o.period_end))
+
+    out: list[Observation] = []
+    for o in obs_list:
+        if o.subject in config.BOILERPLATE_NOTE_NAMES:
+            out.append(replace(o, severity="low"))
+            continue
+        if config.RULE_REGISTRY[o.rule_name].subject_kind != "section":
+            out.append(o)
+            continue
+        extra_peers = peers_by_key.get((o.rule_name, o.subject), [])
+        if _has_cross_company_peer(conn, o.cik, o.rule_name, o.subject, o.rule_version, o.period_end, extra_peers):
+            out.append(replace(o, severity="low", statement=o.statement + _CROSS_COMPANY_NOTE))
+        else:
+            out.append(o)
+    return out
+
+
+def _observations_for_company(
+    conn: sqlite3.Connection, cik: str, rule_names: list[str] | None
+) -> list[Observation]:
+    """Public entry point: one company's observations, WITH severity
+    overrides applied (what actually gets written and what validate's
+    determinism check compares against)."""
+    return _apply_severity_overrides(conn, _raw_observations_for_company(conn, cik, rule_names))
 
 
 # --- persistence ---
@@ -804,22 +994,37 @@ def compute_observations(
 ) -> list[dict]:
     """Compute every registered rule (or just `rule_names`) for every
     applicable subject. Idempotent. Asserts no-lookahead (R3) before every
-    write."""
+    write.
+
+    Two passes, not one company at a time: raw observations are collected
+    for EVERY requested company first, then the severity-override pass
+    (R5d) runs once over the complete batch, then everything is written.
+    This is what makes cross-company-simultaneity demotion correct on a
+    single from-scratch call -- computing and writing company by company
+    would miss a same-day match for whichever company happened to be
+    processed first, since its peer wouldn't exist in the table yet.
+    """
     companies = [c for c in config.WATCHLIST if tickers is None or c.ticker in tickers]
-    written: list[dict] = []
+    ticker_by_cik = {c.cik: c.ticker for c in companies}
+
+    raw: list[Observation] = []
     for company in companies:
-        for obs in _observations_for_company(conn, company.cik, rule_names):
-            _assert_no_lookahead(conn, obs)
-            if _write_observation(conn, obs):
-                written.append(
-                    {
-                        "ticker": company.ticker,
-                        "rule_name": obs.rule_name,
-                        "subject": obs.subject,
-                        "period_end": obs.period_end,
-                        "severity": obs.severity,
-                    }
-                )
+        raw.extend(_raw_observations_for_company(conn, company.cik, rule_names))
+    overridden = _apply_severity_overrides(conn, raw)
+
+    written: list[dict] = []
+    for obs in overridden:
+        _assert_no_lookahead(conn, obs)
+        if _write_observation(conn, obs):
+            written.append(
+                {
+                    "ticker": ticker_by_cik[obs.cik],
+                    "rule_name": obs.rule_name,
+                    "subject": obs.subject,
+                    "period_end": obs.period_end,
+                    "severity": obs.severity,
+                }
+            )
     conn.commit()
     logger.info("compute_observations: %d observation(s) written/updated", len(written))
     return written

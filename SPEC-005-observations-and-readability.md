@@ -1,12 +1,47 @@
 # SPEC-005 — Observations and Readability
 
-**Version:** 1.2
+**Version:** 1.4
 **For:** Claude Code
 **Depends on:** SPEC-004 (complete, commit `7e5b7a6` plus the exceptions-register follow-up)
 **Reference:** `ARCHITECTURE.md` — sections 2, 6
-**Estimated effort:** 6–8 hours (actual: full implementation plus three rounds of live calibration)
+**Estimated effort:** 6–8 hours (actual: full implementation plus five rounds of live calibration)
 
 **Changelog**
+- v1.4 — Three small post-implementation refinements: (1) `BOILERPLATE_NOTE_NAMES`
+  excluded from rename detection (R5f) — fixed a remaining false positive ("Pay vs
+  Performance Disclosure" repeatedly paired with an unrelated accounting-standards note
+  at the threshold); no signal lost, since boilerplate names are already forced "low"
+  regardless of rule. (2) The 33%-eligible-periods firing-rate ceiling replaced by a
+  per-filing contribution measure (R8b) — the old measure structurally penalised rules
+  checking many things per filing; the new one directly measures what matters for display
+  budgets, and precisely explains the Amazon top-5 problem (`metric_multi_year_extreme`'s
+  max of 24 observations on one filing vs. every other rule's max ≤ 12). (3) R11 added:
+  any future top-N observation display must cap contributions from one rule at 2 — binding
+  on SPEC-006 and the dashboard, recorded here since the failure mode was found and
+  measured in this spec. Decision log entries 33–35 added to `ARCHITECTURE.md`.
+- v1.3 — Severity reassigned by analytical materiality instead of detection method (R5d)
+  — the original scheme (every `section_appeared`/`disappeared` "high," every metric
+  extreme "medium" regardless of which metric) let presentation artifacts outrank real
+  economic signal; confirmed live, Amazon's and Micron's top-5-by-severity observations
+  were dominated by boilerplate SEC disclosure items and undifferentiated metric extremes.
+  New: `EXTREME_HIGH_SEVERITY_CATEGORIES` (category-based severity for
+  `metric_multi_year_extreme`), `BOILERPLATE_NOTE_NAMES` (forces "low" regardless of
+  rule), cross-company simultaneity demotion (R5d), automatic rename detection (R5e),
+  `MetricDef.headline` (R5c, excludes Beneish components and four intermediates from
+  `metric_multi_year_extreme`/`metric_sigma_move`). Two real bugs found and fixed before
+  shipping, not just designed around: the cross-company demotion was first scoped to
+  every rule, not just section-subject ones, and silently zeroed every
+  `metric_multi_year_extreme` observation on a real filing (every company files annually
+  within the same 12 months regardless of any real event, so a same-subject metric always
+  has a trivial "peer"); and the similarity function used
+  `difflib.SequenceMatcher.quick_ratio()`, an upper-bound heuristic unreliable for real
+  similarity decisions (0.87 measured for two genuinely unrelated notes, true `.ratio()`
+  0.03) — `section_wording_changed`'s threshold was re-measured from scratch with the
+  corrected metric (0.85 → 0.60; the old value, re-measured correctly, would have fired on
+  61–67% of comparisons). `metric_multi_year_extreme` measured 34.8% after `headline`
+  (essentially unchanged from 34.4%, still above the 33% ceiling that v1.4 goes on to
+  replace). Decision log entries 30–32 (partially superseded by v1.4's replacement of the
+  firing-rate ceiling) plus new entries added to `ARCHITECTURE.md`.
 - v1.2 — Three post-implementation refinements, all live-verified:
   1. `MetricDef.extreme_informative` (R5c) excludes five compounding dollar-level metrics
      (`ebitda`, `nopat`, `invested_capital`, `free_cash_flow`, `net_debt`) from
@@ -107,7 +142,8 @@ appear on the Overview page out of several thousand.
 1. Readability columns on `sections`, plus `normalized_text_hash`, with backfill
 2. `observations` table
 3. Declarative rule registry
-4. Ten rules (nine table rows — `section_appeared`/`section_disappeared` share one row)
+4. Eleven rules (nine original table rows — `section_appeared`/`section_disappeared` share
+   one row — plus `section_renamed`, added post-implementation, R5e)
 5. Statement templates
 6. CLI, validate additions, tests
 
@@ -292,13 +328,29 @@ masked; genuine incremental prose editing is.
 `section_wording_changed` applies to **both** `Policies` and `Notes`. It uses
 `normalized_text_hash` as a fast exact-match skip (byte-identical wording never fires,
 trivially), and for anything that differs at all, computes a real similarity ratio
-(`difflib.SequenceMatcher.quick_ratio`) between the two normalized texts, firing only
-when similarity falls below `config.SECTION_WORDING_SIMILARITY_THRESHOLD` (0.85 —
-measured to yield 14.6% for Policies and 13.3% for Notes, comfortably under the 33%
-ceiling and, notably, nearly identical between categories). That near-identity between
-categories **is** the calibration finding requested: Notes does not need excluding once
-real per-period noise is controlled for; a materiality threshold does the work a category
-restriction cannot.
+between the two normalized texts, firing only when similarity falls below
+`config.SECTION_WORDING_SIMILARITY_THRESHOLD`.
+
+**Threshold corrected, post-implementation round 2: the original measurement was wrong,
+not just imprecise.** It used `difflib.SequenceMatcher.quick_ratio()`, a fast
+**upper-bound heuristic** (character-multiset overlap) rather than real sequence
+matching — checked live while debugging round 2's rename detector (R5e), two genuinely
+unrelated Micron notes scored `quick_ratio()` = 0.87 against a true `.ratio()` of 0.03.
+Every use was switched to the real `.ratio()`, and the threshold was **re-measured from
+scratch** with the corrected metric, exactly as the original 0.85 was measured — the
+whole similarity distribution shifts down hard once the metric stops overstating it
+(median similarity 0.96 under `quick_ratio()` → 0.73 (Policies) / 0.80 (Notes) under real
+`.ratio()`, since ordinary annual editing is not actually 96% textually stable;
+`quick_ratio()` just said so). The old 0.85 threshold, re-measured with the corrected
+metric, fires on 67.4% (Policies) / 61.3% (Notes) — nowhere near usable; it only looked
+calibrated because it was calibrated against the wrong number.
+
+**New threshold: 0.60**, chosen the same way as the original — measured against the real
+corpus, picked for comfortable margin under the ceiling in both categories: **Policies
+27.0%, Notes 19.8%**. Still, notably, close to each other — the calibration finding that
+Notes does not need excluding once real per-period noise is controlled for survives the
+correction; only the specific threshold value changes. `rule_version` bumped to `v3` (the
+similarity computation itself changed, not just severity).
 
 `normalized_text_hash` itself keeps its literal meaning (R1a) — the similarity check is
 additional logic inside the rule, not a redefinition of the stored column.
@@ -344,7 +396,117 @@ Measured live: **37.7% → 34.4%** of eligible periods (438/1162 → 347/1010). 
 33% design ceiling but not yet under it — the remaining rate is still driven by the small
 annual-history window described in the changelog and ARCHITECTURE.md §2.3, which
 `extreme_informative` does not address (it narrows *which* metrics are checked, not *how
-many periods* of history each one has).
+many periods* of history each one has). (This eligible-periods percentage was itself
+replaced by R8b below in a later round — kept here only as the historical record of why
+`extreme_informative` was added.)
+
+#### R5d — Severity by materiality, not by detection method (post-implementation round 2)
+
+**The original severity assignment was a design error, not an implementation bug**: every
+`section_appeared`/`section_disappeared` observation was "high" and every metric extreme
+was "medium," regardless of *what* appeared or *which* metric hit a record. A boilerplate
+SEC-mandated disclosure item showing up "new" this year outranked a five-year low in
+gross margin — presentation artifacts outranking economics. Severity is now assigned by
+analytical materiality:
+
+- **`metric_multi_year_extreme`**: "high" when the metric's `category` is `margins`,
+  `returns`, or `working_capital` (`config.EXTREME_HIGH_SEVERITY_CATEGORIES`) — a
+  multi-year record in one of these *is* the analytical claim. "Medium" otherwise (growth
+  rates, capex ratios, solvency multiples, the Beneish M-score).
+- **`metric_threshold_cross`** and **`metric_divergence`**: uniformly "high" — crossing
+  any of the declared hard thresholds (a solvency ratio, a cash-burn signal, a leverage
+  flip, a fraud-risk flag) is analytically material regardless of which one it is. The
+  per-threshold severity field in `DECLARED_THRESHOLDS` is now uniform rather than
+  varying.
+- **`section_appeared`/`section_disappeared`**: downgraded to "low" — a note appearing or
+  disappearing is a presentation change, not itself a number moving.
+- **`section_wording_changed`**: stays "high," but now means "high for a *substantive*
+  note" — see the boilerplate override below.
+- **`section_length_change`**: stays "medium," same substantive/boilerplate distinction.
+- **`readability_change`**: stays "low."
+
+**`config.BOILERPLATE_NOTE_NAMES`** (frozenset): any observation about one of these notes
+is "low" **regardless of which rule produced it**, applied as a final override after base
+severity is computed. Four notes, confirmed live to be SEC-mandated disclosure items that
+roll out industry-wide around the same real-world date across the whole watchlist: `Pay
+vs Performance Disclosure` (Item 402), `Cybersecurity Risk Management and Strategy
+Disclosure` (Item 106), `Insider Trading Arrangements` and `Insider Trading Policies and
+Procedures` (Item 408).
+
+**Cross-company simultaneity demotion**: if the same rule fires on the same **section
+name** for more than one watchlist company within `config.CROSS_COMPANY_SIMULTANEITY_WINDOW_DAYS`
+(365, measured against all four real `BOILERPLATE_NOTE_NAMES` cases: cross-company gaps
+ranged 214–303 days, since companies with different fiscal year ends reach "first annual
+report after the same regulatory effective date" at different calendar times), it is
+demoted to "low" and the reason is appended to the statement — an event affecting every
+company simultaneously is a taxonomy or regulatory change, not company-specific
+information.
+
+**Bug found and fixed before this shipped**: the demotion was first implemented for
+*every* rule, not just section-subject ones. Every watchlist company files an annual
+10-K within roughly the same 12 months as every other, so a metric subject like
+`asset_turnover` — the identical literal string for every company by construction —
+always has a same-window "peer" for a trivial reason unrelated to any real event. This
+silently demoted **every single** `metric_multi_year_extreme` observation on Amazon's
+most recent 10-K to "low" in testing. Fixed by scoping the cross-company check to
+`config.RULE_REGISTRY[rule_name].subject_kind == "section"` only — metric-subject rules
+are never eligible for this demotion.
+
+Implementation note: severity overrides are applied as a **second pass** over a complete
+batch (`observations._apply_severity_overrides`), not per-company. Computing and writing
+company by company would miss a same-window match for whichever company happened to be
+processed first in a from-scratch run, since its peer would not exist in the table yet.
+The override pass builds its peer index from the in-memory batch it is given, supplemented
+by a DB lookup for companies outside that batch — correct whether called with a full
+three-company batch (`compute_observations`) or a single company in isolation
+(`observations._observations_for_company`, which is also what `validate`'s determinism
+check calls, so the two paths must agree).
+
+#### R5e — Automatic note-rename detection (post-implementation round 2)
+
+Within a single year-over-year transition, a disappeared name and an appeared name whose
+actual section text similarity exceeds `config.SECTION_RENAME_SIMILARITY_THRESHOLD`
+(0.70, user-specified) are reported as **one `section_renamed` observation** ("low"
+severity) instead of a separate disappeared+appeared pair — reusing
+`section_wording_changed`'s exact similarity function. Greedy best-match pairing, walked
+in sorted name order for determinism.
+
+**Bug found and fixed before this shipped**: the similarity function used
+`difflib.SequenceMatcher.quick_ratio()`, which is a fast **upper-bound heuristic**
+(character-multiset overlap) rather than real sequence matching, and is unreliable for
+this purpose. Checked live: two genuinely unrelated Micron notes ("Acquisition of
+Inotera" vs. "Revenue and Contract Liabilities") scored `quick_ratio()` = **0.87**
+against a true `.ratio()` of **0.03** — a 29x difference. At the specified 0.70
+threshold, `quick_ratio()` produced 75 rename detections, the large majority nonsensical
+("Basis of Presentation" → "Lehi, Utah, Fab and 3D XPoint," "Redeemable Convertible
+Notes" → "Research and Development"). Fixed by switching every use to the real
+`.ratio()` — this also affects `section_wording_changed`, see R5a's threshold correction
+above. With the fix, `section_renamed` measures 17 detections, effectively all plausible
+or genuine (a singular/plural note-name flip, a "Recently Issued" → "Recently Adopted
+and Recently Issued" consolidation, a mangled-encoding case-and-punctuation match on the
+literal same title).
+
+**Whether this resolves Micron's "Other Income and Expenses" case (asked directly,
+checked directly, not assumed):** **No.** Its best same-year candidate ("Recently Issued
+Accounting Standards," the only other note that disappeared that same transition) scores
+0.43 — well under threshold. If "Other Income and Expenses" is a genuine consolidation of
+older content, the source note disappeared in an earlier transition than this mechanism
+(scoped to one year-over-year comparison at a time) can see. It is reported as a plain
+`section_appeared` observation, which is the correct, honest behavior given no same-year
+candidate clears the bar — not a failure of the mechanism, a boundary of its scope.
+
+#### R5f — Boilerplate notes excluded from rename detection (post-implementation round 3)
+
+`BOILERPLATE_NOTE_NAMES` (R5d) never participate in rename-pairing, on either side.
+Verified necessary live: with the `.ratio()` fix in place, one remaining false positive
+persisted at the threshold boundary — "Pay vs Performance Disclosure" repeatedly paired
+with an unrelated "Recently Adopted and Recently Issued Accounting Standards" note
+(70–91% similarity across three separate periods) — because two different boilerplate,
+SEC-template-driven disclosures share enough generic structural language to look similar
+without being the same note. No signal is lost by excluding them: a boilerplate name is
+already forced "low" by R5d regardless of which rule reports it, so excluding it from
+`section_renamed` only changes which (equally "low") rule reports it — it falls back to
+being a plain `section_appeared`/`section_disappeared` pair instead.
 
 ### R6 — Statement templates
 
@@ -409,11 +571,55 @@ python -m edgar.pipeline compute-observations [--ticker TICKER] [--rule NAME]
 
 | Check | Behaviour |
 |---|---|
-| **Firing rate** | Per rule, the share of eligible periods where it fired, using `observations.ELIGIBLE_COUNT_FUNCS` (mirrors each rule's own gating logic). **Flag above 33%.** Informational. |
+| **Per-filing contribution** | Per rule, the mean and maximum number of observations it contributes to a single filing. **Replaced the original 33%-of-eligible-periods ceiling** — see R8b. Informational, always reported. |
 | **Dead rules** | A rule that never fires across the whole corpus is either miscalibrated or dead code. Report it. Informational. |
 | **Lookahead** | Assert no observation references data with `period_end` later than its own. Hard failure. |
 | **Determinism** | Recompute every rule in memory (no write) and assert each **persisted** row's statement is byte-identical to its recomputed statement. Iterates over persisted rows, not over every possible recomputed observation — an observations table that simply hasn't been computed yet must read as zero violations, not "everything mismatches." Hard failure. |
 | **Orphan references** | Every id in `refs_json` must resolve. Hard failure. |
+
+#### R8b — Per-filing contribution replaces the 33% eligible-periods ceiling (post-implementation round 3)
+
+**The original firing-rate measure had a structural bias, not just a wrong threshold.**
+It counted firings per `(subject, period)` — which penalises a rule that evaluates 30
+metrics against one that evaluates a single condition purely as an artifact of how many
+things it checks, regardless of how much of any *one* filing's brief either actually
+occupies. A rule that fires rarely but produces 14 observations on the one filing where
+it does fire crowds out just as much of that filing's list as a rule that fires
+constantly at 1 observation each time — the original percentage could not distinguish
+these, and this is exactly what happened live: Amazon's top-5-by-severity observations
+were entirely `metric_multi_year_extreme`, even though its eligible-periods rate (34.4%)
+was barely above the ceiling.
+
+**Replacement:** for each rule, `validate` reports the mean and maximum number of
+observations it contributes to any single filing (grouped by `(cik, accession_no)`,
+current `rule_version` only), computed across the filings it contributed to at all —
+`FIRING_RATE_WARNING_PCT` and `observations.ELIGIBLE_COUNT_FUNCS`'s use for this purpose
+are both removed (`ELIGIBLE_COUNT_FUNCS` is retained only for the still-valid, structurally
+different, dead-rule check). No fixed ceiling — the numbers are reported for judgement,
+not gated against a threshold this spec would otherwise have to justify inventing.
+
+Measured live (all three companies, current versions):
+
+| Rule | Mean / filing | Max / filing | Filings contributed to |
+|---|---|---|---|
+| `metric_multi_year_extreme` | 6.9 | **24** | 46 |
+| `section_wording_changed` | 3.9 | 11 | 67 |
+| `readability_change` | 4.4 | 11 | 64 |
+| `section_length_change` | 3.6 | 10 | 65 |
+| `metric_sigma_move` | 4.6 | 12 | 35 |
+| `section_appeared` | 2.3 | 5 | 49 |
+| `section_disappeared` | 2.3 | 7 | 50 |
+| `metric_stopped_computing` | 1.7 | 5 | 23 |
+| `section_renamed` | 1.2 | 2 | 14 |
+| `metric_threshold_cross` | 1.1 | 2 | 12 |
+| `metric_divergence` | 1.0 | 1 | 14 |
+
+`metric_multi_year_extreme`'s max of 24 (vs. every other rule's max ≤ 12) is the precise,
+quantified version of the top-5 problem: on the one filing where it fires hardest, it can
+alone fill a display budget several times over. This is a display-layer problem, not a
+detection-layer one (R11 below) — the rule's individual claims are each still true and
+independently verifiable; the issue is entirely about what happens when many true claims
+from the same rule compete for a small number of display slots.
 
 ### R9 — Fiscal-period matching (SPEC-005 change 9)
 
@@ -502,6 +708,35 @@ three-company watchlist, reaching 15 MB from the current 6.48 MB is on the order
 decade away — the soft ceiling is there for when the watchlist grows, not because current
 growth is a near-term concern.
 
+### R11 — Top-N display must cap contributions per rule (binding on SPEC-006 and the dashboard)
+
+**Not implemented in this spec** — SPEC-005 has no top-N display surface of its own (no
+LLM narration, no dashboard). Recorded here as a binding requirement for whichever future
+spec introduces one, because the failure mode was found and measured here (R8b) and must
+not be rediscovered independently later.
+
+**Rule: any top-N selection of observations must cap contributions from a single rule at
+2, then fill remaining slots from the next-highest-severity rule.** Sort by severity as
+today (high, medium, low, with a deterministic tie-break), but when walking the sorted
+list to fill N slots, skip any observation whose rule has already contributed 2 to the
+selection, and continue to the next-eligible observation regardless of rule.
+
+**Why 2, and why this is a display problem, not a detection problem (R8b):** Amazon's
+top-5-by-severity being entirely `metric_multi_year_extreme` is not evidence that rule is
+miscalibrated — every one of those five observations is independently true and
+verifiable (a real 6-year extreme, with real refs). The problem is purely that one rule
+can produce up to 24 observations on a single filing (R8b) while every other rule tops
+out at 12, so an uncapped top-N silently becomes "the rule that happens to fire most on
+this filing," not "the most material things about this filing." A per-rule cap of 2
+guarantees a top-5 view surfaces at least 3 distinct *kinds* of finding (metric extremes,
+wording changes, threshold crosses, ...) rather than one rule's internal ranking.
+
+**Consequence for SPEC-006's LLM narration and the dashboard's Overview page**: both must
+implement this cap when selecting which observations to narrate or display — it is a
+selection-layer rule, not something `observations.py` itself should ever do (the
+`observations` table remains the complete, uncapped, unranked record; the cap applies
+only at the point observations are chosen for a bounded display or prompt).
+
 ---
 
 ## Constraints
@@ -526,11 +761,10 @@ growth is a near-term concern.
    exactly why one specific (metric, period) pair cannot currently fire under the
    user-specified minimum-history requirement, and why that is correct behaviour, not a
    miscalibration.
-5. **No rule fires on more than 33% of eligible periods**, with one documented exception
-   (`metric_multi_year_extreme`, measured at 37.7% before `extreme_informative` (v1.2,
-   below), 34.4% after — closer to the ceiling but not yet under it. See the changelog
-   and the implementer's final report for the mechanism and why it is expected to
-   self-correct further as more fiscal years of history accumulate.)
+5. **Replaced (v1.4):** the 33%-of-eligible-periods ceiling is dropped for a per-filing
+   contribution measure (mean/max observations contributed to a single filing, per rule)
+   — see R8b for why (it structurally penalised rules checking many things per filing)
+   and the measured table there. No fixed ceiling; reported for judgement.
 6. **Amended (v1.2):** NVIDIA's Q2 FY2023 (`2022-07-31`) `incremental_gross_margin` was
    assumed to have sufficient quarterly history to fire; it does not, and the criterion
    was wrong to assume otherwise. See R9a for the verified root cause (the missing Q4
@@ -598,6 +832,20 @@ growth is a near-term concern.
 - `test_readability_on_known_text` — a hand-checked passage with known word and sentence
   counts.
 - `test_observations_idempotent`
+- `test_extreme_severity_high_for_margin_return_working_capital` /
+  `test_extreme_severity_medium_for_other_categories` — R5d category-based severity.
+- `test_headline_flags_set_correctly` / `test_extreme_and_sigma_skip_non_headline_metrics`
+  — R5c/headline gate.
+- `test_boilerplate_note_forced_low_regardless_of_rule` — R5d.
+- `test_cross_company_demotion_applies_to_matching_section_subject` /
+  `test_cross_company_demotion_does_not_apply_to_metric_subjects` — R5d, including the
+  metric-scoping bug found and fixed; the second test is the regression guard for it.
+- `test_rename_detected_for_near_identical_text` / `test_rename_not_detected_for_unrelated_notes`
+  — R5e, including the regression guard for the quick_ratio → ratio() fix (the "unrelated
+  notes" case is the exact pair that produced a quick_ratio false positive during
+  development).
+- `test_rename_not_detected_for_boilerplate_note` — R5f.
+- `test_per_filing_contribution_reports_mean_and_max` — R8b.
 
 ---
 
@@ -630,16 +878,27 @@ Flagged, not implemented here.
 2. **Observations are the LLM's only input.** SPEC-006 will pass these statements, not raw
    metrics. Statement quality directly determines narrative quality — a vague observation
    produces vague prose.
-3. **Rule calibration will need a second pass** once real output is visible. Two rules
-   are already flagged from this pass: `metric_multi_year_extreme`'s 38% aggregate rate
-   (annual-window mechanics, expected to improve with more history) and the still-open
-   question of whether `SECTION_WORDING_SIMILARITY_THRESHOLD` (0.85) is the right
-   materiality bar once an analyst is actually reading the output.
-4. **Loughran–McDonald** reuses this exact machinery — a per-section score column and a
+3. **R11's top-N per-rule cap is binding on SPEC-006 and the dashboard, not optional.**
+   The failure mode (one rule dominating a filing's list) was found, measured, and fixed
+   at the *display* layer requirement here — it must not be rediscovered independently by
+   whichever spec builds the first real top-N selection. See R11 and R8b.
+4. **`metric_multi_year_extreme`'s per-filing max (24, R8b) is worth revisiting once more
+   fiscal-year history accumulates**, separately from the R11 display cap — the display
+   cap manages the *symptom* (too many observations competing for a display slot); the
+   underlying annual-window mechanics (ARCHITECTURE.md §2.3) are the *cause*, and are
+   expected to self-moderate as the corpus ages, not something this spec fixes directly.
+5. **Loughran–McDonald** reuses this exact machinery — a per-section score column and a
    change rule — and can be added as a small follow-on.
-5. **Unit-aware statement formatting** (percentages, dollar suffixes, multiples) was
+6. **Unit-aware statement formatting** (percentages, dollar suffixes, multiples) was
    deliberately deferred to SPEC-006's narration layer (R6) — worth revisiting if
    observations end up displayed directly on the dashboard before SPEC-006 exists.
+7. **The `SECTION_RENAME_SIMILARITY_THRESHOLD` (0.70) boundary is still imperfect.**
+   With the `.ratio()` fix (R5e) and boilerplate exclusion (R5f), the remaining 17
+   detections are effectively all plausible or genuine — but 0.70 is a user-specified
+   value, not independently re-measured against the corrected metric the way
+   `SECTION_WORDING_SIMILARITY_THRESHOLD` was. Worth a from-scratch remeasurement if a
+   future case like the "Pay vs Performance" false positive resurfaces for a
+   non-boilerplate pair.
 
 ---
 

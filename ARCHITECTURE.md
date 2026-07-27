@@ -1,11 +1,38 @@
 # Equity Research Platform — Architecture
 
-**Version:** 2.1
+**Version:** 2.3
 **Date:** 2026-07-27
 **Owner:** Zakaria
 **Status:** Approved for V1 implementation
 
 **Changelog**
+- v2.3 — Three more SPEC-005 post-implementation refinements. `BOILERPLATE_NOTE_NAMES`
+  excluded from automatic rename detection (§2.4) — fixed a remaining false positive
+  ("Pay vs Performance Disclosure" repeatedly paired with an unrelated accounting-
+  standards note); no signal lost, since boilerplate names are already forced "low"
+  regardless of rule. The 33%-eligible-periods firing-rate ceiling replaced by a
+  per-filing contribution measure (§7a) — the old measure penalised rules checking many
+  things per filing purely as an artifact of how many things they check; the new one
+  measured precisely what the Amazon top-5 problem actually was:
+  `metric_multi_year_extreme` contributes up to 24 observations to a single filing,
+  more than double every other rule's maximum. New binding requirement for SPEC-006 and
+  the dashboard: any future top-N observation display must cap contributions from one
+  rule at 2 (§2.4) — the failure mode was found and measured here and must not be
+  rediscovered independently later. Decision log entries 36–38 added.
+- v2.2 — Severity reassigned by analytical materiality instead of detection method (§2.4,
+  new) — the original scheme (every `section_appeared`/`disappeared` "high," every metric
+  extreme "medium" regardless of which metric) let presentation artifacts outrank real
+  economic signal, confirmed live. New: category-based severity for
+  `metric_multi_year_extreme`, `BOILERPLATE_NOTE_NAMES`, cross-company simultaneity
+  demotion, automatic note-rename detection, `MetricDef.headline` (excludes Beneish
+  components and four intermediates from the two per-metric rules). Two real bugs found
+  and fixed before shipping: the cross-company demotion was first scoped to every rule,
+  not just section-subject ones, and silently zeroed every `metric_multi_year_extreme`
+  observation on a real filing; and `section_wording_changed`/the new rename detector
+  both used `difflib.SequenceMatcher.quick_ratio()`, an upper-bound heuristic unreliable
+  for real similarity decisions (0.87 measured for two genuinely unrelated notes, true
+  `.ratio()` 0.03) — `section_wording_changed`'s threshold was re-measured from scratch
+  with the corrected metric (0.85 → 0.60). Decision log entries 33–35 added.
 - v2.1 — Three SPEC-005 post-implementation refinements. `MetricDef.extreme_informative`
   (§7a) excludes five compounding dollar-level metrics from `metric_multi_year_extreme`
   (a record in a growing company's `ebitda`/`nopat`/`invested_capital`/`free_cash_flow`/
@@ -233,6 +260,68 @@ self-limiting: `metric_multi_year_extreme` ("is this a new record over the trail
 window") and `metric_sigma_move` ("is this more than 2σ from a moving trailing mean")
 both naturally stop firing once a metric stabilizes, without needing an explicit
 transition check — a moving window is already a kind of transition detector.
+
+### 2.4 Severity is assigned by materiality, and display is a separate concern from detection (SPEC-005)
+
+**Detection method is not materiality.** The original severity scheme assigned "high" to
+every `section_appeared`/`section_disappeared` observation and "medium" to every metric
+extreme, regardless of *what* appeared or *which* metric hit a record — a boilerplate
+SEC-mandated disclosure item showing up "new" this year outranked a five-year low in
+gross margin. Confirmed live: Amazon's and Micron's top-5-by-severity observations were
+dominated by presentation artifacts, not economics. Severity is now computed from what
+was actually found, not from which rule found it:
+
+- `metric_multi_year_extreme`: "high" only for `margins`/`returns`/`working_capital`
+  metric categories — a multi-year record in one of these *is* the analytical claim.
+- `metric_threshold_cross`/`metric_divergence`: uniformly "high" — any declared hard
+  threshold crossing is material regardless of which one.
+- `section_appeared`/`section_disappeared`: downgraded to "low" — a note appearing is a
+  presentation change, not a number moving.
+- **`BOILERPLATE_NOTE_NAMES`** (four SEC-mandated disclosure items, confirmed live to
+  roll out industry-wide within the same real-world window across the whole watchlist —
+  Pay vs Performance, Cybersecurity Risk Management, Insider Trading Arrangements,
+  Insider Trading Policies and Procedures): any observation about one of these is "low"
+  **regardless of which rule produced it**.
+- **Cross-company simultaneity**: if the same rule fires on the same **section name**
+  (never a metric name — see the bug note below) for more than one watchlist company
+  within 365 days, it is demoted to "low" — a same-name event hitting every company at
+  once is a taxonomy or regulatory change, not company-specific information.
+- **Automatic note-rename detection**: a disappeared name and an appeared name within one
+  year-over-year transition, whose actual text similarity clears a threshold, are reported
+  as one "low" `section_renamed` observation instead of a disappeared+appeared pair.
+  Boilerplate names never participate (already "low" either way; excluding them removed a
+  real false-positive class, since two different boilerplate disclosures can share enough
+  generic template language to look similar without being the same note).
+
+**Two real bugs found and fixed before this shipped, not designed around in advance:**
+(1) cross-company demotion was first applied to every rule, not just section-subject
+ones — every watchlist company files an annual 10-K within the same ~12 months as every
+other, so a metric subject like `asset_turnover` (the identical string for every company
+by construction) always has a same-window "peer" for a reason with zero relationship to
+any real event; this silently zeroed every `metric_multi_year_extreme` observation on a
+real filing before being scoped to section-subject rules only. (2) both the wording-change
+rule and the rename detector used `difflib.SequenceMatcher.quick_ratio()`, a fast
+upper-bound heuristic (character-multiset overlap) rather than real sequence matching —
+two genuinely unrelated notes scored 0.87 under `quick_ratio()` against a true `.ratio()`
+of 0.03. Every use was switched to the real `.ratio()`, and `section_wording_changed`'s
+threshold was re-measured from scratch with the corrected metric (0.85 → 0.60; the old
+value, re-measured correctly, would have fired on 61–67% of comparisons — it only looked
+calibrated because it was calibrated against the wrong number).
+
+**Display is a separate concern from detection, and belongs at the display layer, not
+here.** Measuring how much of a single filing's observation list each rule can occupy
+(mean/max observations contributed per filing, replacing an eligible-periods-fired
+percentage that structurally penalised rules checking many things per filing) showed
+`metric_multi_year_extreme` can contribute up to 24 observations to one filing — more
+than double every other rule's maximum. Every one of those 24 claims is independently
+true and verifiable; the problem is entirely that an uncapped top-N selection becomes "the
+rule that fired most on this filing" rather than "the most material things about this
+filing." The fix — cap any future top-N observation selection (SPEC-006's LLM narration,
+the dashboard's Overview page) at 2 contributions per rule, then fill remaining slots from
+the next rule — is recorded as a binding requirement on those future specs rather than
+solved here, since SPEC-005 itself has no top-N display surface: `observations` remains
+the complete, uncapped, unranked record, and the cap applies only where a bounded
+selection is actually made.
 
 ---
 
@@ -805,41 +894,66 @@ semiconductor manufacturers, do report `GrossProfit` currently.
 
 ## 7a. Observation Rule Set (SPEC-005)
 
-Ten rules (nine `SPEC-005 R5` table rows — `section_appeared`/`section_disappeared` share
-one row), declarative in `config.RULE_REGISTRY` plus a small engine in `observations.py`,
-mirroring §7's metric-registry split exactly. Full definitions, thresholds, and the
-governing transition-only-firing principle (§2.3) are in SPEC-005 R5; not duplicated here.
+Eleven rules (the original nine `SPEC-005 R5` table rows —
+`section_appeared`/`section_disappeared` share one row — plus `section_renamed`, added
+post-implementation, R5e), declarative in `config.RULE_REGISTRY` plus a small engine in
+`observations.py`, mirroring §7's metric-registry split exactly. Full definitions,
+thresholds, and the governing transition-only-firing principle (§2.3) are in SPEC-005 R5;
+severity-by-materiality (including the two mechanisms that can only ever lower it further
+— `BOILERPLATE_NOTE_NAMES` and cross-company simultaneity) is in §2.4; not duplicated here.
 
 | Rule | Reads | Severity |
 |---|---|---|
-| `metric_multi_year_extreme` | `metrics` | medium |
+| `metric_multi_year_extreme` | `metrics` | high (margins/returns/working_capital) or medium (other) |
 | `metric_sigma_move` (quarterly-only) | `metrics` | medium |
-| `metric_threshold_cross` | `metrics` | varies by declared threshold |
+| `metric_threshold_cross` | `metrics` | high |
 | `metric_divergence` | `metrics` | high |
 | `section_wording_changed` | `sections` (Policies + Notes) | high |
 | `section_length_change` | `sections` (Policies + Notes) | medium |
-| `section_appeared` / `section_disappeared` | `sections` (Notes) | high |
+| `section_appeared` / `section_disappeared` | `sections` (Notes) | low |
+| `section_renamed` | `sections` (Notes) | low |
 | `metric_stopped_computing` | `metrics` | medium |
 | `readability_change` | `sections` (Policies + Notes) | low |
 
-Measured live against the real database (all three companies): every one of the ten
-rules fires at least once (zero dead rules) — `metric_threshold_cross` 4.6%,
-`metric_divergence` 11.7%, `section_wording_changed` 13.3%, `section_length_change`
-18.6%, `section_appeared` 9.0%, `section_disappeared` 9.2%, `metric_stopped_computing`
-11.0%, `readability_change` 22.0%, `metric_sigma_move` 24.9% — all comfortably under the
-33% ceiling. `metric_multi_year_extreme` measures **34.4%** (347/1010) after excluding
-five compounding dollar-level metrics via `MetricDef.extreme_informative` (down from
-37.7%/438/1162) — still the one rule above the design ceiling, mechanically driven by the
-very small annual-history window at current corpus depth (as few as 4–6 total fiscal
-years per company), where a genuinely trending metric sets a "new record" on most
-eligible annual points almost by construction — expected to fall further as more fiscal
-years of history accumulate, not a false-positive class. One further gap, narrower than a
-dead rule: NVIDIA's Q2 FY2023 `incremental_gross_margin` (the AC6 case) does not itself
-fire, because only 3 valid prior quarters exist for that specific metric at that point —
-short of the 8-quarter minimum, and verified to trace back to a structural fact true for
-all three companies (none files a Q4 10-Q, so every quarterly chain is 3 real periods per
-fiscal year, not 4). Both are reported, not patched around; see the SPEC-005 changelog
-and decision log entries 30–31.
+All severities above are subject to the `BOILERPLATE_NOTE_NAMES` and cross-company
+overrides (§2.4), which can only ever demote further, never promote.
+
+**Calibration measure replaced (§2.4, R8b):** the original "share of eligible periods
+fired, flag above 33%" measure structurally penalised a rule checking many things per
+filing (`metric_multi_year_extreme`, 45 metrics) against one checking a single condition,
+regardless of how much of any *one* filing's list either actually occupies — exactly the
+wrong question for a display-budget concern. Replaced by mean/max observations
+contributed to a single filing, measured live (all three companies, current rule
+versions):
+
+| Rule | Mean / filing | Max / filing |
+|---|---|---|
+| `metric_multi_year_extreme` | 6.9 | **24** |
+| `metric_sigma_move` | 4.6 | 12 |
+| `readability_change` | 4.4 | 11 |
+| `section_wording_changed` | 3.9 | 11 |
+| `section_length_change` | 3.6 | 10 |
+| `section_appeared` | 2.3 | 5 |
+| `section_disappeared` | 2.3 | 7 |
+| `metric_stopped_computing` | 1.7 | 5 |
+| `section_renamed` | 1.2 | 2 |
+| `metric_threshold_cross` | 1.1 | 2 |
+| `metric_divergence` | 1.0 | 1 |
+
+Every rule fires at least once (zero dead rules). `metric_multi_year_extreme`'s max of 24
+— more than double every other rule's maximum — is the precise, quantified version of the
+Amazon top-5 problem: not miscalibration (every one of those 24 claims on its worst
+filing is independently true and verifiable), but a display-layer risk that an uncapped
+top-N selection would surface "the rule that fired most on this filing" rather than "the
+most material things about it." Fixed at the display layer, not the detection layer — see
+§2.4's top-N cap, binding on SPEC-006 and the dashboard.
+
+One further gap, unrelated to display: NVIDIA's Q2 FY2023 `incremental_gross_margin` (the
+AC6 case) does not fire, because only 3 valid prior quarters exist for that specific
+metric at that point — short of the 8-quarter minimum, and verified to trace back to a
+structural fact true for all three companies (none files a Q4 10-Q, so every quarterly
+chain is 3 real periods per fiscal year, not 4). Reported, not patched around; see the
+SPEC-005 changelog and decision log entry 31.
 
 ---
 
@@ -905,3 +1019,9 @@ and decision log entries 30–31.
 | 30 | `MetricDef.extreme_informative` added, excluding `ebitda`/`nopat`/`invested_capital`/`free_cash_flow`/`net_debt` from `metric_multi_year_extreme`; rule bumped to `rule_version` `v2` | A "record" in a compounding dollar-level metric mostly restates that a growing company grew, not that something happened; a record in a ratio (margin, return, days-outstanding) is information regardless of the dollar scale underneath it. Measured live: firing rate 37.7% → 34.4% | 2026-07-27 |
 | 31 | AC6 amended rather than the 8-quarter minimum lowered | Verified live: no watchlist company files a Q4 10-Q (`{Q1, Q2, Q3}` only, confirmed for all three companies) — every quarterly chain is 3 real periods per fiscal year, not 4, which is why NVIDIA's Q2 FY2023 `incremental_gross_margin` had only 3 valid prior quarters at that point. A structural, self-resolving gap, verified and documented rather than closed by weakening the general minimum-history rule for every metric on every company. Derived Q4 figures (already in §8's V2 scope) flagged as the direct future fix | 2026-07-27 |
 | 32 | `app.db`'s absolute size ceiling replaced by a growth measure (current size + measured marginal cost per filing) and a 15 MB soft ceiling | The absolute number had already been relaxed twice during SPEC-004 (5 MB → 6 MB) and needed relaxing again after SPEC-005; a number that keeps moving was never the right criterion. Measured live (scratch copy of the real database, one Micron 10-Q reprocessed end to end): 72 KB per filing — at that rate the 15 MB soft ceiling is roughly a decade away at current watchlist size | 2026-07-27 |
+| 33 | Observation severity reassigned by analytical materiality (metric category for `metric_multi_year_extreme`, uniform "high" for threshold/divergence crossings, "low" for section appeared/disappeared), not by which rule detected it | Confirmed live: the original scheme let a boilerplate SEC disclosure item showing up "new" this year outrank a five-year low in gross margin — Amazon's and Micron's top-5-by-severity observations were dominated by presentation artifacts, not economics | 2026-07-27 |
+| 34 | `BOILERPLATE_NOTE_NAMES` and cross-company-simultaneity demotion added, scoped to section-subject rules only | Four SEC-mandated disclosure items (Pay vs Performance, Cybersecurity Risk Management, Insider Trading Arrangements, Insider Trading Policies and Procedures) confirmed live to roll out industry-wide within the same real-world window across the whole watchlist — a regulatory-calendar event, not company-specific information. Scoping to sections only was itself a live-found-and-fixed bug: applied to every rule, it silently demoted every `metric_multi_year_extreme` observation on a real filing, since every company files annually within ~12 months of every other regardless of any real event | 2026-07-27 |
+| 35 | Automatic note-rename detection added (`section_renamed`); `difflib.SequenceMatcher.quick_ratio()` replaced with real `.ratio()` everywhere it's used for a similarity decision | `quick_ratio()` is a fast upper-bound heuristic (character-multiset overlap), not real sequence matching, and is unreliable for this purpose — verified live, two genuinely unrelated Micron notes scored 0.87 under `quick_ratio()` against a true `.ratio()` of 0.03. `section_wording_changed`'s threshold was re-measured from scratch with the corrected metric (0.85 → 0.60); the old value, re-measured correctly, would have fired on 61–67% of comparisons | 2026-07-27 |
+| 36 | `BOILERPLATE_NOTE_NAMES` excluded from rename-pairing on either side | Verified live: even after the `.ratio()` fix, "Pay vs Performance Disclosure" repeatedly paired with an unrelated accounting-standards note at the threshold boundary, because two different boilerplate SEC-template disclosures share enough generic structural language to look similar without being the same note. No signal lost — boilerplate names are already forced "low" regardless of which rule reports them | 2026-07-27 |
+| 37 | The 33%-eligible-periods firing-rate ceiling replaced by a per-filing contribution measure (mean/max observations contributed to a single filing, per rule) | The old measure counted firings per `(subject, period)`, structurally penalising a rule checking many things per filing (45 metrics) against one checking a single condition, regardless of how much of any ONE filing's list either actually occupies. Measured live: `metric_multi_year_extreme` contributes up to 24 observations to a single filing, more than double every other rule's maximum — the precise, quantified version of the Amazon top-5 problem | 2026-07-27 |
+| 38 | Top-N observation selection must cap contributions from a single rule at 2 (then fill from the next rule) — recorded as binding on SPEC-006 and the dashboard, not implemented here | SPEC-005 has no top-N display surface of its own; the failure mode (one rule's internal ranking dominating a filing's list) was found and measured in this spec (entry 37) and must not be rediscovered independently by whichever future spec builds the first real top-N selection | 2026-07-27 |

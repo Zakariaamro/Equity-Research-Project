@@ -34,7 +34,7 @@ class ValidationReport:
     coverage: list[dict] = field(default_factory=list)
     unresolved_concepts: list[dict] = field(default_factory=list)
     finance_lease_zero_assumptions: list[dict] = field(default_factory=list)
-    observation_firing_rates: list[dict] = field(default_factory=list)
+    observation_per_filing_contribution: list[dict] = field(default_factory=list)
     observation_dead_rules: list[dict] = field(default_factory=list)
     observation_lookahead_violations: list[dict] = field(default_factory=list)
     observation_determinism_violations: list[dict] = field(default_factory=list)
@@ -619,18 +619,48 @@ def _observations_for_rule(conn: sqlite3.Connection, tickers: list[str] | None, 
     return [dict(r) for r in rows]
 
 
-def _check_observation_firing_rates(conn: sqlite3.Connection, tickers: list[str] | None) -> list[dict]:
-    """Per rule, share of eligible periods where it fired. Informational --
-    flagged (not hard-failed) above config.FIRING_RATE_WARNING_PCT (R8)."""
+def _check_observation_per_filing_contribution(conn: sqlite3.Connection, tickers: list[str] | None) -> list[dict]:
+    """Per rule, the mean and maximum number of observations it contributes
+    to a single filing (R8, replacing the original eligible-periods-fired
+    percentage). Informational, always reported (not just when high) --
+    there is no longer a fixed ceiling to flag against; see the constant's
+    removal note and SPEC-005 R8b for why.
+
+    The original measure counted firings per (subject, period) -- which
+    structurally penalises a rule that evaluates 30 metrics per filing
+    (metric_multi_year_extreme) against one that evaluates a single
+    condition (metric_threshold_cross), regardless of how much of any ONE
+    filing's brief either actually occupies. What matters for a dashboard or
+    an LLM narration budget is per-filing occupancy, not per-subject-period
+    frequency -- a rule that fires rarely but produces 14 observations on
+    the one filing where it does fire crowds out everything else in that
+    filing's list exactly as much as a rule that fires constantly at 1
+    observation each time.
+    """
+    ciks = _ciks_for_tickers(tickers)
+    if not ciks:
+        return []
+    placeholders = ",".join("?" for _ in ciks)
     findings = []
     for rule_name in config.RULE_REGISTRY:
-        fired = len(_observations_for_rule(conn, tickers, rule_name))
-        eligible = sum(
-            observations_mod.ELIGIBLE_COUNT_FUNCS[rule_name](conn, cik) for cik in _ciks_for_tickers(tickers)
+        version = config.RULE_REGISTRY[rule_name].version
+        rows = conn.execute(
+            f"SELECT cik, accession_no, COUNT(*) AS n FROM observations "
+            f"WHERE cik IN ({placeholders}) AND rule_name = ? AND rule_version = ? AND accession_no IS NOT NULL "
+            f"GROUP BY cik, accession_no",
+            (*ciks, rule_name, version),
+        ).fetchall()
+        if not rows:
+            continue
+        counts = [row["n"] for row in rows]
+        findings.append(
+            {
+                "rule_name": rule_name,
+                "filings_contributed_to": len(counts),
+                "mean_per_filing": sum(counts) / len(counts),
+                "max_per_filing": max(counts),
+            }
         )
-        rate = fired / eligible if eligible else 0.0
-        if eligible and rate > config.FIRING_RATE_WARNING_PCT:
-            findings.append({"rule_name": rule_name, "fired": fired, "eligible": eligible, "rate": rate})
     return findings
 
 
@@ -774,7 +804,7 @@ def run_validate(conn: sqlite3.Connection, tickers: list[str] | None = None) -> 
         coverage=_check_coverage(conn, tickers),
         unresolved_concepts=_check_unresolved_concepts(conn, tickers),
         finance_lease_zero_assumptions=_check_finance_lease_zero_assumptions(conn, tickers),
-        observation_firing_rates=_check_observation_firing_rates(conn, tickers),
+        observation_per_filing_contribution=_check_observation_per_filing_contribution(conn, tickers),
         observation_dead_rules=_check_observation_dead_rules(conn, tickers),
         observation_lookahead_violations=_check_observation_lookahead(conn, tickers),
         observation_determinism_violations=_check_observation_determinism(conn, tickers),
@@ -878,9 +908,10 @@ def format_report(report: ValidationReport) -> str:
         lambda v: f"{v['ticker']}: total_debt assumed $0 finance lease in {v['periods_affected']} period(s)",
     )
     _section(
-        "12. Observation firing rates (informational -- flagged above 33%)",
-        report.observation_firing_rates,
-        lambda v: f"{v['rule_name']}: {v['fired']}/{v['eligible']} eligible periods ({v['rate']:.0%})",
+        "12. Observation per-filing contribution (informational -- mean/max observations per filing)",
+        report.observation_per_filing_contribution,
+        lambda v: f"{v['rule_name']}: mean {v['mean_per_filing']:.1f}, max {v['max_per_filing']} "
+        f"(across {v['filings_contributed_to']} filing(s) it contributed to)",
     )
     _section(
         "13. Dead observation rules (informational)",

@@ -6,7 +6,7 @@ import re
 
 import pytest
 
-from edgar import config, db, observations, readability, section_store
+from edgar import config, db, observations, readability, section_store, validate
 
 AMZN_CIK = "0001018724"
 NVDA_CIK = "0001045810"
@@ -405,3 +405,199 @@ def test_observations_idempotent(conn):
     assert first
     second = observations.compute_observations(conn, tickers=["AMZN"])
     assert second == []
+
+
+# --- severity by materiality (post-implementation round 2) ---
+
+
+def test_extreme_severity_high_for_margin_return_working_capital(conn):
+    # gross_margin: category "margins" -> high.
+    values = [0.10, 0.11, 0.12, 0.13, 0.99]
+    for i, v in enumerate(values):
+        year = 2020 + i
+        _insert_filing(conn, f"accgm{year}", AMZN_CIK, "10-K", f"{year}-12-31", year, "FY")
+        _insert_metric(conn, AMZN_CIK, f"{year}-01-01", f"{year}-12-31", "gross_margin", v)
+    obs = observations._rule_metric_multi_year_extreme(conn, AMZN_CIK)
+    matches = [o for o in obs if o.subject == "gross_margin"]
+    assert matches and all(o.severity == "high" for o in matches)
+
+
+def test_extreme_severity_medium_for_other_categories(conn):
+    # capex_to_revenue: category "capital_cash" -> medium.
+    values = [0.05, 0.06, 0.07, 0.08, 0.50]
+    for i, v in enumerate(values):
+        year = 2020 + i
+        _insert_filing(conn, f"acccr{year}", AMZN_CIK, "10-K", f"{year}-12-31", year, "FY")
+        _insert_metric(conn, AMZN_CIK, f"{year}-01-01", f"{year}-12-31", "capex_to_revenue", v)
+    obs = observations._rule_metric_multi_year_extreme(conn, AMZN_CIK)
+    matches = [o for o in obs if o.subject == "capex_to_revenue"]
+    assert matches and all(o.severity == "medium" for o in matches)
+
+
+# --- headline gate (change 5) ---
+
+
+def test_headline_flags_set_correctly():
+    excluded = {
+        "beneish_dsri", "beneish_gmi", "beneish_aqi", "beneish_sgi", "beneish_depi",
+        "beneish_sgai", "beneish_lvgi", "beneish_tata", "nopat", "invested_capital",
+        "effective_tax_rate", "ebitda",
+    }
+    for name in excluded:
+        assert config.METRIC_REGISTRY[name].headline is False
+    assert config.METRIC_REGISTRY["beneish_m_score"].headline is True
+    assert config.METRIC_REGISTRY["gross_margin"].headline is True
+
+
+def test_extreme_and_sigma_skip_non_headline_metrics(conn):
+    values = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 999.0]
+    for i, v in enumerate(values):
+        year = 2016 + i
+        _insert_filing(conn, f"accbd{year}", AMZN_CIK, "10-K", f"{year}-12-31", year, "FY")
+        _insert_metric(conn, AMZN_CIK, f"{year}-01-01", f"{year}-12-31", "beneish_dsri", v)
+    obs = observations._rule_metric_multi_year_extreme(conn, AMZN_CIK)
+    assert not any(o.subject == "beneish_dsri" for o in obs)
+
+
+# --- boilerplate notes (change 2) ---
+
+
+def test_boilerplate_note_forced_low_regardless_of_rule(conn):
+    boilerplate = next(iter(config.BOILERPLATE_NOTE_NAMES))
+    _insert_filing(conn, "accbp1", AMZN_CIK, "10-K", "2023-12-31", 2023, "FY")
+    _insert_section(conn, "accbp1", config.MENUCATEGORY_NOTES, "Leases", "Baseline note, unrelated.")
+    _insert_filing(conn, "accbp2", AMZN_CIK, "10-K", "2024-12-31", 2024, "FY")
+    _insert_section(conn, "accbp2", config.MENUCATEGORY_NOTES, "Leases", "Baseline note, unrelated, still here.")
+    _insert_section(conn, "accbp2", config.MENUCATEGORY_NOTES, boilerplate, "New boilerplate disclosure text.")
+    raw = observations._raw_observations_for_company(conn, AMZN_CIK, ["section_appeared"])
+    overridden = observations._apply_severity_overrides(conn, raw)
+    matches = [o for o in overridden if o.subject == boilerplate]
+    assert matches and all(o.severity == "low" for o in matches)
+
+
+# --- cross-company simultaneity: sections only, not metrics (bug found and fixed) ---
+
+
+def test_cross_company_demotion_applies_to_matching_section_subject(conn):
+    for cik in (AMZN_CIK, NVDA_CIK):
+        _insert_filing(conn, f"accxc0-{cik}", cik, "10-K", "2022-12-31", 2022, "FY")
+        _insert_section(conn, f"accxc0-{cik}", config.MENUCATEGORY_NOTES, "Leases", "Baseline note.")
+        _insert_filing(conn, f"accxc1-{cik}", cik, "10-K", "2023-12-31", 2023, "FY")
+        _insert_section(conn, f"accxc1-{cik}", config.MENUCATEGORY_NOTES, "Leases", "Baseline note, still here.")
+        _insert_section(conn, f"accxc1-{cik}", config.MENUCATEGORY_NOTES, "Derivative Instruments", "New text.")
+    raw_amzn = observations._raw_observations_for_company(conn, AMZN_CIK, ["section_appeared"])
+    raw_nvda = observations._raw_observations_for_company(conn, NVDA_CIK, ["section_appeared"])
+    overridden = observations._apply_severity_overrides(conn, raw_amzn + raw_nvda)
+    matches = [o for o in overridden if o.subject == "Derivative Instruments"]
+    assert len(matches) == 2
+    assert all(o.severity == "low" for o in matches)
+    assert all("another watchlist company" in o.statement for o in matches)
+
+
+def test_cross_company_demotion_does_not_apply_to_metric_subjects(conn):
+    # The bug found live: every company files an annual 10-K within ~12
+    # months of every other, so a same-subject METRIC observation always
+    # has a same-window "peer" for a trivial reason (everyone reports
+    # annually), which is not a signal. Metric-subject rules must never be
+    # demoted by this mechanism.
+    for cik in (AMZN_CIK, NVDA_CIK):
+        values = [0.10, 0.11, 0.12, 0.13, 0.99]
+        for i, v in enumerate(values):
+            year = 2020 + i
+            _insert_filing(conn, f"accm{cik}{year}", cik, "10-K", f"{year}-12-31", year, "FY")
+            _insert_metric(conn, cik, f"{year}-01-01", f"{year}-12-31", "gross_margin", v)
+    raw_amzn = observations._raw_observations_for_company(conn, AMZN_CIK, ["metric_multi_year_extreme"])
+    raw_nvda = observations._raw_observations_for_company(conn, NVDA_CIK, ["metric_multi_year_extreme"])
+    overridden = observations._apply_severity_overrides(conn, raw_amzn + raw_nvda)
+    matches = [o for o in overridden if o.subject == "gross_margin"]
+    assert len(matches) == 2
+    assert all(o.severity == "high" for o in matches)  # NOT demoted to low
+    assert all("another watchlist company" not in o.statement for o in matches)
+
+
+# --- automatic rename detection (change 4) ---
+
+
+def test_rename_detected_for_near_identical_text(conn):
+    text = (
+        "Other Operating (Income) Expense, Net Other Operating (Income) Expense, NetOther "
+        "operating expense (income), net, consists primarily of the amortization of "
+        "intangible assets and asset impairments recognized during the period under review."
+    )
+    _insert_filing(conn, "accrn1", MU_CIK, "10-K", "2020-08-30", 2020, "FY")
+    _insert_section(conn, "accrn1", config.MENUCATEGORY_NOTES, "Other Operating (Income) Expense, Net", text)
+    _insert_filing(conn, "accrn2", MU_CIK, "10-K", "2021-09-02", 2021, "FY")
+    _insert_section(
+        conn, "accrn2", config.MENUCATEGORY_NOTES, "Other Operating (Income) Expenses, Net",
+        text.replace("Expense, Net", "Expenses, Net"),
+    )
+    obs = observations._rule_section_appeared_disappeared(conn, MU_CIK)
+    renamed = [o for o in obs if o.rule_name == "section_renamed"]
+    assert len(renamed) == 1
+    assert renamed[0].severity == "low"
+    assert not any(o.rule_name in ("section_appeared", "section_disappeared") for o in obs)
+
+
+def test_rename_not_detected_for_boilerplate_note(conn):
+    # R5f: boilerplate names never participate in rename-pairing, even when
+    # their text similarity would otherwise clear the threshold.
+    boilerplate = next(iter(config.BOILERPLATE_NOTE_NAMES))
+    _insert_filing(conn, "accbr1", MU_CIK, "10-K", "2020-08-30", 2020, "FY")
+    _insert_section(conn, "accbr1", config.MENUCATEGORY_NOTES, boilerplate, "Boilerplate disclosure text, year one.")
+    _insert_filing(conn, "accbr2", MU_CIK, "10-K", "2021-09-02", 2021, "FY")
+    _insert_section(
+        conn, "accbr2", config.MENUCATEGORY_NOTES, "Recently Issued Accounting Standards",
+        "Boilerplate disclosure text, year one, nearly identical wording reused here too.",
+    )
+    obs = observations._rule_section_appeared_disappeared(conn, MU_CIK)
+    assert not any(o.rule_name == "section_renamed" for o in obs)
+    assert any(o.rule_name == "section_disappeared" and o.subject == boilerplate for o in obs)
+    assert any(
+        o.rule_name == "section_appeared" and o.subject == "Recently Issued Accounting Standards" for o in obs
+    )
+
+
+# --- per-filing contribution (validate.py, replaces the 33%-eligible-periods ceiling) ---
+
+
+def test_per_filing_contribution_reports_mean_and_max(conn):
+    # One filing with 3 extremes, one filing with 1 extreme -- for the SAME
+    # metric name so both land under one rule's contribution stats.
+    filings = [
+        ("2020-01-01", "2020-12-31", 2020, 1.0),
+        ("2021-01-01", "2021-12-31", 2021, 1.0),
+        ("2022-01-01", "2022-12-31", 2022, 1.0),
+        ("2023-01-01", "2023-12-31", 2023, 1.0),
+        ("2024-01-01", "2024-12-31", 2024, 99.0),   # extreme #1 in this filing
+    ]
+    for i, (start, end, year, v) in enumerate(filings):
+        _insert_filing(conn, f"accpf{year}", AMZN_CIK, "10-K", end, year, "FY")
+        _insert_metric(conn, AMZN_CIK, start, end, "gross_margin", v)
+        _insert_metric(conn, AMZN_CIK, start, end, "net_margin", v)  # a 2nd metric, same extreme pattern
+    written = observations.compute_observations(conn, tickers=["AMZN"], rule_names=["metric_multi_year_extreme"])
+    assert written
+    report = validate.run_validate(conn, tickers=["AMZN"])
+    matches = [f for f in report.observation_per_filing_contribution if f["rule_name"] == "metric_multi_year_extreme"]
+    assert len(matches) == 1
+    assert matches[0]["filings_contributed_to"] == 1  # only the 2024 filing has any extreme
+    assert matches[0]["max_per_filing"] == 2  # both gross_margin and net_margin fired on it
+    assert matches[0]["mean_per_filing"] == 2.0
+
+
+def test_rename_not_detected_for_unrelated_notes(conn):
+    _insert_filing(conn, "accru1", MU_CIK, "10-K", "2020-08-30", 2020, "FY")
+    _insert_section(
+        conn, "accru1", config.MENUCATEGORY_NOTES, "Acquisition of Inotera",
+        "We completed the acquisition of the remaining interest in Inotera Memories, Inc. "
+        "for total consideration paid in cash and equity securities during fiscal 2016.",
+    )
+    _insert_filing(conn, "accru2", MU_CIK, "10-K", "2021-09-02", 2021, "FY")
+    _insert_section(
+        conn, "accru2", config.MENUCATEGORY_NOTES, "Revenue and Contract Liabilities",
+        "Revenue is recognized when control of the promised goods or services is transferred "
+        "to customers in an amount that reflects the consideration expected to be received.",
+    )
+    obs = observations._rule_section_appeared_disappeared(conn, MU_CIK)
+    assert not any(o.rule_name == "section_renamed" for o in obs)
+    assert any(o.rule_name == "section_appeared" and o.subject == "Revenue and Contract Liabilities" for o in obs)
+    assert any(o.rule_name == "section_disappeared" and o.subject == "Acquisition of Inotera" for o in obs)

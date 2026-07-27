@@ -412,6 +412,21 @@ class MetricDef:
     (ebitda, free cash flow, invested capital, net debt) usually is not.
     True for everything else, including growth-RATE metrics (revenue_yoy,
     ...) and quality indices (Beneish) -- those are not compounding levels.
+
+    `headline` (SPEC-005 change, post-implementation round 2) gates
+    `metric_multi_year_extreme` and `metric_sigma_move`: only headline
+    metrics generate standalone "is this metric's own value notable"
+    observations. False for: the 8 individual Beneish component indices
+    (DSRI, GMI, ...) -- only the composite `beneish_m_score` is a headline
+    quality signal, an analyst reads the components as its inputs, not as
+    findings in their own right; and for `nopat`, `invested_capital`,
+    `effective_tax_rate`, `ebitda` -- intermediates that feed other metrics
+    (`roic`, `net_debt_to_ebitda`, ...) rather than headline figures
+    themselves. Does NOT gate `metric_threshold_cross`/`metric_divergence`,
+    which already only ever run against a small, curated, always-headline
+    set (DECLARED_THRESHOLDS/DECLARED_DIVERGENCES below) -- nor
+    `metric_stopped_computing`, where a silently-broken intermediate is
+    still diagnostically useful even though it is not itself headline.
     """
 
     name: str
@@ -421,6 +436,7 @@ class MetricDef:
     needs_prior: bool = False
     category: str = ""
     extreme_informative: bool = True
+    headline: bool = True
 
 
 METRIC_REGISTRY: dict[str, MetricDef] = {
@@ -448,7 +464,7 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
     ),
     "ebitda": MetricDef(
         "ebitda", ("operating_income", "dep_amort"), "both", None, False, "margins",
-        extreme_informative=False,
+        extreme_informative=False, headline=False,
     ),
     "ebitda_margin": MetricDef(
         "ebitda_margin", ("operating_income", "dep_amort", "revenue"), "both", (-2.0, 1.0), False, "margins"
@@ -473,11 +489,12 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
     # --- Returns ---
     # Range widened -0.5..1.0 -> -3.0..2.0 live: real large negative rates occur (R6a).
     "effective_tax_rate": MetricDef(
-        "effective_tax_rate", ("tax_expense", "pretax_income"), "both", (-3.0, 2.0), False, "returns"
+        "effective_tax_rate", ("tax_expense", "pretax_income"), "both", (-3.0, 2.0), False, "returns",
+        headline=False,
     ),
     "nopat": MetricDef(
         "nopat", ("operating_income", "tax_expense", "pretax_income"), "both", None, False, "returns",
-        extreme_informative=False,
+        extreme_informative=False, headline=False,
     ),
     "invested_capital": MetricDef(
         "invested_capital",
@@ -491,6 +508,7 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         False,
         "returns",
         extreme_informative=False,
+        headline=False,
     ),
     "roic": MetricDef(
         "roic",
@@ -617,11 +635,15 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         True,
         "quality",
     ),
+    # All 8 components: headline=False -- an analyst reads these as
+    # beneish_m_score's inputs, not as findings in their own right. Only the
+    # composite score is a headline quality signal.
     "beneish_dsri": MetricDef(
-        "beneish_dsri", ("receivables", "revenue"), "annual", (0.0, 20.0), True, "quality"
+        "beneish_dsri", ("receivables", "revenue"), "annual", (0.0, 20.0), True, "quality", headline=False
     ),
     "beneish_gmi": MetricDef(
-        "beneish_gmi", ("gross_profit", "revenue", "cogs"), "annual", (-20.0, 20.0), True, "quality"
+        "beneish_gmi", ("gross_profit", "revenue", "cogs"), "annual", (-20.0, 20.0), True, "quality",
+        headline=False,
     ),
     "beneish_aqi": MetricDef(
         "beneish_aqi",
@@ -630,8 +652,11 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         (-20.0, 20.0),
         True,
         "quality",
+        headline=False,
     ),
-    "beneish_sgi": MetricDef("beneish_sgi", ("revenue",), "annual", (0.0, 20.0), True, "quality"),
+    "beneish_sgi": MetricDef(
+        "beneish_sgi", ("revenue",), "annual", (0.0, 20.0), True, "quality", headline=False
+    ),
     "beneish_depi": MetricDef(
         "beneish_depi",
         ("depreciation", "dep_amort", "ppe_net", "ppe_and_lease_net"),
@@ -639,9 +664,10 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         (-20.0, 20.0),
         True,
         "quality",
+        headline=False,
     ),
     "beneish_sgai": MetricDef(
-        "beneish_sgai", ("sga_expense", "revenue"), "annual", (-20.0, 20.0), True, "quality"
+        "beneish_sgai", ("sga_expense", "revenue"), "annual", (-20.0, 20.0), True, "quality", headline=False
     ),
     "beneish_lvgi": MetricDef(
         "beneish_lvgi",
@@ -654,10 +680,12 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         (-20.0, 20.0),
         True,
         "quality",
+        headline=False,
     ),
     "beneish_tata": MetricDef(
         # The one Beneish index computed from a single period -- no t-1 comparison.
-        "beneish_tata", ("net_income", "cfo", "total_assets"), "annual", (-2.0, 2.0), False, "quality"
+        "beneish_tata", ("net_income", "cfo", "total_assets"), "annual", (-2.0, 2.0), False, "quality",
+        headline=False,
     ),
 }
 
@@ -757,26 +785,73 @@ class RuleDef:
     subject_kind: str  # "metric" | "section" -- which table this rule reads
 
 
+# SPEC-005 post-implementation, round 2 -- severity reassigned by analytical
+# materiality, not by detection method. The original assignment (every
+# section_appeared/disappeared "high", every metric extreme "medium"
+# regardless of which metric) let presentation artifacts (a boilerplate SEC
+# disclosure item showing up "new" this year) outrank real economic signal
+# (a five-year low in a margin). See RULE_REGISTRY comments per rule and
+# ARCHITECTURE.md §2.4 for the full rationale.
+#
+# Every rule's version bumps this round: the new severity-override layer
+# (BOILERPLATE_NOTE_NAMES, cross-company simultaneity demotion, R5c/R5d
+# below) changes what every rule can produce, even where the base severity
+# assignment for a given rule is otherwise unchanged, so v1 rows are no
+# longer comparable to current output for any rule.
 RULE_REGISTRY: dict[str, RuleDef] = {
-    # v2: MetricDef.extreme_informative added post-implementation, excluding
-    # compounding dollar-level metrics (ebitda, nopat, invested_capital,
-    # free_cash_flow, net_debt) -- a real behavior change, so the version
-    # bumps; v1's observations on those metrics remain in the table for
-    # comparison but drop out of every current-version query (R4/R8).
-    "metric_multi_year_extreme": RuleDef("metric_multi_year_extreme", "v2", "medium", "metric"),
-    "metric_sigma_move": RuleDef("metric_sigma_move", "v1", "medium", "metric"),
-    "metric_threshold_cross": RuleDef("metric_threshold_cross", "v1", None, "metric"),
-    "metric_divergence": RuleDef("metric_divergence", "v1", "high", "metric"),
+    # Severity now varies by metric category -- "high" for margins/returns/
+    # working_capital (a five-year low in a ratio is information), "medium"
+    # otherwise (including growth-rate and capital_cash/solvency/quality
+    # metrics) -- computed in observations.py, not a fixed value here. Also
+    # gated on MetricDef.headline (R5d) as well as extreme_informative.
+    "metric_multi_year_extreme": RuleDef("metric_multi_year_extreme", "v3", None, "metric"),
+    "metric_sigma_move": RuleDef("metric_sigma_move", "v2", "medium", "metric"),
+    # Uniformly "high": crossing any of these five declared hard thresholds
+    # (a solvency ratio, a cash-burn signal, a leverage flip, a fraud-risk
+    # flag) is analytically material regardless of which one it is -- see
+    # DECLARED_THRESHOLDS below, where the per-threshold severity field is
+    # now uniform rather than varying.
+    "metric_threshold_cross": RuleDef("metric_threshold_cross", "v2", "high", "metric"),
+    "metric_divergence": RuleDef("metric_divergence", "v2", "high", "metric"),
     # Renamed from accounting_policy_changed (SPEC-005 change 2): driven by
     # normalized_text_hash, not text_hash, and its firing threshold is a
     # measured calibration -- see SECTION_WORDING_SIMILARITY_THRESHOLD below
-    # and SPEC-005 R5a / ARCHITECTURE.md.
-    "section_wording_changed": RuleDef("section_wording_changed", "v1", "high", "section"),
-    "section_length_change": RuleDef("section_length_change", "v1", "medium", "section"),
-    "section_appeared": RuleDef("section_appeared", "v1", "high", "section"),
-    "section_disappeared": RuleDef("section_disappeared", "v1", "high", "section"),
-    "metric_stopped_computing": RuleDef("metric_stopped_computing", "v1", "medium", "metric"),
-    "readability_change": RuleDef("readability_change", "v1", "low", "section"),
+    # and SPEC-005 R5a / ARCHITECTURE.md. "High" here means "for a
+    # substantive note" -- BOILERPLATE_NOTE_NAMES overrides to "low"
+    # regardless of rule (R5d).
+    # v3: SECTION_WORDING_SIMILARITY_THRESHOLD recalibrated after the
+    # quick_ratio -> ratio() fix (see the constant's docstring) -- a real
+    # behavior change to the similarity computation itself, not just severity.
+    "section_wording_changed": RuleDef("section_wording_changed", "v3", "high", "section"),
+    "section_length_change": RuleDef("section_length_change", "v2", "medium", "section"),
+    # Downgraded from "high": a note appearing or disappearing is a
+    # presentation change, not itself a number moving -- see R5d. Automatic
+    # rename detection (R5e) also removes the single biggest source of
+    # spurious appeared+disappeared pairs before this rule ever sees them.
+    # v3: quick_ratio -> ratio() fix changed which appeared/disappeared names
+    # get pulled into a section_renamed pair instead (see section_renamed's
+    # own version-bump comment) -- the output SET changes even though these
+    # two rules' own logic didn't. v4: BOILERPLATE_NOTE_NAMES excluded from
+    # rename-pairing (R5f) -- boilerplate names that used to get (wrongly)
+    # paired into a rename now correctly fall back to being reported here
+    # (and are then forced "low" anyway by the boilerplate override).
+    "section_appeared": RuleDef("section_appeared", "v4", "low", "section"),
+    "section_disappeared": RuleDef("section_disappeared", "v4", "low", "section"),
+    "metric_stopped_computing": RuleDef("metric_stopped_computing", "v2", "medium", "metric"),
+    "readability_change": RuleDef("readability_change", "v2", "low", "section"),
+    # New (R5e): an automatically detected note rename (disappeared/appeared
+    # pair whose actual text is similar above SECTION_RENAME_SIMILARITY_THRESHOLD)
+    # emitted as one observation instead of a disappeared+appeared pair.
+    # Always "low" -- a rename is a presentation change, lower-confidence
+    # than a manually verified NOTE_NAME_ALIASES entry (which is never
+    # reported as an observation at all, since it's treated as one
+    # continuous note from the start).
+    # v2: quick_ratio -> ratio() fix (see SECTION_WORDING_SIMILARITY_THRESHOLD's
+    # docstring) -- a real change to which pairs match, not just a value tweak.
+    # v3: BOILERPLATE_NOTE_NAMES excluded from rename-pairing (R5f) -- fixed
+    # a real false positive ("Pay vs Performance Disclosure" repeatedly
+    # paired with an unrelated accounting-standards note at the threshold).
+    "section_renamed": RuleDef("section_renamed", "v3", "low", "section"),
 }
 
 
@@ -790,11 +865,14 @@ class ThresholdRule:
     severity: str
 
 
+# All five uniformly "high" (post-implementation round 2) -- see
+# RULE_REGISTRY's metric_threshold_cross entry for why severity no longer
+# varies by which threshold crossed.
 DECLARED_THRESHOLDS: tuple[ThresholdRule, ...] = (
     ThresholdRule("beneish_m_score", "above", BENEISH_FLAG_THRESHOLD, "high"),
-    ThresholdRule("current_ratio", "below", 1.0, "medium"),
-    ThresholdRule("net_debt", "crosses_zero", None, "medium"),
-    ThresholdRule("fcf_conversion", "below", 0.5, "medium"),
+    ThresholdRule("current_ratio", "below", 1.0, "high"),
+    ThresholdRule("net_debt", "crosses_zero", None, "high"),
+    ThresholdRule("fcf_conversion", "below", 0.5, "high"),
     ThresholdRule("interest_coverage", "below", 3.0, "high"),
 )
 
@@ -912,14 +990,24 @@ NOTE_NAME_ALIASES: dict[str, str] = {e.alias: e.canonical for e in _NOTE_NAME_AL
 # EITHER category -- the fix is a materiality threshold, not a category
 # choice. section_wording_changed uses normalized_text_hash as a fast exact
 # match (skip trivially-identical wording, cheaply) and, for everything
-# else, a real similarity ratio between the two normalized texts
-# (difflib.SequenceMatcher.quick_ratio) against this threshold. Measured at
-# 0.85: Policies fires on 14.6% of comparisons, Notes on 13.3% -- both
-# comfortably under the ceiling and, again, nearly identical between
-# categories. That similarity between categories is itself the calibration
-# finding: Notes does not need excluding once real per-period noise
-# (numbers, and now materiality) is controlled for.
-SECTION_WORDING_SIMILARITY_THRESHOLD: float = 0.85
+# else, a real similarity ratio between the two normalized texts against
+# this threshold.
+#
+# CORRECTED post-implementation (round 2): the original measurement used
+# difflib.SequenceMatcher.quick_ratio(), which is a fast UPPER-BOUND
+# heuristic (character-multiset overlap), not real sequence matching --
+# checked live while debugging round 2's rename detector, two genuinely
+# unrelated Micron notes scored quick_ratio=0.87 against a true ratio() of
+# 0.03. Every use of this threshold now uses the real .ratio(). Re-measured
+# with the corrected metric: the whole distribution shifts down hard
+# (median similarity 0.96 under quick_ratio -> 0.73-0.80 under real ratio,
+# since ordinary annual-editing noise is not actually 96% textually stable,
+# quick_ratio just said so). At 0.60: Policies fires on 27.0% of
+# comparisons, Notes on 19.8% -- both comfortably under the 33% ceiling.
+# The old 0.85 threshold, re-measured with the corrected metric, would fire
+# on 67%/61% -- nowhere close to usable; it only looked calibrated because
+# it was calibrated against the wrong number.
+SECTION_WORDING_SIMILARITY_THRESHOLD: float = 0.60
 
 # Notes whose PRESENCE legitimately fluctuates period to period (e.g. a
 # "pending ASU" housekeeping note that is only written when one is actually
@@ -934,8 +1022,64 @@ FLUCTUATING_NOTE_NAMES: frozenset[str] = frozenset({
     "Recently Issued Accounting Standards Not Yet Adopted",
 })
 
+# --- SPEC-005 post-implementation round 2: severity by materiality ---
+
+# R5d: any observation about one of these notes is "low" regardless of
+# which rule produced it. All four are boilerplate SEC-mandated disclosure
+# items confirmed live to roll out industry-wide around the same real-world
+# date across the whole watchlist (Pay vs Performance Disclosure, Item 402;
+# Cybersecurity Risk Management and Strategy Disclosure, Item 106; Insider
+# Trading Arrangements and Insider Trading Policies and Procedures, Item
+# 408) -- their appearance/disappearance/wording is a regulatory-calendar
+# event, not company-specific information, however the detection rule
+# happened to notice it.
+BOILERPLATE_NOTE_NAMES: frozenset[str] = frozenset({
+    "Pay vs Performance Disclosure",
+    "Cybersecurity Risk Management and Strategy Disclosure",
+    "Insider Trading Arrangements",
+    "Insider Trading Policies and Procedures",
+})
+
+# R5d: metric_multi_year_extreme severity by MetricDef.category -- "high"
+# for the categories where a multi-year record is itself the analytical
+# claim (a five-year low margin, a five-year low return, a working-capital
+# days figure at an extreme); "medium" for every other eligible category
+# (growth rates, capex ratios, solvency multiples, the Beneish M-score).
+EXTREME_HIGH_SEVERITY_CATEGORIES: frozenset[str] = frozenset({"margins", "returns", "working_capital"})
+
+# R5d: an observation is demoted to "low" (with a reason appended to the
+# statement) when the SAME rule fires on the SAME subject for more than one
+# watchlist company within this many days of each other. Verified live
+# against all four current BOILERPLATE_NOTE_NAMES cases before picking this
+# value: cross-company gaps ranged 214-303 days (companies with different
+# fiscal year ends reach "first annual report after the same regulatory
+# effective date" at different calendar times) -- 365 days comfortably
+# covers a same real-world event across the whole watchlist without being
+# so wide it would treat two genuinely unrelated same-named events years
+# apart as one event.
+CROSS_COMPANY_SIMULTANEITY_WINDOW_DAYS: int = 365
+
+# R5e: automatic rename detection for section_appeared/section_disappeared.
+# A disappeared name and an appeared name within the SAME year-over-year
+# transition, whose actual section text similarity (same function as
+# section_wording_changed -- difflib.SequenceMatcher.ratio on
+# normalize_for_wording_hash'd text) exceeds this, are reported as one
+# section_renamed observation instead of a separate disappeared+appeared
+# pair. User-specified value. Higher than SECTION_WORDING_SIMILARITY_THRESHOLD
+# (0.60) -- deliberate: a rename is inferred indirectly (two different
+# titles, matched only by content), so it needs higher confidence than
+# "does this same-titled note's content still match itself."
+SECTION_RENAME_SIMILARITY_THRESHOLD: float = 0.70
+
 # --- SPEC-005 R8: validate additions ---
-FIRING_RATE_WARNING_PCT: float = 0.33
+# FIRING_RATE_WARNING_PCT (a flat 33%-of-eligible-periods ceiling) removed,
+# post-implementation round 3 (R8b): it counted firings per (subject,
+# period), which structurally penalises a rule evaluating many metrics per
+# filing against one evaluating a single condition, regardless of how much
+# of any ONE filing's brief either actually occupies. Replaced by
+# validate.py's per-filing contribution report (mean/max observations
+# contributed to a single filing, per rule) -- informational, no fixed
+# ceiling, always reported.
 
 # --- SPEC-005 R10 (AC14 amendment): app.db size is a growth measure, not an
 # absolute ceiling -- the absolute number was already relaxed twice during
