@@ -1,6 +1,6 @@
 # SPEC-004 — XBRL Facts and Financial Metrics
 
-**Version:** 2.3
+**Version:** 2.4
 **For:** Claude Code
 **Depends on:** SPEC-003 (complete, commit `0cb1767`)
 **Reference:** `ARCHITECTURE.md` — sections 2, 6, 7
@@ -11,6 +11,15 @@ declarative metric registry and covers 32 metrics including Beneish M-score and 
 decomposition. Delete the old file if present.
 
 **Changelog**
+- v2.4 — Closing two residuals from v2.3's live validation, with `validate` exiting 0 in
+  the healthy state as a result. R8 category 4's 4 AMZN debt reconciliation findings and
+  category 1's 2 remaining range findings are each real, checked, explained values, not
+  bugs — registered in two new exceptions registers (`DEBT_RECONCILIATION_EXCEPTIONS`,
+  `RANGE_EXCEPTIONS`), following the same pattern as `ALIAS_AGREEMENT_EXCEPTIONS`: named
+  entries with a written reason, reported informationally, never a widened threshold. One
+  self-correction along the way: `incremental_gross_margin`'s remaining violation was
+  previously diagnosed as a denominator artifact; checked directly, it isn't (§R6a
+  updated accordingly) — it's NVIDIA's real Q2 FY2023 write-down.
 - v2.3 — Category-6 (alias agreement) findings from live validation, resolved. `dep_amort`
   split from `depreciation` (DD&A vs pure depreciation are different quantities);
   `interest_expense_debt` split out of `interest_expense`; `equity_including_nci` and
@@ -363,6 +372,50 @@ lease liabilities specifically because ASC 842 makes absence diagnostic. It shou
 be read as license to assume zero for any other missing input; every other NULL rule in
 this spec (interest expense, short-term investments, receivables, ...) is unchanged.
 
+### R1i — Debt-reconciliation exceptions register
+
+Same pattern as R1g, for R8 category 4. Amazon's `LongTermDebt` (combined tag) and
+`debt_noncurrent + debt_current` (summed components) disagree ~1.1% for exactly four
+periods: 2015-12-31 through 2016-09-30. Real cause, checked: ASU 2015-03 (effective for
+Amazon in fiscal 2016) reclassified debt issuance costs from an asset to a
+contra-liability, and the combined tag and the split components didn't finish reflecting
+the reclassification on the same reporting date — a real accounting-standard transition,
+not a tagging error, and not the double-counting bug R1b exists to catch (confirmed: the
+gap is small, consistent with a reclassification timing difference, not the ~5–20%+ a
+double-count or wrong-quantity alias produces).
+
+`config.py` gets `DEBT_RECONCILIATION_EXCEPTIONS`: a dict of `(cik, period_end)` → written
+reason, checked by `validate` category 4. Keyed per-period rather than per-company (unlike
+R1g's canonical-input keying) because a debt reconciliation exception is about specific
+transition periods for a specific company, not a standing property of an input — a future
+Amazon debt reconciliation disagreement in an unrelated period must still hard-fail.
+
+### R1j — Range exceptions register
+
+Same pattern again, for R8 category 1. Two of the four range violations widened in R6a
+resolved on their own once the bounds moved; two did not, because they were never guard-
+or bound-fixable — they are real, individually-checked values:
+
+- **NVIDIA `incremental_gross_margin`, 2022-07-31 (Q2 FY2023):** the gaming-GPU inventory
+  write-down quarter. Gross profit fell $1.3B on $197M of revenue growth (2.94% of
+  revenue — above even the raised 2% guard, so R6a's guard was never going to catch this
+  one; **the original diagnosis that this was a denominator artifact was wrong**, and is
+  corrected here rather than left standing).
+- **Micron `effective_tax_rate`, fiscal Q2 2024 (period ended 2024-02-29):** pretax income
+  of $170M against a $622M discrete tax *benefit* (net income $793M) — consistent with a
+  deferred-tax valuation-allowance release as Micron returned to marginal profitability
+  after the 2022–2023 memory downturn.
+
+`config.py` gets `RANGE_EXCEPTIONS`: a dict of `(metric, cik, period_start, period_end)` →
+written reason, checked by `validate` category 1. **Never a widened threshold** — the
+whole point of this register is to keep the range meaningful by handling the individually-
+checked, explained exception separately, rather than stretching the band to include it
+(which would let the *next*, unchecked value of similar size through silently).
+
+With both registers in place, `validate` exits 0 against the real database in the healthy
+state: every remaining finding in categories 1 and 4 is either gone (after R6a's range
+widening) or registered (R1i, R1j), and no category 1–6 finding is unregistered.
+
 ### R2 — Ingest (`xbrl.py`)
 
 - Fetch `https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json` via `edgar_client`.
@@ -642,6 +695,9 @@ It must run against the real database and report, without modifying anything:
    evidence, not to make someone scroll past every occurrence to find the pattern. Do not
    widen any range as part of implementing this — reporting is not the same decision as
    recalibrating a bound, and the evidence should inform that decision, not this spec.
+   **Skip any `(metric, cik, period_start, period_end)` in `config.RANGE_EXCEPTIONS`**
+   (R1j) — report it informationally, with the register's written reason, instead of as a
+   hard failure. Anything not in the register still hard-fails.
 2. **DuPont reconciliation** — `net_margin × asset_turnover × equity_multiplier` versus
    `roe`. Flag differences beyond 1% relative. Disagreement means a concept mapping is
    wrong.
@@ -655,7 +711,9 @@ It must run against the real database and report, without modifying anything:
    company, period, and both values. This turns the twelve-period Micron finding from the
    pre-implementation review into a permanent, automated assertion rather than a one-time
    observation — it must keep catching this if it ever recurs, for any company, not just
-   confirm it happened once.
+   confirm it happened once. **Skip any `(cik, period_end)` in
+   `config.DEBT_RECONCILIATION_EXCEPTIONS`** (R1i) — report it informationally, with the
+   register's written reason. Anything not in the register still hard-fails.
 5. **Period-mixing check — redefined.** The original definition ("assert every metric's
    inputs share one duration class") was implemented as "no `period_end` may appear in
    more than one duration class," which flagged 158 real, benign cases on live data
@@ -773,7 +831,9 @@ python -m edgar.pipeline validate        [--ticker TICKER]
 13. Every metric row has non-empty `formula` and `inputs_json`, and concepts named in
     `formula` appear in `inputs_json`.
 14. YoY metrics for NVDA and MU compare periods twelve months apart, verified.
-15. `validate` runs clean, or every finding is explained in the report.
+15. `validate` exits 0 against the real database (categories 1–6 clean) — achieved via
+    `RANGE_EXCEPTIONS`/`DEBT_RECONCILIATION_EXCEPTIONS`/`ALIAS_AGREEMENT_EXCEPTIONS`
+    covering every real, checked, explained finding; nothing unregistered remains.
 16. `app.db` under 6 MB (relaxed from 5 MB — see Constraints).
 17. Re-running any command changes no rows and creates no duplicates.
 18. `pytest` passes.
@@ -893,6 +953,18 @@ python -m edgar.pipeline validate        [--ticker TICKER]
   `formula` records the zero assumption.
 - `test_total_debt_still_null_when_borrowings_missing` — confirms the refined NULL rule
   didn't loosen the *primary*-measure side: absent borrowings is still NULL, never $0.
+- `test_debt_reconciliation_exception_reported_not_hard_failed` — the real AMZN
+  2015-2016 ASU 2015-03 periods show up informationally, with their reason, and don't
+  count toward `hard_failure_count`.
+- `test_debt_reconciliation_unregistered_period_still_hard_fails` — a disagreement at a
+  `(cik, period_end)` not in `DEBT_RECONCILIATION_EXCEPTIONS` still hard-fails.
+- `test_range_exceptions_reported_not_hard_failed` — the real NVIDIA and Micron cases
+  show up informationally, with their reasons, and don't count toward
+  `hard_failure_count`.
+- `test_range_exceptions_unregistered_violation_still_hard_fails` — a violation at a
+  `(metric, cik, period_start, period_end)` not in `RANGE_EXCEPTIONS` still hard-fails.
+- `test_validate_exits_zero_against_real_database` — the actual healthy-state assertion:
+  run against the live `app.db`, `hard_failure_count == 0`.
 
 ---
 

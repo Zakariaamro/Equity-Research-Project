@@ -83,6 +83,29 @@ def test_debt_reconciliation_detects_corruption(conn):
     assert any(v["period_end"] == "2012-08-30" for v in report.debt_reconciliation_violations)
 
 
+def test_debt_reconciliation_exception_reported_not_hard_failed(conn):
+    # Real AMZN 2015-2016 ASU 2015-03 transition periods -- registered in
+    # DEBT_RECONCILIATION_EXCEPTIONS (SPEC-004 R1b/AC-close). Must show up
+    # informationally, with the reason, and not count as a hard failure.
+    _ingest_and_compute(conn, ["AMZN"])
+    report = validate.run_validate(conn, tickers=["AMZN"])
+    assert report.debt_reconciliation_violations == []
+    exception_periods = {f["period_end"] for f in report.debt_reconciliation_exceptions}
+    assert {"2015-12-31", "2016-03-31", "2016-06-30", "2016-09-30"} <= exception_periods
+    assert all("ASU 2015-03" in f["reason"] for f in report.debt_reconciliation_exceptions)
+
+
+def test_debt_reconciliation_unregistered_period_still_hard_fails(conn):
+    _ingest_and_compute(conn, ["MU"])
+    conn.execute(
+        "UPDATE xbrl_facts SET value = value * 2 WHERE concept = 'LongTermDebt' AND period_end = '2012-08-30'"
+    )
+    conn.commit()
+    report = validate.run_validate(conn, tickers=["MU"])
+    assert ("0000723125", "2012-08-30") not in config.DEBT_RECONCILIATION_EXCEPTIONS
+    assert any(v["period_end"] == "2012-08-30" for v in report.debt_reconciliation_violations)
+
+
 def test_gross_profit_crosscheck_detects_corruption(conn):
     _ingest_and_compute(conn, ["NVDA"])
     conn.execute("UPDATE xbrl_facts SET value = value * 3 WHERE concept = 'GrossProfit'")
@@ -100,6 +123,28 @@ def test_range_violations_detected(conn):
 
     report = validate.run_validate(conn, tickers=["AMZN"])
 
+    assert any(v["metric"] == "current_ratio" for v in report.range_violations)
+
+
+def test_range_exceptions_reported_not_hard_failed(conn):
+    # NVDA's real Q2 FY2023 inventory write-down and MU's real fiscal Q2 2024
+    # discrete tax benefit -- both registered in RANGE_EXCEPTIONS. Must show
+    # up informationally, with their reasons, and not count as hard failures.
+    _ingest_and_compute(conn, ["NVDA", "MU"])
+    report = validate.run_validate(conn, tickers=["NVDA", "MU"])
+    assert report.range_violations == []
+    metrics_found = {(f["metric"], f["ticker"]) for f in report.range_exceptions}
+    assert ("incremental_gross_margin", "NVDA") in metrics_found
+    assert ("effective_tax_rate", "MU") in metrics_found
+    assert all(f["reason"] for f in report.range_exceptions)
+
+
+def test_range_exceptions_unregistered_violation_still_hard_fails(conn):
+    _ingest_and_compute(conn, ["AMZN"])
+    conn.execute("UPDATE metrics SET value = 99.0 WHERE name = 'current_ratio'")
+    conn.commit()
+    report = validate.run_validate(conn, tickers=["AMZN"])
+    assert not any(key[0] == "current_ratio" for key in config.RANGE_EXCEPTIONS)
     assert any(v["metric"] == "current_ratio" for v in report.range_violations)
 
 
@@ -242,8 +287,10 @@ def test_format_report_is_readable_text(conn):
     report = validate.run_validate(conn, tickers=["AMZN"])
     text = validate.format_report(report)
     assert "Range violations" in text
+    assert "Range exceptions" in text
     assert "DuPont reconciliation" in text
     assert "Debt reconciliation" in text
+    assert "Debt reconciliation exceptions" in text
     assert "Alias agreement" in text
     assert "Unverified YoY drift" in text
     assert "Finance lease zero-assumption" in text

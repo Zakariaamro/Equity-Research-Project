@@ -1,11 +1,17 @@
 # Equity Research Platform — Architecture
 
-**Version:** 1.8
+**Version:** 1.9
 **Date:** 2026-07-27
 **Owner:** Zakaria
 **Status:** Approved for V1 implementation
 
 **Changelog**
+- v1.9 — SPEC-004's last two live-validation residuals closed. Two more exceptions
+  registers, same pattern as §2.2's alias-agreement one: `DEBT_RECONCILIATION_EXCEPTIONS`
+  (keyed per `(cik, period_end)` — Amazon's real 2015-2016 ASU 2015-03 transition) and
+  `RANGE_EXCEPTIONS` (keyed per `(metric, cik, period_start, period_end)` — NVIDIA's real
+  Q2 FY2023 inventory write-down, Micron's real fiscal Q2 2024 discrete tax benefit).
+  `validate` now exits 0 against the real database. Decision log entry 23 added.
 - v1.8 — SPEC-004 category-6 (alias agreement) findings, resolved. Five more registry
   splits (§2.1): `dep_amort`/`depreciation`, `interest_expense`/`interest_expense_debt`,
   `equity`/`equity_including_nci`, `net_income`/`net_income_including_nci`, and
@@ -712,3 +718,4 @@ semiconductor manufacturers, do report `GrossProfit` currently.
 | 20 | Five more canonical-input splits (`depreciation`, `interest_expense_debt`, `equity_including_nci`, `net_income_including_nci`; `sbc` trimmed with no replacement) | Live alias-agreement check (validate category 6) found consistent, non-random disagreements — same shape as `LongTermDebt`/`ReceivablesNetCurrent`, confirming §2.1's rule generalizes | 2026-07-27 |
 | 21 | Alias-agreement exceptions register added (`config.ALIAS_AGREEMENT_EXCEPTIONS`) | `capex`'s one-period Amazon disagreement is a real tag-transition artifact, not a broader/narrower split, and is already hand-verified via AC9 — needed a place to write down an accepted exception rather than either hard-failing forever or silently dropping the check | 2026-07-27 |
 | 22 | NULL discipline narrowly refined: absence = zero for a required-disclosure additive component (finance leases, ASC 842), still NULL for primary measures | Applying "absence is not zero" literally made `total_debt` permanently NULL for NVIDIA; ASC 842 makes the absence itself diagnostic for finance leases specifically, so the exception is named and scoped rather than a general loosening | 2026-07-27 |
+| 23 | Debt-reconciliation and range exceptions registers added, keyed per-period (not per-canonical, unlike the alias register) | Amazon's ASU 2015-03 debt transition and NVIDIA's/Micron's real range findings are checked, one-off, explained values, not standing properties of an input or metric — a future unrelated finding for the same company/metric must still hard-fail | 2026-07-27 |

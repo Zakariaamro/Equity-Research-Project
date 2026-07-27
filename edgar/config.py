@@ -292,6 +292,84 @@ ALIAS_AGREEMENT_EXCEPTIONS: dict[str, AliasAgreementException] = {
 
 
 @dataclass(frozen=True)
+class DebtReconciliationException:
+    """A documented, accepted exception to R8 category 4 (debt reconciliation).
+
+    Keyed by (cik, period_end) -- unlike the alias-agreement register, a debt
+    reconciliation exception is about a specific company's specific
+    transition periods, not a standing property of a canonical input. A
+    (cik, period_end) NOT in this register still hard-fails on any
+    disagreement.
+    """
+
+    cik: str
+    period_end: str
+    reason: str
+
+
+DEBT_RECONCILIATION_EXCEPTIONS: dict[tuple[str, str], DebtReconciliationException] = {
+    ("0001018724", period_end): DebtReconciliationException(
+        cik="0001018724",
+        period_end=period_end,
+        reason=(
+            "ASU 2015-03 (effective 2016) moved debt issuance costs from an asset to a "
+            "contra-liability. LongTermDebt (the combined tag) and "
+            "debt_noncurrent + debt_current (the split components) legitimately differ "
+            "~1.1% during the transition: one side reflects the reclassification before "
+            "the other catches up. Real accounting-standard transition, not a tagging error."
+        ),
+    )
+    for period_end in ("2015-12-31", "2016-03-31", "2016-06-30", "2016-09-30")
+}
+
+
+@dataclass(frozen=True)
+class RangeException:
+    """A documented, accepted exception to R8 category 1 (range violations).
+
+    Keyed by (metric, cik, period_start, period_end) -- a specific finding,
+    never a widened threshold. A range violation NOT in this register still
+    hard-fails; this register documents a checked, explained real value, not
+    a way to make a range wide enough to stop mattering.
+    """
+
+    metric: str
+    cik: str
+    period_start: str
+    period_end: str
+    reason: str
+
+
+RANGE_EXCEPTIONS: dict[tuple[str, str, str, str], RangeException] = {
+    ("incremental_gross_margin", "0001045810", "2022-05-02", "2022-07-31"): RangeException(
+        metric="incremental_gross_margin",
+        cik="0001045810",
+        period_start="2022-05-02",
+        period_end="2022-07-31",
+        reason=(
+            "NVIDIA's gaming-GPU inventory write-down quarter (Q2 FY2023): gross profit "
+            "fell $1.3B on essentially flat revenue (Δrevenue = $197M, 2.94% of revenue -- "
+            "above even the 2% guard floor, so this was never a denominator artifact). "
+            "A real, disclosed, one-time write-down."
+        ),
+    ),
+    ("effective_tax_rate", "0000723125", "2023-12-01", "2024-02-29"): RangeException(
+        metric="effective_tax_rate",
+        cik="0000723125",
+        period_start="2023-12-01",
+        period_end="2024-02-29",
+        reason=(
+            "Micron fiscal Q2 2024: pretax income of only $170M against a $622M discrete "
+            "tax BENEFIT (net income $793M) -- consistent with a deferred-tax "
+            "valuation-allowance release as Micron returned to marginal profitability "
+            "coming out of the 2022-2023 memory downturn. A small real denominator plus a "
+            "large real discrete item, not a data error."
+        ),
+    ),
+}
+
+
+@dataclass(frozen=True)
 class DurationClass:
     name: str
     min_days: int

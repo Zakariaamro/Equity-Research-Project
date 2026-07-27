@@ -19,9 +19,11 @@ from edgar import metrics as metrics_mod
 @dataclass
 class ValidationReport:
     range_violations: list[dict] = field(default_factory=list)
+    range_exceptions: list[dict] = field(default_factory=list)
     dupont_violations: list[dict] = field(default_factory=list)
     gross_profit_violations: list[dict] = field(default_factory=list)
     debt_reconciliation_violations: list[dict] = field(default_factory=list)
+    debt_reconciliation_exceptions: list[dict] = field(default_factory=list)
     period_mixing_violations: list[dict] = field(default_factory=list)
     alias_agreement_violations: list[dict] = field(default_factory=list)
     alias_agreement_exceptions: list[dict] = field(default_factory=list)
@@ -54,34 +56,57 @@ def _ciks_for_tickers(tickers: list[str] | None) -> list[str]:
 # --- category 1: range violations ---
 
 
-def _check_range_violations(conn: sqlite3.Connection, tickers: list[str] | None) -> list[dict]:
+def _find_range_violations(conn: sqlite3.Connection, tickers: list[str] | None) -> list[dict]:
+    """Every metric row outside its declared plausible range -- regardless of
+    whether that (metric, cik, period) is in RANGE_EXCEPTIONS. Partitioned
+    into hard failures vs. exceptions by the caller."""
     ciks = _ciks_for_tickers(tickers)
     if not ciks:
         return []
     placeholders = ",".join("?" for _ in ciks)
     rows = conn.execute(
-        f"SELECT m.cik, c.ticker, m.period_end, m.name, m.value FROM metrics m "
+        f"SELECT m.cik, c.ticker, m.period_start, m.period_end, m.name, m.value FROM metrics m "
         f"JOIN companies c ON c.cik = m.cik "
         f"WHERE m.cik IN ({placeholders}) AND m.value IS NOT NULL AND m.calc_version = ?",
         (*ciks, config.CALC_VERSION),
     ).fetchall()
-    violations = []
+    findings = []
     for row in rows:
         mdef = config.METRIC_REGISTRY.get(row["name"])
         if mdef is None or mdef.plausible_range is None:
             continue
         lo, hi = mdef.plausible_range
         if not (lo <= row["value"] <= hi):
-            violations.append(
+            findings.append(
                 {
                     "ticker": row["ticker"],
+                    "cik": row["cik"],
+                    "period_start": row["period_start"],
                     "period_end": row["period_end"],
                     "metric": row["name"],
                     "value": row["value"],
                     "range": (lo, hi),
                 }
             )
-    return violations
+    return findings
+
+
+def _range_exception_key(v: dict) -> tuple[str, str, str, str]:
+    return (v["metric"], v["cik"], v["period_start"], v["period_end"])
+
+
+def _check_range_violations(conn: sqlite3.Connection, tickers: list[str] | None) -> list[dict]:
+    """Hard-failing range violations: (metric, cik, period) NOT in RANGE_EXCEPTIONS."""
+    return [f for f in _find_range_violations(conn, tickers) if _range_exception_key(f) not in config.RANGE_EXCEPTIONS]
+
+
+def _check_range_exceptions(conn: sqlite3.Connection, tickers: list[str] | None) -> list[dict]:
+    """Range violations covered by the register -- informational, with the
+    written reason attached."""
+    findings = [f for f in _find_range_violations(conn, tickers) if _range_exception_key(f) in config.RANGE_EXCEPTIONS]
+    for f in findings:
+        f["reason"] = config.RANGE_EXCEPTIONS[_range_exception_key(f)].reason
+    return findings
 
 
 def _group_range_violations(violations: list[dict]) -> dict[tuple[str, str], dict]:
@@ -176,8 +201,11 @@ def _check_gross_profit_crosscheck(conn: sqlite3.Connection, tickers: list[str] 
 # --- category 4: debt reconciliation ---
 
 
-def _check_debt_reconciliation(conn: sqlite3.Connection, tickers: list[str] | None) -> list[dict]:
-    violations = []
+def _find_debt_reconciliation_findings(conn: sqlite3.Connection, tickers: list[str] | None) -> list[dict]:
+    """Every (cik, period_end) where the combined debt tag and summed
+    components disagree beyond tolerance -- regardless of whether it's in
+    DEBT_RECONCILIATION_EXCEPTIONS. Partitioned by the caller."""
+    findings = []
     for cik, ticker in _companies(tickers):
         facts = metrics_mod._load_facts(conn, cik)
         period_ends: set[str] = set()
@@ -197,9 +225,10 @@ def _check_debt_reconciliation(conn: sqlite3.Connection, tickers: list[str] | No
             denom = abs(combined) if combined != 0 else 1e-9
             rel_diff = abs(component_sum - combined) / denom
             if rel_diff > config.DEBT_RECONCILIATION_TOLERANCE:
-                violations.append(
+                findings.append(
                     {
                         "ticker": ticker,
+                        "cik": cik,
                         "period_end": end,
                         "combined_concept": combined_alias,
                         "combined": combined,
@@ -207,7 +236,30 @@ def _check_debt_reconciliation(conn: sqlite3.Connection, tickers: list[str] | No
                         "rel_diff": rel_diff,
                     }
                 )
-    return violations
+    return findings
+
+
+def _check_debt_reconciliation(conn: sqlite3.Connection, tickers: list[str] | None) -> list[dict]:
+    """Hard-failing debt reconciliation findings: (cik, period_end) NOT in
+    DEBT_RECONCILIATION_EXCEPTIONS."""
+    return [
+        f
+        for f in _find_debt_reconciliation_findings(conn, tickers)
+        if (f["cik"], f["period_end"]) not in config.DEBT_RECONCILIATION_EXCEPTIONS
+    ]
+
+
+def _check_debt_reconciliation_exceptions(conn: sqlite3.Connection, tickers: list[str] | None) -> list[dict]:
+    """Debt reconciliation findings covered by the register -- informational,
+    with the written reason attached."""
+    findings = [
+        f
+        for f in _find_debt_reconciliation_findings(conn, tickers)
+        if (f["cik"], f["period_end"]) in config.DEBT_RECONCILIATION_EXCEPTIONS
+    ]
+    for f in findings:
+        f["reason"] = config.DEBT_RECONCILIATION_EXCEPTIONS[(f["cik"], f["period_end"])].reason
+    return findings
 
 
 # --- category 5: period-mixing check (redefined, SPEC-004 R8) ---
@@ -539,9 +591,11 @@ def _check_finance_lease_zero_assumptions(conn: sqlite3.Connection, tickers: lis
 def run_validate(conn: sqlite3.Connection, tickers: list[str] | None = None) -> ValidationReport:
     return ValidationReport(
         range_violations=_check_range_violations(conn, tickers),
+        range_exceptions=_check_range_exceptions(conn, tickers),
         dupont_violations=_check_dupont(conn, tickers),
         gross_profit_violations=_check_gross_profit_crosscheck(conn, tickers),
         debt_reconciliation_violations=_check_debt_reconciliation(conn, tickers),
+        debt_reconciliation_exceptions=_check_debt_reconciliation_exceptions(conn, tickers),
         period_mixing_violations=_check_period_mixing(conn, tickers),
         alias_agreement_violations=_check_alias_agreement(conn, tickers),
         alias_agreement_exceptions=_check_alias_agreement_exceptions(conn, tickers),
@@ -574,6 +628,11 @@ def format_report(report: ValidationReport) -> str:
                 f"  {metric} {direction} range {g['range']}: {len(g['values'])} occurrence(s), "
                 f"values {min(g['values']):.4g} to {max(g['values']):.4g}, tickers: {sorted(g['tickers'])}"
             )
+    _section(
+        "1a. Range exceptions (informational -- registered, not hard-failed)",
+        report.range_exceptions,
+        lambda v: f"{v['ticker']} {v['metric']} {v['period_end']}: value={v['value']:.4g} outside {v['range']} -- {v['reason']}",
+    )
 
     _section(
         "2. DuPont reconciliation",
@@ -592,6 +651,12 @@ def format_report(report: ValidationReport) -> str:
         report.debt_reconciliation_violations,
         lambda v: f"{v['ticker']} {v['period_end']}: {v['combined_concept']}={v['combined']:.4g} "
         f"vs debt_noncurrent+debt_current={v['component_sum']:.4g} (rel diff {v['rel_diff']:.2%})",
+    )
+    _section(
+        "4a. Debt reconciliation exceptions (informational -- registered, not hard-failed)",
+        report.debt_reconciliation_exceptions,
+        lambda v: f"{v['ticker']} {v['period_end']}: {v['combined_concept']}={v['combined']:.4g} "
+        f"vs debt_noncurrent+debt_current={v['component_sum']:.4g} (rel diff {v['rel_diff']:.2%}) -- {v['reason']}",
     )
     _section(
         "5. Period-mixing check",
