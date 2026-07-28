@@ -1310,6 +1310,10 @@ SPEC-005 changelog and decision log entry 31.
 - Derived Q4 figures
 - Email or push notification on high-severity findings
 
+**Parked ideas generated during V1 build-out — evaluated, deliberately not pursued, and not
+designed — live in `ROADMAP-V2.md`, not here.** One home for them, so they can be revisited
+without either being lost or quietly expanding V1's scope in the meantime.
+
 ### Future — Could have
 - Cross-company comparison (NVDA/MU supply-chain linkage is a natural first case)
 - Earnings call transcripts
