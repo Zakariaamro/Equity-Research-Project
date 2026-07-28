@@ -315,3 +315,160 @@ def test_db_size_reports_real_file_size_and_never_hard_fails(conn):
     assert report.db_size["over_soft_ceiling"] is False  # a tiny test db is nowhere near 15 MB
     assert report.db_size["measured_marginal_bytes_per_filing"] > 0
     assert report.hard_failure_count == 0  # db_size never contributes to hard failures
+
+
+# --- SPEC-006 R10: LLM infrastructure checks ---
+
+from edgar import analyze, llm  # noqa: E402 (module-level, but grouped with this section)
+
+GOOD_RESPONSE = json.dumps({
+    "material": True,
+    "findings": [{
+        "category": "accounting_change", "severity": "medium", "headline": "Tax Act increased provision",
+        "detail": "detail text", "quote": "The 2025 Tax Act increased our income tax provision",
+    }],
+})
+
+NOTE_TEXT = "Income Taxes. The 2025 Tax Act increased our income tax provision, primarily due to a decrease."
+
+
+class _FakeRawClient:
+    def __init__(self, responses: list[str]) -> None:
+        self._responses = list(responses)
+
+    def messages_create(self, model, max_tokens, prompt):
+        return self._responses.pop(0), 1000, 200, "end_turn"
+
+
+def _insert_notes_section(conn, accession_no="acc1", cik=AMZN_CIK, short_name="Income Taxes", text=NOTE_TEXT) -> int:
+    from edgar import section_store
+
+    conn.execute(
+        "INSERT INTO filings (accession_no, cik, form_type, filing_date, period_end, discovered_at, status) "
+        "VALUES (?, ?, '10-K', '2026-02-06', '2025-12-31', '2026-02-06T00:00:00', 'sectioned') "
+        "ON CONFLICT(accession_no) DO NOTHING",
+        (accession_no, cik),
+    )
+    text_hash = section_store.write_section_text(text)
+    cursor = conn.execute(
+        "INSERT INTO sections (accession_no, category, short_name, source_file, position, text_hash) "
+        "VALUES (?, 'Notes', ?, 'R1.htm', 1, ?)",
+        (accession_no, short_name, text_hash),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+@pytest.fixture(autouse=True)
+def _reset_llm_run_state():
+    llm._reset_run_state()
+
+
+def test_llm_pricing_staleness_flags_old_verification_date(conn, monkeypatch):
+    stale = config.ModelPricing(
+        input_per_mtok=1.0, output_per_mtok=1.0, source_url="https://example.com", verified_date="2020-01-01",
+    )
+    monkeypatch.setitem(config.LLM_PRICING, "claude-test-stale", stale)
+    report = validate.run_validate(conn, tickers=["AMZN"])
+    stale_models = {f["model"] for f in report.llm_pricing_staleness}
+    assert "claude-test-stale" in stale_models
+
+
+def test_llm_pricing_staleness_clean_for_current_table(conn):
+    report = validate.run_validate(conn, tickers=["AMZN"])
+    assert report.llm_pricing_staleness == []  # real LLM_PRICING was verified 2026-07-27
+
+
+def test_llm_ledger_reconciliation_clean_by_default(conn):
+    llm.record_result(conn, "claude-sonnet-5", input_tokens=1000, output_tokens=200, status="ok")
+    report = validate.run_validate(conn, tickers=["AMZN"])
+    assert report.llm_ledger_mismatches == []
+
+
+def test_llm_budget_headroom_reports_spent_and_remaining(conn):
+    llm.record_result(conn, "claude-sonnet-5", input_tokens=1000, output_tokens=200, status="ok")
+    report = validate.run_validate(conn, tickers=["AMZN"])
+    expected_spent = llm.total_spent(conn)
+    assert report.llm_budget["spent"] == pytest.approx(expected_spent)
+    assert report.llm_budget["budget"] == config.LLM_BUDGET_USD
+    assert report.llm_budget["over_budget"] is False
+
+
+def test_llm_budget_headroom_flags_over_budget(conn, monkeypatch):
+    monkeypatch.setattr(config, "LLM_BUDGET_USD", 0.0001)
+    llm.record_result(conn, "claude-sonnet-5", input_tokens=1_000_000, output_tokens=1_000_000, status="ok")
+    report = validate.run_validate(conn, tickers=["AMZN"])
+    assert report.llm_budget["over_budget"] is True
+    assert report.hard_failure_count > 0
+
+
+def test_llm_orphan_findings_detects_dangling_analysis_id(conn):
+    # An orphan can never arise through normal code (FKs are enforced, PRAGMA
+    # foreign_keys=ON in db.py) -- this check exists as a belt-and-suspenders
+    # guard against corruption from outside the app (a bug, a manual edit, a
+    # partial migration), so the test has to disable enforcement to construct
+    # the scenario it defends against.
+    _insert_notes_section(conn)
+    conn.execute("PRAGMA foreign_keys = OFF")
+    conn.execute(
+        "INSERT INTO findings (analysis_id, accession_no, category, severity, headline, detail, quote, created_at) "
+        "VALUES (999, 'acc1', 'note_item', 'low', 'h', 'd', 'q', '2026-01-01T00:00:00')"
+    )
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = ON")
+    report = validate.run_validate(conn, tickers=["AMZN"])
+    assert len(report.llm_orphan_findings) == 1
+    assert report.hard_failure_count > 0
+
+
+def test_llm_quote_integrity_passes_for_verified_finding(conn):
+    section_id = _insert_notes_section(conn)
+    client = llm.LLMClient(raw_client=_FakeRawClient([GOOD_RESPONSE]))
+    outcome = llm.get_or_create_analysis(
+        conn, section_id, "section_analysis", "v1",
+        rendered_prompt="rendered prompt referencing: " + NOTE_TEXT, client=client,
+    )
+    assert outcome.status == "ok"
+    conn.execute(
+        "INSERT INTO findings (analysis_id, accession_no, category, severity, headline, detail, quote, created_at) "
+        "VALUES (?, 'acc1', 'accounting_change', 'medium', 'h', 'd', ?, '2026-01-01T00:00:00')",
+        (outcome.analysis_id, "The 2025 Tax Act increased our income tax provision"),
+    )
+    conn.commit()
+    report = validate.run_validate(conn, tickers=["AMZN"])
+    assert report.llm_quote_integrity_violations == []
+
+
+def test_llm_quote_integrity_detects_fabricated_quote(conn):
+    section_id = _insert_notes_section(conn)
+    client = llm.LLMClient(raw_client=_FakeRawClient([GOOD_RESPONSE]))
+    outcome = llm.get_or_create_analysis(
+        conn, section_id, "section_analysis", "v1",
+        rendered_prompt="rendered prompt referencing: " + NOTE_TEXT, client=client,
+    )
+    conn.execute(
+        "INSERT INTO findings (analysis_id, accession_no, category, severity, headline, detail, quote, created_at) "
+        "VALUES (?, 'acc1', 'accounting_change', 'medium', 'h', 'd', ?, '2026-01-01T00:00:00')",
+        (outcome.analysis_id, "this quote never appeared anywhere in the note text at all"),
+    )
+    conn.commit()
+    report = validate.run_validate(conn, tickers=["AMZN"])
+    assert len(report.llm_quote_integrity_violations) == 1
+    assert report.hard_failure_count > 0
+
+
+def test_llm_discard_rate_reports_per_prompt_version(conn):
+    section_id = _insert_notes_section(conn)
+    client = llm.LLMClient(raw_client=_FakeRawClient([GOOD_RESPONSE]))
+    template = analyze.load_prompt_template(config.SECTION_ANALYSIS_PROMPT_NAME, config.SECTION_ANALYSIS_PROMPT_VERSION)
+    row = analyze.select_candidate_sections(conn, tickers=["AMZN"])[0]
+    result = analyze.analyze_one_section(conn, row, template, client=client)
+    assert result.status == "ok"
+    assert result.findings_returned == 1
+    assert result.findings_kept == 1  # the fixture's quote is a real substring of NOTE_TEXT
+
+    report = validate.run_validate(conn, tickers=["AMZN"])
+    by_version = {d["prompt_version"]: d for d in report.llm_discard_rate}
+    assert by_version[config.SECTION_ANALYSIS_PROMPT_VERSION]["returned"] == 1
+    assert by_version[config.SECTION_ANALYSIS_PROMPT_VERSION]["kept"] == 1
+    assert by_version[config.SECTION_ANALYSIS_PROMPT_VERSION]["discard_rate"] == 0.0

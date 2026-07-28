@@ -1,0 +1,9 @@
+{
+  "material": true,
+  "findings": [
+    {
+      "category": "liquidity",
+      "severity": "high",
+      "headline": "Revolving credit facility utilization increased materially",
+      "detail": "The company drew down a significant portion of its revolving credit facility during the period, indicating tightening liquidity",
+      "quote": "As of the end of the period, the Company had drawn $1.2 billion under its revolving credit facility, compared to no amounts outstanding

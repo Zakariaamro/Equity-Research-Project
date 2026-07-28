@@ -12,7 +12,7 @@ import shutil
 import sqlite3
 import sys
 
-from edgar import config, db, fetch, metrics, monitor, observations, section_store, sections, validate, xbrl
+from edgar import analyze, config, db, fetch, llm, metrics, monitor, observations, section_store, sections, validate, xbrl
 from edgar.edgar_client import EdgarClient
 from edgar.monitor import DiscoveredFiling
 
@@ -279,6 +279,196 @@ def cmd_validate(args: argparse.Namespace) -> None:
         conn.close()
 
 
+def _confirm_cost_tolerance(estimate: float) -> float:
+    """SPEC-006A L4: how close --confirm-cost N must be to the dry-run
+    estimate. Not specified by the spec ("a small tolerance") -- 1% of the
+    estimate, floored at $0.01 (config.LLM_CONFIRM_COST_TOLERANCE_*)."""
+    return max(config.LLM_CONFIRM_COST_TOLERANCE_FLOOR_USD, estimate * config.LLM_CONFIRM_COST_TOLERANCE_FRACTION)
+
+
+def _print_cache_impact(stats: analyze.RunStats) -> None:
+    """SPEC-006A L5: reported before every run, execute or dry-run alike --
+    "before any run, report calls that will hit the cache, calls that are
+    new..." """
+    print(
+        f"  cache: {stats.cache_hits_dry} hit(s), {stats.new_calls_dry} new call(s), "
+        f"estimated cost of new calls: ${stats.estimated_cost_usd:.4f}"
+    )
+    if stats.version_bumped:
+        print(
+            f"  prompt version changed since last run (prior version(s): {', '.join(stats.prior_prompt_versions)}, "
+            f"current: {config.SECTION_ANALYSIS_PROMPT_VERSION}): "
+            f"{stats.invalidated_by_version_bump} previously-cached analysis(es) invalidated, "
+            f"${stats.invalidated_cost_usd:.4f} to regenerate"
+        )
+
+
+def cmd_analyze_sections(args: argparse.Namespace) -> None:
+    tickers = None
+    if args.ticker:
+        _validate_ticker(args.ticker)
+        tickers = [args.ticker]
+
+    conn = db.get_connection()
+    try:
+        if args.scheduled and args.sample is not None:
+            llm.record_refusal(
+                conn,
+                "L7: --scheduled runs must never use --sample (a prompt-development-only bypass)",
+                prompt_name=config.SECTION_ANALYSIS_PROMPT_NAME,
+                prompt_version=config.SECTION_ANALYSIS_PROMPT_VERSION,
+            )
+            raise SystemExit("Refusing: --scheduled runs must never use --sample.")
+
+        # SPEC-006A: always compute the dry-run pass first, execute or not --
+        # it is where L5's cache-impact report and L4's confirmation number
+        # both come from, and it makes zero calls / no spend either way.
+        dry_stats = analyze.run_analysis(
+            conn, tickers=tickers, accession=args.accession, sample=args.sample, seed=args.seed,
+            limit=args.limit, execute=False, scheduled=args.scheduled,
+        )
+        print(f"[DRY RUN] {dry_stats.candidates} candidate section(s), {dry_stats.processed} selected.")
+        if dry_stats.seed_used is not None:
+            print(f"  sample seed: {dry_stats.seed_used}")
+        _print_cache_impact(dry_stats)
+
+        if not args.execute:
+            return
+
+        # L4: confirmation gate. Below LLM_CONFIRM_THRESHOLD_USD, no
+        # confirmation is required at all -- the whole point is to make the
+        # operator READ a number that matters, not force a ritual on every
+        # $0.02 dev run.
+        estimate = dry_stats.estimated_cost_usd
+        if estimate > config.LLM_CONFIRM_THRESHOLD_USD:
+            if args.confirm_cost is None:
+                llm.record_refusal(
+                    conn,
+                    f"L4: estimated cost ${estimate:.4f} exceeds confirmation threshold "
+                    f"${config.LLM_CONFIRM_THRESHOLD_USD:.2f} and no --confirm-cost was given",
+                    prompt_name=config.SECTION_ANALYSIS_PROMPT_NAME,
+                    prompt_version=config.SECTION_ANALYSIS_PROMPT_VERSION,
+                )
+                raise SystemExit(
+                    f"Refusing: estimated cost ${estimate:.4f} exceeds the "
+                    f"${config.LLM_CONFIRM_THRESHOLD_USD:.2f} confirmation threshold. "
+                    f"Re-run with --confirm-cost {estimate:.4f} to proceed."
+                )
+            tolerance = _confirm_cost_tolerance(estimate)
+            if abs(args.confirm_cost - estimate) > tolerance:
+                llm.record_refusal(
+                    conn,
+                    f"L4: --confirm-cost {args.confirm_cost:.4f} does not match dry-run estimate "
+                    f"${estimate:.4f} (tolerance ${tolerance:.4f})",
+                    prompt_name=config.SECTION_ANALYSIS_PROMPT_NAME,
+                    prompt_version=config.SECTION_ANALYSIS_PROMPT_VERSION,
+                )
+                raise SystemExit(
+                    f"Refusing: --confirm-cost {args.confirm_cost:.4f} does not match the current "
+                    f"dry-run estimate of ${estimate:.4f} (tolerance ${tolerance:.4f}). "
+                    "Re-read the estimate above and pass it exactly."
+                )
+
+        # L5: cache-invalidation acknowledgement gate.
+        if (
+            dry_stats.invalidated_by_version_bump > config.LLM_CACHE_INVALIDATION_WARN
+            and not args.acknowledge_cache_invalidation
+        ):
+            llm.record_refusal(
+                conn,
+                f"L5: prompt version bump invalidates {dry_stats.invalidated_by_version_bump} previously-cached "
+                f"analysis(es) (> {config.LLM_CACHE_INVALIDATION_WARN}), costing "
+                f"${dry_stats.invalidated_cost_usd:.4f} to regenerate, and --acknowledge-cache-invalidation "
+                "was not given",
+                prompt_name=config.SECTION_ANALYSIS_PROMPT_NAME,
+                prompt_version=config.SECTION_ANALYSIS_PROMPT_VERSION,
+            )
+            raise SystemExit(
+                f"Refusing: this run would invalidate {dry_stats.invalidated_by_version_bump} previously-cached "
+                f"analyses (${dry_stats.invalidated_cost_usd:.4f} to regenerate). "
+                "Re-run with --acknowledge-cache-invalidation to proceed."
+            )
+
+        # Built before any real API-touching work: if ANTHROPIC_API_KEY
+        # (the project's own, EQUITY_RESEARCH_ANTHROPIC_API_KEY) is unset,
+        # fail immediately naming the variable, never after work is done.
+        client = llm.LLMClient()
+
+        stats = analyze.run_analysis(
+            conn,
+            tickers=tickers,
+            accession=args.accession,
+            sample=args.sample,
+            seed=args.seed,
+            limit=args.limit,
+            execute=True,
+            client=client,
+            max_run_cost_usd=args.max_run_cost,
+            max_calls_per_run=args.max_calls,
+            scheduled=args.scheduled,
+        )
+
+        print(f"[EXECUTE] {stats.candidates} candidate section(s), {stats.processed} processed.")
+        print(
+            f"  calls made: {stats.calls_made}, cache hits: {stats.cache_hits}, "
+            f"refused: {stats.refused}, errors: {stats.errors}, truncated: {stats.truncated}, "
+            f"skipped (oversized): {stats.skipped_oversized}"
+        )
+        print(
+            f"  findings returned: {stats.findings_returned}, kept: {stats.findings_kept}, "
+            f"discarded: {stats.findings_discarded}"
+        )
+        rate = stats.numeric_support_rate
+        if rate is None:
+            print("  numeric support: no numbers checked (no findings kept)")
+        else:
+            print(
+                f"  numeric support: {stats.numeric_tokens_supported}/{stats.numeric_tokens_checked} "
+                f"tokens found in source ({rate:.0%}) -- "
+                f"in quote: {stats.numeric_tokens_supported_in_quote} ({stats.numeric_support_rate_in_quote:.0%}), "
+                f"in note only: {stats.numeric_tokens_supported_in_note_only} "
+                f"({stats.numeric_support_rate_in_note_only:.0%}); "
+                f"{stats.findings_with_unsupported_numbers} finding(s) with at least one unsupported number "
+                f"(warning only, not discarded)"
+            )
+
+        # L10: every paid command states this run's cost, lifetime spend,
+        # and remaining budget on completion. No paid operation may
+        # complete without stating what it cost.
+        print(
+            f"  this run's cost: ${stats.run_cost_usd:.4f} | "
+            f"lifetime spend: ${stats.total_cost_usd:.4f} of ${config.LLM_BUDGET_USD:.2f} budget | "
+            f"remaining: ${config.LLM_BUDGET_USD - stats.total_cost_usd:.4f}"
+        )
+
+        if stats.stopped_reason is not None:
+            print(f"  STOPPED EARLY: {stats.stopped_reason}")
+            raise SystemExit(1)
+    finally:
+        conn.close()
+
+
+def cmd_spend(args: argparse.Namespace) -> None:
+    conn = db.get_connection()
+    try:
+        summary = llm.spend_summary(conn)
+        print(
+            f"Total spent: ${summary['total_spent']:.4f} of ${summary['budget']:.2f} budget "
+            f"(${summary['remaining']:.4f} remaining)"
+        )
+        if not summary["breakdown"]:
+            print("  (no calls recorded yet)")
+        else:
+            print("  By prompt / model / status:")
+            for row in summary["breakdown"]:
+                print(
+                    f"    {row['prompt_name'] or '-'} / {row['model']} / {row['status']}: "
+                    f"{row['n']} call(s), ${row['cost']:.4f}"
+                )
+    finally:
+        conn.close()
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     conn = db.get_connection()
     try:
@@ -402,6 +592,53 @@ def build_parser() -> argparse.ArgumentParser:
     p_validate = sub.add_parser("validate", help="Run data-quality checks against the real database")
     p_validate.add_argument("--ticker", help="Restrict to one watchlist ticker")
 
+    p_analyze_sections = sub.add_parser(
+        "analyze-sections", help="Run the section-analysis LLM prompt over eligible Notes sections"
+    )
+    p_analyze_sections.add_argument("--ticker", help="Restrict to one watchlist ticker")
+    p_analyze_sections.add_argument("--accession", help="Restrict to a single filing by accession number")
+    p_analyze_sections.add_argument(
+        "--sample", type=int, default=None, help="Deterministically sample N sections (prompt development, never the full set)"
+    )
+    p_analyze_sections.add_argument(
+        "--seed", type=int, default=None, help="Seed for --sample (default: config.DEFAULT_SAMPLE_SEED)"
+    )
+    p_analyze_sections.add_argument("--limit", type=int, default=None, help="Cap the number of sections processed")
+    p_analyze_sections.add_argument(
+        "--execute", action="store_true", help="Make real API calls. Without this flag, performs a dry run (no calls, no spend)."
+    )
+    p_analyze_sections.add_argument(
+        "--confirm-cost", type=float, default=None,
+        help=(
+            "SPEC-006A L4: required when the dry-run estimate exceeds "
+            f"${config.LLM_CONFIRM_THRESHOLD_USD:.2f} -- must match the printed estimate within a small tolerance."
+        ),
+    )
+    p_analyze_sections.add_argument(
+        "--acknowledge-cache-invalidation", action="store_true",
+        help=(
+            "SPEC-006A L5: required when a prompt-version bump would invalidate more than "
+            f"{config.LLM_CACHE_INVALIDATION_WARN} previously-cached analyses."
+        ),
+    )
+    p_analyze_sections.add_argument(
+        "--max-run-cost", type=float, default=None,
+        help=f"SPEC-006A L3: override the per-run cost ceiling (default ${config.LLM_MAX_RUN_COST_USD:.2f}).",
+    )
+    p_analyze_sections.add_argument(
+        "--max-calls", type=int, default=None,
+        help=f"SPEC-006A L6: override the per-run call-count ceiling (default {config.LLM_MAX_CALLS_PER_RUN}).",
+    )
+    p_analyze_sections.add_argument(
+        "--scheduled", action="store_true",
+        help=(
+            "SPEC-006A L7: unattended-run mode. Clamps the run-cost ceiling to "
+            f"${config.LLM_SCHEDULED_RUN_MAX_COST_USD:.2f} and refuses --sample."
+        ),
+    )
+
+    sub.add_parser("spend", help="Report LLM spend: total, remaining, and breakdown by prompt/model/status")
+
     sub.add_parser("status", help="Summarize filings by company, form, and status")
 
     return parser
@@ -409,6 +646,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     _setup_logging()
+    # SPEC-006A L9: on startup, every invocation -- not gated to paid
+    # commands. Warn, never refuse (the variable may legitimately be set for
+    # an unrelated tool); the point is that it must never again go unnoticed.
+    canary = llm.check_environment_canary()
+    if canary is not None:
+        print(f"\n{'!' * 70}\n{canary}\n{'!' * 70}\n", file=sys.stderr)
+
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -432,6 +676,10 @@ def main(argv: list[str] | None = None) -> int:
         cmd_compute_observations(args)
     elif args.command == "validate":
         cmd_validate(args)
+    elif args.command == "analyze-sections":
+        cmd_analyze_sections(args)
+    elif args.command == "spend":
+        cmd_spend(args)
     elif args.command == "status":
         cmd_status(args)
 

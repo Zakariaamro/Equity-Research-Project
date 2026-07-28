@@ -1,0 +1,19 @@
+{
+  "material": true,
+  "findings": [
+    {
+      "category": "accounting_change",
+      "severity": "medium",
+      "headline": "Tax Act increased provision",
+      "detail": "The company's income tax provision increased due to the 2025 Tax Act.",
+      "quote": "The 2025 Tax Act increased our income tax provision, primarily due to a decrease"
+    },
+    {
+      "category": "red_flag",
+      "severity": "high",
+      "headline": "Fabricated finding",
+      "detail": "This finding's quote does not exist in the source note -- it must be discarded by quote verification.",
+      "quote": "This is a completely invented sentence that never appeared anywhere"
+    }
+  ]
+}

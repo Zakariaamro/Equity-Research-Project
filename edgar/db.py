@@ -1,8 +1,10 @@
 """Schema creation and connection handling.
 
-Creates the complete seven-table schema from ARCHITECTURE.md §6 up front,
+Creates the complete nine-table schema from ARCHITECTURE.md §6 up front,
 including tables unused until later specs (sections, xbrl_facts, metrics,
-analyses, findings) — this avoids migrations mid-project.
+llm_calls, analyses, findings, observations) — this avoids migrations
+mid-project, aside from the rare in-place schema change to a table that
+turns out to still be empty (see `_migrate_analyses_table`, SPEC-006).
 """
 
 from __future__ import annotations
@@ -93,17 +95,46 @@ CREATE TABLE IF NOT EXISTS metrics (
     UNIQUE(cik, period_start, period_end, name, calc_version)
 );
 
+-- ============ SPEC-006: LLM SPEND LEDGER ============
+-- Sole source of spend. Every call attempt appends a row, including
+-- failures and refusals -- a ledger with gaps is not a ledger. Checked
+-- before every call so the lifetime cap (config.LLM_BUDGET_USD) cannot be
+-- exceeded by construction (SPEC-006 R1). Defined before `analyses`, which
+-- references it. This ledger only ever sees spend that routes through it --
+-- see SPEC-006A / ARCHITECTURE.md §4.2 for the layers that exist because
+-- that is not the same thing as "all spend."
+CREATE TABLE IF NOT EXISTS llm_calls (
+    id             INTEGER PRIMARY KEY,
+    created_at     TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    prompt_name    TEXT,
+    prompt_version TEXT,
+    input_tokens   INTEGER NOT NULL,
+    output_tokens  INTEGER NOT NULL,
+    cost_usd       REAL NOT NULL,
+    status         TEXT NOT NULL,        -- ok | error | refused | reconciliation
+    -- 'reconciliation': a manual, one-off adjustment row for real spend that a
+    -- since-fixed ledger bug failed to capture at the time (2026-07-28: the
+    -- truncation-retry gap, see scripts/backfill_2026_07_28_truncation_ledger_gap.py).
+    -- Never written by application code -- only by a reviewed, committed one-off
+    -- script -- and its note always states plainly what is measured versus assumed.
+    note           TEXT
+);
+
+-- SPEC-006: analyses.call_id is the sole link to spend (llm_calls); analyses
+-- itself no longer carries input_tokens/output_tokens/cost_usd.
 CREATE TABLE IF NOT EXISTS analyses (
     id             INTEGER PRIMARY KEY,
     section_id     INTEGER NOT NULL REFERENCES sections(id),
     prompt_name    TEXT NOT NULL,
     prompt_version TEXT NOT NULL,
     model          TEXT NOT NULL,
+    -- sha256 of the FULLY RENDERED prompt (every interpolated value --
+    -- note text, company, ticker, form type, fiscal period, note name --
+    -- included), never just the static template (SPEC-006 R2).
     input_hash     TEXT NOT NULL,
     output_json    TEXT NOT NULL,
-    input_tokens   INTEGER,
-    output_tokens  INTEGER,
-    cost_usd       REAL,
+    call_id        INTEGER REFERENCES llm_calls(id),
     created_at     TEXT NOT NULL,
     UNIQUE(input_hash)
 );
@@ -112,6 +143,7 @@ CREATE TABLE IF NOT EXISTS findings (
     id           INTEGER PRIMARY KEY,
     analysis_id  INTEGER NOT NULL REFERENCES analyses(id),
     accession_no TEXT NOT NULL REFERENCES filings(accession_no),
+    -- red_flag | accounting_change | litigation | concentration | liquidity | note_item
     category     TEXT NOT NULL,
     severity     TEXT,
     headline     TEXT NOT NULL,
@@ -151,6 +183,7 @@ TABLE_NAMES = (
     "sections",
     "xbrl_facts",
     "metrics",
+    "llm_calls",
     "analyses",
     "findings",
     "observations",
@@ -178,6 +211,29 @@ def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, co
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
 
 
+def _migrate_analyses_table(conn: sqlite3.Connection) -> None:
+    """SPEC-006: analyses gains call_id, drops input_tokens/output_tokens/cost_usd.
+
+    The table has been empty since it was created in SPEC-001 -- nothing has
+    called the LLM yet -- so this is a drop-and-recreate, not a real
+    column-preserving migration, and does not need SQLite's ALTER TABLE
+    DROP COLUMN support (see section_store.py's MIN_SQLITE_VERSION_INFO for
+    why that matters elsewhere). If the table is ever non-empty when this
+    runs, it refuses rather than silently discarding rows -- a real
+    migration would be needed at that point, and this is not it.
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(analyses)")}
+    if not existing or "call_id" in existing:
+        return  # table doesn't exist yet, or already migrated
+    count = conn.execute("SELECT COUNT(*) AS n FROM analyses").fetchone()["n"]
+    if count:
+        raise RuntimeError(
+            f"analyses has {count} row(s) but predates SPEC-006's schema (no call_id) -- "
+            "refusing to drop a non-empty table. A real migration is needed here, not this one."
+        )
+    conn.execute("DROP TABLE analyses")
+
+
 def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
     """Open a connection with foreign keys enforced.
 
@@ -199,6 +255,7 @@ def init_db(db_path: Path | None = None) -> None:
     """
     conn = get_connection(db_path)
     try:
+        _migrate_analyses_table(conn)
         conn.executescript(SCHEMA)
         for table, column, coltype in _NEW_COLUMNS:
             _add_column_if_missing(conn, table, column, coltype)

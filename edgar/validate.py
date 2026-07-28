@@ -13,9 +13,12 @@ from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
+from edgar import analyze as analyze_mod
 from edgar import config
+from edgar import llm as llm_mod
 from edgar import metrics as metrics_mod
 from edgar import observations as observations_mod
+from edgar import section_store
 
 
 @dataclass
@@ -40,6 +43,15 @@ class ValidationReport:
     observation_determinism_violations: list[dict] = field(default_factory=list)
     observation_orphan_refs: list[dict] = field(default_factory=list)
     db_size: dict = field(default_factory=dict)
+    llm_pricing_staleness: list[dict] = field(default_factory=list)
+    llm_ledger_mismatches: list[dict] = field(default_factory=list)
+    llm_cost_recomputation_mismatches: list[dict] = field(default_factory=list)
+    llm_pricing_rate_review: list[dict] = field(default_factory=list)
+    llm_budget: dict = field(default_factory=dict)
+    llm_orphan_findings: list[dict] = field(default_factory=list)
+    llm_quote_integrity_violations: list[dict] = field(default_factory=list)
+    llm_discard_rate: list[dict] = field(default_factory=list)
+    llm_numeric_support: list[dict] = field(default_factory=list)
 
     @property
     def hard_failure_count(self) -> int:
@@ -53,6 +65,10 @@ class ValidationReport:
             + len(self.observation_lookahead_violations)
             + len(self.observation_determinism_violations)
             + len(self.observation_orphan_refs)
+            + len(self.llm_ledger_mismatches)
+            + (1 if self.llm_budget.get("over_budget") else 0)
+            + len(self.llm_orphan_findings)
+            + len(self.llm_quote_integrity_violations)
         )
 
 
@@ -788,6 +804,241 @@ def _check_db_size(conn: sqlite3.Connection) -> dict:
     }
 
 
+# --- SPEC-006 R10: LLM infrastructure checks ---
+
+
+def _check_llm_pricing_staleness(conn: sqlite3.Connection) -> list[dict]:
+    """Informational (R1a/R10): a stale price doesn't corrupt persisted data,
+    but the budget cap's entire meaning depends on LLM_PRICING being current,
+    so a verification date older than LLM_PRICING_STALENESS_WARNING_DAYS is
+    surfaced here rather than only discoverable by reading config.py."""
+    today = date.today()
+    findings = []
+    for model, pricing in config.LLM_PRICING.items():
+        verified = date.fromisoformat(pricing.verified_date)
+        age_days = (today - verified).days
+        if age_days > config.LLM_PRICING_STALENESS_WARNING_DAYS:
+            findings.append(
+                {
+                    "model": model,
+                    "verified_date": pricing.verified_date,
+                    "age_days": age_days,
+                    "source_url": pricing.source_url,
+                }
+            )
+    return findings
+
+
+def _check_llm_ledger_reconciliation(conn: sqlite3.Connection) -> list[dict]:
+    """Hard failure (R10): llm.total_spent's SUM(cost_usd) must match a raw
+    SQL sum computed independently here -- guards against total_spent ever
+    drifting from what the ledger literally contains (e.g. a future filter
+    added to one but not the other)."""
+    reported = llm_mod.total_spent(conn)
+    raw = conn.execute("SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM llm_calls").fetchone()["total"]
+    if abs(reported - raw) > 1e-9:
+        return [{"reported_total": reported, "raw_sum": raw}]
+    return []
+
+
+def _check_llm_cost_recomputation(conn: sqlite3.Connection) -> list[dict]:
+    """SPEC-006A (L10, "reconciliation against the ledger"): every 'ok'/
+    'error' row's stored cost_usd must equal compute_cost(model,
+    input_tokens, output_tokens) recomputed under the CURRENT
+    config.LLM_PRICING. This is exactly the check that would have caught
+    the 2026-07-27 mispricing automatically (a row recorded at the $3/$15
+    rate while LLM_PRICING said $2/$10, or vice versa).
+
+    Informational, not a hard failure: a REAL pricing change (see
+    LLM_SONNET5_RATE_REVIEW_DATE) makes old rows mismatch on purpose, since
+    they were genuinely billed at the rate in effect when they were made --
+    that is expected drift, not corruption, and must be judged by a human
+    at that point (backfill the old rows' known rate, same as the
+    2026-07-27 fix), not silenced or hard-failed here automatically.
+    """
+    rows = conn.execute(
+        "SELECT id, model, input_tokens, output_tokens, cost_usd FROM llm_calls WHERE status IN ('ok', 'error')"
+    ).fetchall()
+    mismatches = []
+    for row in rows:
+        try:
+            expected = llm_mod.compute_cost(row["model"], row["input_tokens"], row["output_tokens"])
+        except ValueError:
+            continue  # unpriced model -- not this check's concern
+        if abs(expected - row["cost_usd"]) > 1e-6:
+            mismatches.append(
+                {
+                    "call_id": row["id"],
+                    "model": row["model"],
+                    "stored_cost_usd": row["cost_usd"],
+                    "expected_cost_usd_at_current_pricing": expected,
+                }
+            )
+    return mismatches
+
+
+def _check_llm_pricing_rate_review(conn: sqlite3.Connection) -> list[dict]:
+    """SPEC-006A: claude-sonnet-5's introductory rate in LLM_PRICING expires
+    on config.LLM_SONNET5_RATE_REVIEW_DATE (2026-09-01). Once today reaches
+    that date, LLM_PRICING must be hand-bumped to the standard $3.00/$15.00
+    rate or every call from that day forward is silently mispriced again --
+    the forcing function for the exact mistake this spec exists to stop
+    repeating."""
+    today = date.today()
+    review_date = date.fromisoformat(config.LLM_SONNET5_RATE_REVIEW_DATE)
+    if today < review_date:
+        return []
+    pricing = config.LLM_PRICING.get("claude-sonnet-5")
+    if pricing is not None and pricing.input_per_mtok >= 3.00:
+        return []  # already bumped to the standard rate
+    return [
+        {
+            "model": "claude-sonnet-5",
+            "review_date": config.LLM_SONNET5_RATE_REVIEW_DATE,
+            "today": today.isoformat(),
+            "current_input_per_mtok": pricing.input_per_mtok if pricing is not None else None,
+        }
+    ]
+
+
+def _check_llm_budget_headroom(conn: sqlite3.Connection) -> dict:
+    """Report spent/remaining always; a hard failure only if spend has
+    somehow exceeded the budget -- that would mean the cap leaked (R10)."""
+    spent = llm_mod.total_spent(conn)
+    return {
+        "spent": spent,
+        "budget": config.LLM_BUDGET_USD,
+        "remaining": config.LLM_BUDGET_USD - spent,
+        "over_budget": spent > config.LLM_BUDGET_USD,
+    }
+
+
+def _check_llm_orphan_findings(conn: sqlite3.Connection) -> list[dict]:
+    """Hard failure (R10): every finding must resolve to an analysis, and that
+    analysis must resolve to a section."""
+    rows = conn.execute(
+        """
+        SELECT fi.id AS finding_id, fi.analysis_id, an.id AS resolved_analysis_id, an.section_id,
+               se.id AS resolved_section_id
+        FROM findings fi
+        LEFT JOIN analyses an ON an.id = fi.analysis_id
+        LEFT JOIN sections se ON se.id = an.section_id
+        """
+    ).fetchall()
+    violations = []
+    for row in rows:
+        if row["resolved_analysis_id"] is None:
+            violations.append({"finding_id": row["finding_id"], "problem": f"analysis_id {row['analysis_id']} does not resolve"})
+        elif row["resolved_section_id"] is None:
+            violations.append({"finding_id": row["finding_id"], "problem": f"analysis's section_id {row['section_id']} does not resolve"})
+    return violations
+
+
+def _check_llm_quote_integrity(conn: sqlite3.Connection) -> list[dict]:
+    """Hard failure (R10): re-verify every stored finding's quote against its
+    section's CURRENT text, independently of the write-time verification in
+    analyze.py -- a stored finding that no longer matches its source is
+    corruption, whether from a bug or from the section text having been
+    re-written under the same hash key."""
+    rows = conn.execute(
+        """
+        SELECT fi.id AS finding_id, fi.quote, se.text_hash
+        FROM findings fi
+        JOIN analyses an ON an.id = fi.analysis_id
+        JOIN sections se ON se.id = an.section_id
+        """
+    ).fetchall()
+    violations = []
+    for row in rows:
+        source_text = section_store.read_section_text(row["text_hash"])
+        if not analyze_mod.verify_quote(row["quote"], source_text):
+            violations.append({"finding_id": row["finding_id"], "quote": row["quote"]})
+    return violations
+
+
+def _check_llm_numeric_support(conn: sqlite3.Connection) -> list[dict]:
+    """Informational, per prompt version: of the numeric tokens appearing in
+    kept findings' `headline`/`detail`, how many appear in the source note.
+
+    Recomputed from stored findings and their section text rather than stored
+    at write time -- the same choice as quote integrity above, and for the
+    same reason: a derived figure is a property of (finding, source), so
+    deriving it on demand cannot drift out of step with either. Warning
+    metric only while config.NUMERIC_SUPPORT_ENFORCE is False; unsupported
+    numbers include legitimately computed ones.
+    """
+    rows = conn.execute(
+        """
+        SELECT fi.id AS finding_id, fi.headline, fi.detail, fi.quote, an.prompt_version, se.text_hash
+        FROM findings fi
+        JOIN analyses an ON an.id = fi.analysis_id
+        JOIN sections se ON se.id = an.section_id
+        """
+    ).fetchall()
+    totals: dict[str, dict] = {}
+    for row in rows:
+        source_text = section_store.read_section_text(row["text_hash"])
+        numeric = analyze_mod.check_numeric_support(
+            row["headline"], row["detail"], row["quote"], source_text
+        )
+        bucket = totals.setdefault(
+            row["prompt_version"],
+            {
+                "checked": 0, "supported_in_quote": 0, "supported_in_note_only": 0,
+                "findings_with_unsupported": 0, "examples": [],
+            },
+        )
+        bucket["checked"] += numeric.checked
+        bucket["supported_in_quote"] += numeric.supported_in_quote
+        bucket["supported_in_note_only"] += numeric.supported_in_note_only
+        if numeric.unsupported:
+            bucket["findings_with_unsupported"] += 1
+            if len(bucket["examples"]) < 5:
+                bucket["examples"].append({"finding_id": row["finding_id"], "unsupported": numeric.unsupported})
+    results = []
+    for version, d in sorted(totals.items()):
+        supported = d["supported_in_quote"] + d["supported_in_note_only"]
+        results.append(
+            {
+                "prompt_version": version,
+                "checked": d["checked"],
+                "supported": supported,
+                "supported_in_quote": d["supported_in_quote"],
+                "supported_in_note_only": d["supported_in_note_only"],
+                "support_rate": (supported / d["checked"]) if d["checked"] else None,
+                "findings_with_unsupported": d["findings_with_unsupported"],
+                "examples": d["examples"],
+            }
+        )
+    return results
+
+
+def _check_llm_discard_rate(conn: sqlite3.Connection) -> list[dict]:
+    """Informational, per prompt version (R10): how many of the findings the
+    model returned survived quote verification. output_json on `analyses`
+    holds every finding the model RETURNED (verified or not); `findings` only
+    holds what SURVIVED -- the difference between the two, per analysis, is
+    the discard count."""
+    kept_by_analysis = dict(
+        conn.execute("SELECT analysis_id, COUNT(*) AS n FROM findings GROUP BY analysis_id").fetchall()
+    )
+    totals: dict[str, dict[str, int]] = {}
+    for row in conn.execute("SELECT id, prompt_version, output_json FROM analyses"):
+        returned = len(json.loads(row["output_json"]).get("findings", []))
+        kept = kept_by_analysis.get(row["id"], 0)
+        bucket = totals.setdefault(row["prompt_version"], {"returned": 0, "kept": 0})
+        bucket["returned"] += returned
+        bucket["kept"] += kept
+    findings = []
+    for version, d in sorted(totals.items()):
+        discarded = d["returned"] - d["kept"]
+        rate = discarded / d["returned"] if d["returned"] else 0.0
+        findings.append(
+            {"prompt_version": version, "returned": d["returned"], "kept": d["kept"], "discarded": discarded, "discard_rate": rate}
+        )
+    return findings
+
+
 def run_validate(conn: sqlite3.Connection, tickers: list[str] | None = None) -> ValidationReport:
     return ValidationReport(
         range_violations=_check_range_violations(conn, tickers),
@@ -810,6 +1061,15 @@ def run_validate(conn: sqlite3.Connection, tickers: list[str] | None = None) -> 
         observation_determinism_violations=_check_observation_determinism(conn, tickers),
         observation_orphan_refs=_check_observation_orphan_refs(conn, tickers),
         db_size=_check_db_size(conn),
+        llm_pricing_staleness=_check_llm_pricing_staleness(conn),
+        llm_ledger_mismatches=_check_llm_ledger_reconciliation(conn),
+        llm_cost_recomputation_mismatches=_check_llm_cost_recomputation(conn),
+        llm_pricing_rate_review=_check_llm_pricing_rate_review(conn),
+        llm_budget=_check_llm_budget_headroom(conn),
+        llm_orphan_findings=_check_llm_orphan_findings(conn),
+        llm_quote_integrity_violations=_check_llm_quote_integrity(conn),
+        llm_discard_rate=_check_llm_discard_rate(conn),
+        llm_numeric_support=_check_llm_numeric_support(conn),
     )
 
 
@@ -950,9 +1210,63 @@ def format_report(report: ValidationReport) -> str:
             f"({d['measured_marginal_filing_description']})"
         )
 
+    _section(
+        "18. LLM pricing staleness (informational -- SPEC-006 R1a/R10)",
+        report.llm_pricing_staleness,
+        lambda v: f"{v['model']}: verified {v['verified_date']} ({v['age_days']} days ago, source {v['source_url']})",
+    )
+    _section(
+        "19. LLM ledger reconciliation",
+        report.llm_ledger_mismatches,
+        lambda v: f"total_spent()={v['reported_total']:.4f} vs raw SUM(cost_usd)={v['raw_sum']:.4f}",
+    )
+    lines.append("\n=== 20. LLM budget headroom ===")
+    b = report.llm_budget
+    if b:
+        flag = "  ** OVER BUDGET **" if b["over_budget"] else ""
+        lines.append(f"  spent ${b['spent']:.4f} of ${b['budget']:.2f} budget, ${b['remaining']:.4f} remaining{flag}")
+    _section(
+        "21. LLM orphan findings",
+        report.llm_orphan_findings,
+        lambda v: f"finding_id={v['finding_id']}: {v['problem']}",
+    )
+    _section(
+        "22. LLM quote integrity violations",
+        report.llm_quote_integrity_violations,
+        lambda v: f"finding_id={v['finding_id']}: quote no longer verifies against section text: {v['quote']!r}",
+    )
+    _section(
+        "23. LLM discard rate (informational, by prompt version)",
+        report.llm_discard_rate,
+        lambda v: f"{v['prompt_version']}: {v['kept']}/{v['returned']} kept "
+        f"({v['discard_rate']:.0%} discarded)",
+    )
+    _section(
+        "24. LLM numeric support in headline/detail (informational, warning only, by prompt version)",
+        report.llm_numeric_support,
+        lambda v: f"{v['prompt_version']}: {v['supported']}/{v['checked']} numeric tokens found in source "
+        + (f"({v['support_rate']:.0%} supported)" if v["support_rate"] is not None else "(no numbers)")
+        + f" [in quote: {v['supported_in_quote']}, in note only: {v['supported_in_note_only']}]"
+        + f", {v['findings_with_unsupported']} finding(s) with >=1 unsupported number"
+        + (f"; e.g. {v['examples'][0]['unsupported']} in finding_id={v['examples'][0]['finding_id']}" if v["examples"] else ""),
+    )
+    _section(
+        "25. LLM cost recomputation (informational -- SPEC-006A L10; would have caught the 2026-07-27 mispricing)",
+        report.llm_cost_recomputation_mismatches,
+        lambda v: f"call_id={v['call_id']} {v['model']}: stored cost_usd={v['stored_cost_usd']:.6f} vs "
+        f"compute_cost() at current pricing={v['expected_cost_usd_at_current_pricing']:.6f}",
+    )
+    _section(
+        "26. LLM pricing rate review (SPEC-006A -- claude-sonnet-5's introductory rate)",
+        report.llm_pricing_rate_review,
+        lambda v: f"{v['model']}: introductory-rate review date {v['review_date']} has passed (today {v['today']}) "
+        f"but LLM_PRICING still shows input_per_mtok={v['current_input_per_mtok']} -- bump to the standard "
+        "$3.00/$15.00 rate",
+    )
+
     lines.append(
         f"\n{report.hard_failure_count} finding(s) in hard-failing categories "
-        "(1, 2, 3, 4, 5, 6, 14, 15, 16) -- would exit non-zero."
+        "(1, 2, 3, 4, 5, 6, 14, 15, 16, 19, 20, 21, 22) -- would exit non-zero."
         if report.hard_failure_count
         else "\nAll hard-failing categories clean."
     )

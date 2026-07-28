@@ -57,6 +57,33 @@ def get_sec_user_agent() -> str:
     return value
 
 
+# SPEC-006: Anthropic API key, same discipline as SEC_USER_AGENT above --
+# read from the environment, never from source, fail fast and by name
+# rather than attempting an anonymous call (R2, edge case table).
+#
+# SPEC-006A incident fix (2026-07-27): deliberately NOT named ANTHROPIC_API_KEY.
+# That is the Anthropic SDK's own default variable name -- Claude Code (and
+# anthropic-sdk-based tooling generally) reads it automatically. The
+# original $10 balance was exhausted by $6.28 of Claude Code spend billing
+# to the same account because this project's key happened to share that
+# name in the shell environment; the two were never actually connected in
+# code, just accidentally co-located by name. A project-specific name makes
+# that particular confusion structurally impossible, and it is what makes
+# the L9 environment canary (llm.check_environment_canary) meaningful: it
+# warns specifically because this project does NOT read ANTHROPIC_API_KEY.
+_ANTHROPIC_API_KEY_ENV_VAR = "EQUITY_RESEARCH_ANTHROPIC_API_KEY"
+
+
+def get_anthropic_api_key() -> str:
+    value = os.environ.get(_ANTHROPIC_API_KEY_ENV_VAR)
+    if not value:
+        raise RuntimeError(
+            f"{_ANTHROPIC_API_KEY_ENV_VAR} environment variable is not set. "
+            "Set it before running anything that calls the Anthropic API."
+        )
+    return value
+
+
 SEC_RATE_LIMIT_PER_SEC: int = 8
 HTTP_MAX_RETRIES: int = 3
 HTTP_BACKOFF_BASE_SECONDS: float = 1.0
@@ -1104,3 +1131,260 @@ DB_SIZE_MEASURED_MARGINAL_FILING_DESCRIPTION: str = (
     "one MU 10-Q (0000723125-26-000015): 90 XBRL facts, 31 metric rows, several "
     "sections, 51 observations -- measured 2026-07-27"
 )
+
+# --- SPEC-006: LLM infrastructure and section analysis ---
+
+# R2/R2a: model selection is a config entry, not a literal in llm.py. Sonnet 5
+# chosen on quality, not cost -- see ARCHITECTURE.md decision log 39 and
+# SPEC-006 R2a for the full reasoning (a weaker model is likelier to
+# fabricate a finding rather than correctly return empty, the exact failure
+# mode R6's quote verification exists to catch).
+LLM_MODEL: str = "claude-sonnet-5"
+
+# SPEC-006A (L2): tracks money ACTUALLY AVAILABLE, not the original project
+# intent. On 2026-07-27 the real $10 prepaid balance was exhausted -- ~$3.79
+# of it this project's own pipeline (working as designed), ~$6.28 of it
+# Claude Code billing to the same account (see _ANTHROPIC_API_KEY_ENV_VAR
+# above). LLM_BUDGET_USD stays at 10.00 -- the real remaining balance after
+# a top-up to "roughly what the next phase needs" (L1) -- until a deliberate
+# edit raises it, never as a default.
+LLM_BUDGET_USD: float = 10.00
+LLM_WARN_FRACTION: float = 0.75
+
+# --- SPEC-006A: budget guardrails (L3-L7) ---
+# Every constant below is a SEPARATE, independently-failing layer -- see
+# SPEC-006A-budget-guardrails.md's threat model table. Do not remove one
+# because another looks like it covers the same case; that overlap (L3/L6
+# especially) is deliberate.
+
+# L3: per-run cost ceiling. Tracked in-process (llm.RunGuard) against REAL
+# recorded spend for calls made so far THIS run, independent of the lifetime
+# ledger total (L2). Overridable per invocation via --max-run-cost, never by
+# editing this value mid-run.
+LLM_MAX_RUN_COST_USD: float = 2.00
+
+# L4: any dry-run estimate above this requires `--confirm-cost N` naming the
+# estimate. Deliberately not a bare `--yes` -- see LLM_CONFIRM_COST_TOLERANCE_USD.
+LLM_CONFIRM_THRESHOLD_USD: float = 1.00
+
+# L4: how close --confirm-cost's N must be to the dry-run estimate. 1% of
+# the estimate, floored at $0.01 -- tight enough that pasting a stale or
+# guessed number fails, loose enough that reading the estimate off the
+# terminal and retyping it (rounding included) succeeds. Not specified by
+# SPEC-006A itself ("a small tolerance"); this is the concrete choice.
+LLM_CONFIRM_COST_TOLERANCE_FRACTION: float = 0.01
+LLM_CONFIRM_COST_TOLERANCE_FLOOR_USD: float = 0.01
+
+# L5: a prompt-version bump invalidating more than this many previously-
+# cached analyses (within the currently selected run, not the whole corpus)
+# requires --acknowledge-cache-invalidation before an execute run proceeds.
+LLM_CACHE_INVALIDATION_WARN: int = 50
+
+# L6: deliberately redundant with L3 (see module comment above). Holds even
+# if compute_cost/LLM_PRICING is itself wrong -- exactly the class of bug
+# SPEC-006A exists to catch (see LLM_PRICING's 2026-07-27 fix note below).
+# At this project's real per-call cost (~$0.03-0.12, measured from the live
+# ledger), L3's $2.00 run cap binds well before 300 calls are ever reached
+# in normal operation -- that is correct, not a sign this ceiling is loose;
+# it is the backstop for when L3's arithmetic cannot be trusted, not the
+# primary limit for a healthy run.
+LLM_MAX_CALLS_PER_RUN: int = 300
+
+# L7: unattended (scheduled) runs are held to a much lower ceiling than L3's
+# interactive default -- nobody is watching, and a loop can run all night.
+# A normal incremental run (one new filing, 10-15 sections) costs roughly
+# $0.25 (SPEC-006A), so this is generous for correct behaviour and tight
+# against runaway behaviour. Binding on the GitHub Actions spec when it is
+# written; analyze-sections' own --scheduled flag enforces it today.
+LLM_SCHEDULED_RUN_MAX_COST_USD: float = 0.50
+
+
+@dataclass(frozen=True)
+class ModelPricing:
+    """One model's verified $/million-token pricing (SPEC-006 R1/R1a).
+
+    `source_url` and `verified_date` exist so a future reviewer (or
+    `validate`'s staleness check) can tell at a glance whether this is still
+    current without having to re-derive it -- a price is a fact with an
+    expiration date, not a constant.
+    """
+
+    input_per_mtok: float
+    output_per_mtok: float
+    source_url: str
+    verified_date: str  # ISO 8601 date the figures were checked, not guessed
+
+
+_ANTHROPIC_PRICING_SOURCE = "https://platform.claude.com/docs/en/docs/about-claude/pricing"
+_ANTHROPIC_PRICING_VERIFIED_DATE = "2026-07-27"
+
+# Claude Sonnet 5 has TWO published rates: an introductory $2/$10 per MTok
+# through 2026-08-31, reverting to standard $3/$15 from 2026-09-01.
+#
+# SPEC-006A incident fix (2026-07-27): this table PREVIOUSLY used the
+# post-September standard rate ($3/$15) throughout, deliberately, on the
+# reasoning that overstating cost was "the conservative direction" for a
+# budget cap. That reasoning was wrong in practice: `llm_calls` is also the
+# LEDGER, and it exists to reconcile against Console's actual balance, not
+# only to underspend. Recorded spend was $5.6859 for the 197 real+error
+# calls made so far; recomputing the SAME stored token counts at the
+# introductory $2/$10 rate gives $3.7906 -- exactly the $3/$15 : $2/$10
+# ratio (3:2) applied to the real number, and exactly the "~$3.79" figure
+# this project's own share of the 2026-07-27 incident was measured at. The
+# ledger was silently overstating its own numbers by 50%, which is worse
+# than a smaller cap: a ledger an operator cannot trust against Console is
+# not doing its one job. LLM_BUDGET_USD=10.00 (L2) is the real, harder-money
+# conservatism now; this table tells the truth about what a call actually
+# costs today.
+#
+# This table now uses the rate ACTUALLY IN EFFECT (introductory, through
+# 2026-08-31). It will go stale again on 2026-09-01 -- see
+# LLM_SONNET5_RATE_REVIEW_DATE below, which makes that transition a forced,
+# visible `validate` warning instead of a second silent drift. Existing
+# `llm_calls` rows recorded under the old (wrong) rate were backfilled once,
+# by hand, to this table's values (SPEC-006A) -- see ARCHITECTURE.md's
+# incident entry; this is not something `validate`/init_db redoes on every
+# run, since a REAL future rate change must NOT retroactively reprice calls
+# that were genuinely billed at a now-superseded rate.
+LLM_PRICING: dict[str, ModelPricing] = {
+    "claude-opus-5": ModelPricing(
+        input_per_mtok=5.00, output_per_mtok=25.00,
+        source_url=_ANTHROPIC_PRICING_SOURCE, verified_date=_ANTHROPIC_PRICING_VERIFIED_DATE,
+    ),
+    "claude-sonnet-5": ModelPricing(
+        input_per_mtok=2.00, output_per_mtok=10.00,  # introductory rate, in effect through 2026-08-31
+        source_url=_ANTHROPIC_PRICING_SOURCE, verified_date=_ANTHROPIC_PRICING_VERIFIED_DATE,
+    ),
+    "claude-haiku-4-5-20251001": ModelPricing(
+        input_per_mtok=1.00, output_per_mtok=5.00,
+        source_url=_ANTHROPIC_PRICING_SOURCE, verified_date=_ANTHROPIC_PRICING_VERIFIED_DATE,
+    ),
+}
+
+# SPEC-006A: the day claude-sonnet-5's introductory rate above stops being
+# true. validate.py hard-warns once date.today() reaches this date, until a
+# human bumps the table above to the standard $3.00/$15.00 rate -- the
+# forcing function that makes the 2026-09-01 transition a visible event
+# instead of a second silent mispricing.
+LLM_SONNET5_RATE_REVIEW_DATE: str = "2026-09-01"
+
+# R8b (validate, SPEC-006 R10): informational warning when a pricing entry's
+# verification date is older than this many days -- prices change, and a
+# stale table makes the cap meaningless (R1's own words). Not a hard
+# failure: a stale price doesn't corrupt existing data the way a broken FK
+# or a hash mismatch would.
+LLM_PRICING_STALENESS_WARNING_DAYS: int = 60
+
+# R4: only the paid stage is bounded. Archiving and extraction (SPEC-001/002)
+# stay unbounded on purpose (ARCHITECTURE.md §4.1).
+ANALYSIS_START_DATE: str = "2025-01-01"
+
+# R4: Notes only for V1 -- Policies are excluded (observations already
+# detects policy wording changes; including them roughly doubles cost).
+ANALYSIS_CATEGORIES: tuple[str, ...] = (MENUCATEGORY_NOTES,)
+
+# R5: output schema categories/severities -- the only vocabulary
+# `analyze.py` may write to `findings.category`/`findings.severity`.
+# Corrected in ARCHITECTURE.md v2.4: the schema comment previously said
+# red_flag|guidance|management_language|note_item, which predated this spec.
+FINDING_CATEGORIES: frozenset[str] = frozenset({
+    "red_flag", "accounting_change", "litigation", "concentration", "liquidity", "note_item",
+})
+FINDING_SEVERITIES: frozenset[str] = frozenset({"high", "medium", "low"})
+
+# R5: prompt file identity, versioned per R3 -- a prompt change is a new
+# version file, never an edit to an existing one.
+SECTION_ANALYSIS_PROMPT_NAME: str = "section_analysis"
+SECTION_ANALYSIS_PROMPT_VERSION: str = "v3"
+PROMPTS_DIR: Path = PROJECT_ROOT / "prompts"
+
+# R6: minimum verbatim quote length. A three-word quote matches everything
+# and proves nothing.
+QUOTE_MIN_LENGTH: int = 40
+
+# Numeric support: whether a finding whose headline/detail contains a number
+# absent from its source note is DISCARDED, or merely counted.
+#
+# False, deliberately. Quote verification grounds the quote and nothing else;
+# `headline` and `detail` are ungrounded prose, and a number appearing there
+# but not in the note is the most legible symptom of that. But the check
+# cannot distinguish a fabricated figure from a legitimately derived one (a
+# sum, a difference, a percentage the model computed correctly), so enforcing
+# it immediately would discard correct findings to catch incorrect ones at an
+# unknown exchange rate. The rate is measured first, per prompt version,
+# reported alongside the discard rate; enforcement is a decision to take with
+# the numbers in hand rather than on principle.
+NUMERIC_SUPPORT_ENFORCE: bool = False
+
+# R2: approximate token-count method for estimate_cost() and --dry-run,
+# stated per R2's own requirement ("approximate token counts are fine;
+# state the method"). ~4 characters per token in English is Anthropic's own
+# stated rule of thumb (pricing FAQ: "1 token is approximately 4 characters
+# or 0.75 words"). Not exact -- the real count comes back in the API
+# response and is what actually gets recorded in llm_calls -- this is only
+# for pre-call estimates.
+CHARS_PER_TOKEN_ESTIMATE: float = 4.0
+
+# R2: structured-output retry -- a response failing to parse as the
+# declared JSON schema is retried once, then recorded as an error. Distinct
+# from HTTP-transport retries (config.HTTP_MAX_RETRIES, reused from SEC
+# client backoff config per R2) -- this is a content-validation retry, not a
+# network one.
+LLM_JSON_PARSE_MAX_RETRIES: int = 1
+
+# R8: prompt-development sampling. Deterministic and reported, never a
+# silent random draw -- "Iterate on 5-10 sections, never the full set."
+SAMPLE_MAX_SECTIONS_FOR_DEVELOPMENT: int = 10
+DEFAULT_SAMPLE_SEED: int = 20260727
+
+# R5 output schema: the maximum output size requested per call. Raised from
+# 1,024 after the v1 sampled development run (seed 20260727) truncated a
+# real response mid-string: that call returned output_tokens=1024 exactly
+# and failed to parse as "Unterminated string." The original 1,024 estimate
+# reasoned from headline and detail length and overlooked the verbatim
+# quotes, which are the long part -- a single quote can run 300+ characters,
+# and a note with several findings carries several of them. Truncation is a
+# particularly bad failure here because it is silent at the API level and
+# surfaces only as a JSON parse error, which is indistinguishable from a
+# model that simply emitted bad JSON.
+LLM_MAX_OUTPUT_TOKENS: int = 4096
+
+# 2026-07-27 live-error-analysis fix: the API's own `stop_reason` field, not
+# a JSON-parse failure, is now what identifies truncation (llm.py,
+# get_or_create_analysis). Prior to this fix, three of the six real ledger
+# errors so far were truncation (stop_reason would have been "max_tokens")
+# misfiled as generic "invalid JSON/schema" errors -- one at the OLD
+# output_tokens=1024 cap (the incident LLM_MAX_OUTPUT_TOKENS's own comment
+# above describes), two at the CURRENT output_tokens=4096 cap, meaning
+# raising the cap once already did not fully fix truncation; it only moved
+# where it binds. This is the cap a truncated call is retried at, once, per
+# section, before being recorded as a distinct "truncated" outcome --
+# doubled rather than raised a little, since a call that filled 4096 tokens
+# with a still-incomplete response (long verbatim quotes, several findings)
+# needs meaningful headroom, not a marginal bump.
+LLM_TRUNCATION_RETRY_OUTPUT_TOKENS: int = 8192
+
+# What --dry-run assumes a call will actually EMIT, as distinct from the
+# ceiling above. Measured over the 26 real v2/v3 calls of the sampled
+# development runs: mean 334 output tokens, p95 840, max 972 -- empty
+# responses cost 14 tokens and a three-finding response under 1,000. Using
+# LLM_MAX_OUTPUT_TOKENS for estimation instead put the full-set estimate at
+# $20.06, over the $20 cap, for a run whose real cost is under $6: an
+# estimate 12x high is not conservative, it is uninformative, and it would
+# have argued against a run that was always affordable.
+#
+# The BUDGET CAP deliberately keeps using LLM_MAX_OUTPUT_TOKENS, not this
+# value. The asymmetry is intentional: over-estimating a dry run misleads,
+# whereas over-estimating at the cap only ever refuses a call slightly too
+# early, which is the safe direction for a hard spending limit.
+LLM_ESTIMATED_OUTPUT_TOKENS: int = 1024
+
+# Edge case (R2/R6): "Section text exceeds the context limit -> skip, log
+# with the section identity. Do not silently truncate." Every candidate
+# model's real context window is far larger than this (100K+ tokens), and
+# every real in-window note is a few thousand tokens (SPEC-006 pre-
+# implementation review) -- this exists as a defensive, conservative
+# tripwire for a pathological outlier, not a limit expected to bind in
+# practice. Estimated via CHARS_PER_TOKEN_ESTIMATE, same method as
+# estimate_cost.
+LLM_MAX_INPUT_TOKENS_ESTIMATE: int = 150_000

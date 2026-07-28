@@ -1,11 +1,27 @@
 # Equity Research Platform — Architecture
 
-**Version:** 2.3
+**Version:** 2.5
 **Date:** 2026-07-27
 **Owner:** Zakaria
 **Status:** Approved for V1 implementation
 
 **Changelog**
+- v2.5 — SPEC-006A budget guardrails, written up after the 2026-07-27 incident (§4.2): a
+  $10 balance was exhausted, ~$6.28 of it Claude Code billing to the same account because
+  the project's own key shared `ANTHROPIC_API_KEY`'s name (decision log 40). Ten
+  independent layers added (L1–L10, §4.2); `LLM_BUDGET_USD` cut to $10.00 (decision log
+  41). A second, unrelated bug found while investigating: `LLM_PRICING`'s `claude-sonnet-5`
+  entry used the wrong (future) rate, overstating the ledger by 50% against Console's real
+  attribution — corrected, with existing rows backfilled (decision log 42).
+- v2.4 — SPEC-006 pre-implementation review. `findings.category` corrected to match
+  SPEC-006's actual vocabulary (`red_flag|accounting_change|litigation|concentration|
+  liquidity|note_item`) — the prior comment (`red_flag|guidance|management_language|
+  note_item`) was stale, predating the spec that defines the real categories. New
+  `llm_calls` table (§6) — the sole source of spend; `analyses` drops its own token/cost
+  columns in favor of `call_id`. `analyses.input_hash` now stated explicitly to cover the
+  fully rendered prompt (every interpolated value), not the template — a hash keyed on
+  the template alone would let differently-interpolated calls collide and silently serve
+  a wrong cached answer. Decision log entry 39 added.
 - v2.3 — Three more SPEC-005 post-implementation refinements. `BOILERPLATE_NOTE_NAMES`
   excluded from automatic rename detection (§2.4) — fixed a remaining false positive
   ("Pay vs Performance Disclosure" repeatedly paired with an unrelated accounting-
@@ -454,7 +470,7 @@ Constraint: must run without the operator's machine being on. Cost target: $0 in
 | State | **SQLite committed to the repo** | Runners are ephemeral; repo is the durable store |
 | Raw filings | gzipped in `data/raw/` | Permanent archive |
 | Dashboard | **Streamlit Community Cloud** | Free, deploys from the same repo, redeploys on push |
-| LLM | Anthropic API, section-level calls | Budget ≈ $20 total |
+| LLM | Anthropic API, section-level calls | Budget ≈ $10 total (§4.2) |
 
 **Why not a VM:** SSH, systemd and deployment would consume ~8 of ~30 available hours
 and teach operations rather than system design. Revisit if the watchlist exceeds ~10 companies.
@@ -499,6 +515,173 @@ blobs committed during SPEC-001 and SPEC-002. Reclaiming that would require a hi
 rewrite, deliberately out of scope; the existing `.git` directory stays at its
 pre-migration size permanently.
 
+### 4.2 Budget Guardrails (SPEC-006A)
+
+**The incident (2026-07-27).** A $10 prepaid API balance was exhausted. Of it, ~$3.79 was
+this project's own pipeline — working exactly as designed, correctly capped by the
+`llm_calls` ledger and `LLM_BUDGET_USD`. The remaining ~$6.28 was **Claude Code itself**,
+billing to the same Anthropic account because `ANTHROPIC_API_KEY` happened to be set in
+the shell environment — $5.24 of it on Opus 5, a model this project never calls and never
+priced. The pipeline's own cap was correct and tested throughout. It simply had no view of
+a *different process* spending against the *same account*, because nothing routes an
+unrelated process's spend through this project's ledger. Recorded honestly: the original
+cap was right, and it was still insufficient, because a budget guard only ever protects
+what routes through it.
+
+A second, independent problem was found and fixed while investigating the incident: the
+ledger's own pricing table for `claude-sonnet-5` used the post-2026-09-01 standard rate
+($3/$15 per MTok) throughout, on the reasoning that overstating cost was "the conservative
+direction." That reasoning was wrong in practice — `llm_calls` is also meant to reconcile
+against Console's real balance, and a ledger that silently overstates its own numbers by
+50% (recorded $5.6859 for the same calls Console attributed $3.7906 to this project — the
+exact 3:2 ratio of $3/$15 vs $2/$10, confirmed by recomputing the stored token counts) is
+not doing its one job, no matter which direction the error runs. Fixed by using the rate
+Anthropic is *actually* billing (introductory $2/$10, through 2026-08-31) and backfilling
+the 197 existing `llm_calls` rows to it once, by hand — see `config.LLM_PRICING`'s
+docstring and `config.LLM_SONNET5_RATE_REVIEW_DATE`, which forces a `validate` warning
+when the introductory rate expires so this cannot drift silently a second time.
+
+**The fix is not a better single cap. It is layers that fail independently**, so no single
+mistake — a misrouted client, a careless prompt bump, a loop in a scheduled job — can drain
+the account by itself.
+
+| Path | Stopped by |
+|---|---|
+| Pipeline run costs more than expected | L3 per-run cap, L4 confirmation |
+| Prompt version bump silently invalidates the cache and re-runs everything | L5 cache-impact warning |
+| Bug causes a retry or call loop | L3 per-run cap, L6 call ceiling |
+| GitHub Actions job misbehaves overnight, unattended | L7 scheduled-run cap |
+| Public assistant endpoint is hammered | L8 assistant caps (spec not yet written) |
+| Another process (Claude Code, a script, a future tool) bills to the same key | **L1 only** |
+| Everything else, including the unknown | **L1 only** |
+
+Only L1 catches what the code cannot see — exactly the class of failure that happened.
+
+| Layer | What it does | Where |
+|---|---|---|
+| L1 | Prepaid balance, auto-reload OFF; monthly Console spend limit; balance kept near what the next phase needs, not a comfortable buffer | **Operator action — no code enforces this** |
+| L2 | Lifetime cap, `LLM_BUDGET_USD = 10.00`, tracks money actually available | `llm.ensure_budget_available` |
+| L3 | Per-run cost ceiling, `LLM_MAX_RUN_COST_USD = 2.00`, overridable via `--max-run-cost` | `llm.RunGuard` |
+| L4 | `--confirm-cost N` required above `LLM_CONFIRM_THRESHOLD_USD = 1.00`; N must match the dry-run estimate | `pipeline.cmd_analyze_sections` |
+| L5 | Cache-hit/new-call report every run; `--acknowledge-cache-invalidation` required above `LLM_CACHE_INVALIDATION_WARN = 50` | `analyze.run_analysis` (dry-run pass) |
+| L6 | Call-count ceiling, `LLM_MAX_CALLS_PER_RUN = 300`, deliberately redundant with L3 | `llm.RunGuard` |
+| L7 | `--scheduled` clamps the run-cost ceiling to `LLM_SCHEDULED_RUN_MAX_COST_USD = 0.50`, refuses `--sample` | `analyze.run_analysis` / binding on the GitHub Actions spec |
+| L8 | Per-session question limit; daily spend ceiling separate from the pipeline's; deployment private and password-gated | **Not implemented — binding on the assistant spec when written** |
+| L9 | Warns on startup if the generic `ANTHROPIC_API_KEY` is set (this project reads `EQUITY_RESEARCH_ANTHROPIC_API_KEY` instead) | `llm.check_environment_canary`, called from `pipeline.main` |
+| L10 | Every paid command prints this run's cost, lifetime spend, remaining budget; `validate` adds ledger/pricing reconciliation | `pipeline.cmd_analyze_sections`, `validate.py` categories 19/25/26 |
+
+**L1 is an operator responsibility no code change can enforce.** Concretely, before
+resuming any paid run:
+- Confirm the Anthropic Console account has a prepaid balance with **auto-reload
+  disabled**. With auto-reload on, a runaway process refills its own budget indefinitely —
+  the balance stops being an absolute ceiling.
+- Set a **monthly spend limit** in Console if the account tier offers one.
+- Top up to roughly what the next phase of work needs, not a round number kept "for
+  convenience" — a small balance is itself a guard, the same logic as L2's "money actually
+  available" framing.
+- Never export the project's key as `ANTHROPIC_API_KEY` in a shared or persistent shell
+  profile — that is precisely how Claude Code picked it up on 2026-07-27. Use
+  `EQUITY_RESEARCH_ANTHROPIC_API_KEY` (§ env var rename, decision log) and export it
+  narrowly (a per-invocation prefix, a `.env` loaded only by this project's own tooling).
+
+**L8 is recorded here so it cannot be forgotten**, per SPEC-006A: the assistant spec, when
+written, must implement a per-session question limit, a daily spend ceiling separate from
+the pipeline's own budget, and a private, password-gated deployment. None of this is
+implemented yet because the assistant does not exist yet.
+
+---
+
+### 4.3 Truncation, empty responses, and the per-attempt ledger invariant (2026-07-28)
+
+**Two bugs, found from a real error-analysis pass over the ledger, not from a test
+failure.** Six real `llm_calls` error rows existed before this fix; recomputing them
+against their own recorded `output_tokens` showed three were truncation misfiled as a
+generic parse error (one at the OLD 1,024-token cap — the incident `LLM_MAX_OUTPUT_TOKENS`
+itself already documents — two at the CURRENT 4,096-token cap, meaning raising the cap
+once already had not fixed truncation, only moved where it binds) and one extracted
+**zero text** with no record anywhere of why.
+
+1. **Truncation is now read from the API's own `stop_reason` field**, never inferred from
+   a JSON parse failure — the two are not the same signal. A response that fails to parse
+   but reports `stop_reason="end_turn"` is the model emitting bad JSON on its own, retried
+   at the same cap (unchanged, generic behaviour). A response with `stop_reason="max_tokens"`
+   is now its own class: retried once at `LLM_TRUNCATION_RETRY_OUTPUT_TOKENS` (8,192, double
+   the normal cap), and only recorded as the distinct `"truncated"` `AnalysisOutcome` status
+   — never lumped into `"error"` — if that retry also fails. `analyze.RunStats.truncated` and
+   the `analyze-sections` execute-run report count it separately from `errors`, because a
+   *rising* truncation rate is the signal that the cap needs raising again, and that signal
+   was previously invisible, buried inside a generic parse-error count alongside unrelated
+   schema failures.
+
+2. **Empty text extraction now logs the actual content block types the API returned**,
+   rather than assuming the text-block filter correctly discarded only irrelevant
+   non-text content. Run against the real API for the first time (2026-07-28
+   `analyze-sections --execute`), this immediately diagnosed the mystery: every empty
+   extraction this run (4 of them, all 4 also the truncation cases above) had content block
+   types `['thinking']` and `stop_reason="max_tokens"` — the model's internal reasoning
+   consumed the *entire* output cap before it ever reached the text block with the actual
+   answer. This is not a separate failure mode from truncation; it is truncation's most
+   extreme case (thinking alone exceeds the cap), and fix (1)'s stop_reason-driven retry at
+   a higher cap handles it directly — all 4 real truncations this run succeeded on retry
+   (`RunStats.truncated == 0` for the run, despite 4 transient truncation events along the
+   way).
+
+3. **A third bug, found only because this was the project's first execution of the retry
+   path against the real (billed) API rather than a free `FakeRawClient`**: when a truncated
+   call succeeded on retry, `get_or_create_analysis` recorded only the retry's tokens —
+   the wasted first attempt (a real API call Anthropic billed for: input tokens plus up to
+   4,096 output tokens of a "thinking" block that produced no text) got **no ledger row at
+   all**. This is a direct violation of this project's own founding ledger discipline (SPEC-006
+   AC1, "every call attempt appends a row") and the same shape of failure as decision log
+   #42 (a ledger that silently disagrees with what Anthropic actually billed) — just running
+   in the *other* direction (too low, not too high) this time. Confirmed against all 4 real
+   truncate-then-retry sections from the 2026-07-28 run: each had exactly one `llm_calls`
+   row, holding only the successful retry's tokens.
+
+   **Fixed going forward**: every real API attempt now bills its own `llm_calls` row and its
+   own `RunGuard.record_call`, the instant it happens (`edgar/llm.py`, `get_or_create_analysis`'s
+   `_bill` helper) — a section needing 2 real attempts produces 2 ledger rows, always, whether
+   it's a generic parse retry or a truncation retry, regardless of how the section ultimately
+   resolves. Covered by `test_every_real_attempt_produces_exactly_one_ledger_row`
+   (`tests/test_llm.py`), parametrized over every retry shape — the property test that should
+   have existed when the retry path was first written, and would have caught this
+   immediately in a unit test rather than requiring a real, paid execution to surface it.
+
+   **The 4 already-affected historical rows were NOT reconstructed.** Their wasted attempts'
+   real `input_tokens` were never captured anywhere and are unrecoverable — only their
+   `output_tokens` (4,096 each, read from the live response before the empty-text warning
+   fired) is exactly known. Writing 4 separate rows with an assumed input-token count each
+   would look like 4 measured ledger entries when they are not. Instead,
+   `scripts/backfill_2026_07_28_truncation_ledger_gap.py` (reviewed before running, idempotent,
+   committed to the repo) inserts **one** row with a new, distinct ledger status,
+   `status = 'reconciliation'` — never `'ok'`/`'error'`/`'refused'` — whose note states plainly
+   which figure is exact (16,384 total output tokens, 4 × 4,096) and which is an assumption
+   (40,617 total input tokens, taken from each affected section's own successful retry, on
+   the reasoning that the identical rendered prompt was sent both times). Lifetime spend after
+   the reconciliation entry: **$5.9894** of the $10.00 budget (up from the $5.7443 the ledger
+   showed before the entry existed) — the true cost of the calls this bug undercounted.
+
+   **A 5th real, billed, still-unrecorded attempt exists and was deliberately left OUT of the
+   reconciliation entry above.** Section 1937 needed a generic (non-truncation) parse retry
+   during the same 2026-07-28 run — the SAME pre-existing gap (§ decision log #45) affects the
+   ordinary retry path too, not only the truncation-retry path, and always has (it predates
+   this incident entirely). Unlike the 4 truncation cases, this wasted attempt's real
+   `output_tokens` was never logged anywhere — `stop_reason` was not `"max_tokens"`, so no
+   diagnostic warning fired for it — meaning there is no exact figure to anchor even a labelled
+   estimate to, only an unknown real cost. Recorded here in prose rather than invented into a
+   ledger row with a fabricated number attached to it: this is precisely the residual a
+   labelled reconciliation entry cannot always close, and precisely why manual reconciliation
+   against Console (next paragraph) remains a standing operator responsibility, not a
+   one-time fix.
+
+**Operator responsibility this incident adds, alongside L1 (§4.2): no code change makes
+`llm_calls`'s lifetime total automatically agree with Console's real usage figure forever —
+only manual, periodic reconciliation between the two catches the *next* accounting gap this
+same class of bug could reintroduce, the way this one was caught by a report the operator
+asked for, not by validate.py.** `validate.py` category 25 (`llm_cost_recomputation_mismatches`)
+checks stored `cost_usd` against `compute_cost` for existing `'ok'`/`'error'` rows — it cannot
+detect a call that was made but never got a row at all, which is exactly what this bug was.
+
 ---
 
 ## 5. Module Layout
@@ -517,6 +700,17 @@ edgar/
   analyze.py        Apply prompts to sections, write analyses + findings
   pipeline.py       Orchestration. Imports everything; nothing imports it
 prompts/            Versioned prompt files, e.g. note_materiality_v1.md
+                    Each file is split by a `## Template` marker: everything ABOVE it is
+                    documentation for humans (Purpose/Inputs/Output/Constraints/Success
+                    criteria/Failure cases, SPEC-006 R3) and is STRIPPED by
+                    analyze.load_prompt_template; only what is below it is sent to the
+                    model. Any instruction the model must obey — including the output
+                    schema — therefore has to appear below the marker. Documenting the
+                    schema only in the header silently ships a prompt that asks for a
+                    shape the model was never shown (see SPEC-006 v1→v2, found in the
+                    sampled development run, not in tests: every unit test supplies its
+                    own template string, so none of them exercised the real file's
+                    header/template split).
 dashboard/app.py    Streamlit
 tests/
 data/
@@ -535,7 +729,7 @@ data/
 
 ## 6. Database Schema
 
-Eight tables.
+Nine tables.
 
 ```sql
 -- ============ REFERENCE ============
@@ -618,11 +812,10 @@ CREATE TABLE analyses (
     prompt_name    TEXT NOT NULL,
     prompt_version TEXT NOT NULL,
     model          TEXT NOT NULL,
-    input_hash     TEXT NOT NULL,        -- sha256(section text + rendered prompt)
+    input_hash     TEXT NOT NULL,        -- sha256 of the FULLY RENDERED prompt (every
+                                          -- interpolated value included), SPEC-006 R2
     output_json    TEXT NOT NULL,
-    input_tokens   INTEGER,
-    output_tokens  INTEGER,
-    cost_usd       REAL,
+    call_id        INTEGER REFERENCES llm_calls(id),  -- SPEC-006: sole source of spend
     created_at     TEXT NOT NULL,
     UNIQUE(input_hash)                   -- this IS the response cache
 );
@@ -631,12 +824,27 @@ CREATE TABLE findings (
     id           INTEGER PRIMARY KEY,
     analysis_id  INTEGER NOT NULL REFERENCES analyses(id),
     accession_no TEXT NOT NULL REFERENCES filings(accession_no),
-    category     TEXT NOT NULL,          -- red_flag|guidance|management_language|note_item
+    category     TEXT NOT NULL,          -- red_flag|accounting_change|litigation|
+                                          -- concentration|liquidity|note_item (SPEC-006 R5)
     severity     TEXT,                   -- high|medium|low
     headline     TEXT NOT NULL,
     detail       TEXT,
     quote        TEXT,                   -- verbatim text from the filing
     created_at   TEXT NOT NULL
+);
+
+-- ============ SPEC-006: LLM SPEND LEDGER ============
+CREATE TABLE llm_calls (
+    id             INTEGER PRIMARY KEY,
+    created_at     TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    prompt_name    TEXT,
+    prompt_version TEXT,
+    input_tokens   INTEGER NOT NULL,
+    output_tokens  INTEGER NOT NULL,
+    cost_usd       REAL NOT NULL,
+    status         TEXT NOT NULL,        -- ok | error | refused | reconciliation (§4.3)
+    note           TEXT
 );
 
 -- ============ SPEC-005: OBSERVATIONS (between Calculations and Interpretation) ============
@@ -745,12 +953,23 @@ see numerator and denominator is a toy. Auditability at no cost.
 **`analyses.input_hash` with a UNIQUE constraint** — the database itself prevents paying
 twice for an identical call. Change the prompt, the hash changes, you get a fresh analysis
 and the old one is retained for comparison. Prompt versioning and cost control from one column.
+Covers the *fully rendered* prompt (every interpolated value, not the template) — SPEC-006
+R2 — since a hash keyed only on the static template would let two calls with different
+interpolated content collide and silently serve the wrong cached answer.
 
 **`findings.quote`** — every AI claim must be anchored to verbatim filing text. The strongest
 available control against hallucination, and structural rather than a prompt instruction.
 A finding without a quote is a bug.
 
 **`filings.status`** — makes the pipeline resumable and idempotent.
+
+**`llm_calls` as the sole source of spend (SPEC-006)** — `analyses` no longer carries its
+own `input_tokens`/`output_tokens`/`cost_usd`; every one of those lives in `llm_calls`,
+referenced by `analyses.call_id`, and every call attempt (including failures and
+refusals) appends a row there. One ledger, checked before every call, is what makes the
+lifetime cap (`LLM_BUDGET_USD`, $10.00 as of SPEC-006A §4.2) a real limit rather than a
+number nobody enforces — and, as the 2026-07-27 incident showed, only a real limit for
+spend that actually routes through this ledger in the first place.
 
 ### Note on `sections.UNIQUE`
 
@@ -1025,3 +1244,10 @@ SPEC-005 changelog and decision log entry 31.
 | 36 | `BOILERPLATE_NOTE_NAMES` excluded from rename-pairing on either side | Verified live: even after the `.ratio()` fix, "Pay vs Performance Disclosure" repeatedly paired with an unrelated accounting-standards note at the threshold boundary, because two different boilerplate SEC-template disclosures share enough generic structural language to look similar without being the same note. No signal lost — boilerplate names are already forced "low" regardless of which rule reports them | 2026-07-27 |
 | 37 | The 33%-eligible-periods firing-rate ceiling replaced by a per-filing contribution measure (mean/max observations contributed to a single filing, per rule) | The old measure counted firings per `(subject, period)`, structurally penalising a rule checking many things per filing (45 metrics) against one checking a single condition, regardless of how much of any ONE filing's list either actually occupies. Measured live: `metric_multi_year_extreme` contributes up to 24 observations to a single filing, more than double every other rule's maximum — the precise, quantified version of the Amazon top-5 problem | 2026-07-27 |
 | 38 | Top-N observation selection must cap contributions from a single rule at 2 (then fill from the next rule) — recorded as binding on SPEC-006 and the dashboard, not implemented here | SPEC-005 has no top-N display surface of its own; the failure mode (one rule's internal ranking dominating a filing's list) was found and measured in this spec (entry 37) and must not be rediscovered independently by whichever future spec builds the first real top-N selection | 2026-07-27 |
+| 39 | SPEC-006's section-analysis prompt carries no computed metrics; model is Claude Sonnet 5 | Read three real in-window notes in full before deciding: all were self-contained and numerically dense in their own right, needing none of the 44 period metrics to be understood — supplying them anyway would invite commentary on numbers rather than disclosure, the opposite of the LLM layer's unique job. Sonnet 5 chosen on quality, not cost (all candidates fit the budget with large margin at the corrected 273-call volume): a weaker model is likelier to fabricate a finding rather than correctly return empty, the exact failure mode this spec's quote verification exists to catch | 2026-07-27 |
+| 40 | Project's Anthropic key env var renamed `ANTHROPIC_API_KEY` → `EQUITY_RESEARCH_ANTHROPIC_API_KEY` | The 2026-07-27 incident's root cause: this project's key shared a name with the Anthropic SDK's own default variable, which Claude Code reads automatically. The two were never connected in code, only accidentally co-located in the shell environment. A project-specific name makes that confusion structurally impossible and is what makes the new L9 canary (§4.2) meaningful | 2026-07-27 |
+| 41 | `LLM_BUDGET_USD` cut $20.00 → $10.00; six new independent budget layers (L3–L7, L9, L10) added, none replacing L2 | A single cap only protects what routes through it — Claude Code's spend never did. §4.2's threat-model table shows every layer's blast radius is different; L3/L6 overlap on purpose (one trusts cost arithmetic, one doesn't) | 2026-07-27 |
+| 42 | `LLM_PRICING['claude-sonnet-5']` corrected $3.00/$15.00 → $2.00/$10.00 (the rate actually in effect through 2026-08-31); 197 existing `llm_calls` rows backfilled to match; `LLM_SONNET5_RATE_REVIEW_DATE` added | The "conservative" post-September rate was conservative for the CAP but wrong for the LEDGER, which must reconcile against Console: recorded spend was 50% over Console's real attribution (exactly the 3:2 ratio of the two rates) for the same 197 calls, confirmed by recomputing stored token counts. A ledger that lies about cost, even in the "safe" direction, is worse than a ledger that tells the truth and a cap that is simply smaller | 2026-07-27 |
+| 43 | Truncation now read from the API's `stop_reason` field, retried once at `LLM_TRUNCATION_RETRY_OUTPUT_TOKENS` (8,192), and counted as its own `AnalysisOutcome`/`RunStats` status, `"truncated"`, distinct from `"error"` | Recomputing 6 real ledger error rows found 3 were truncation misfiled as a generic parse error (2 at the current 4,096 cap, 1 at the prior 1,024 cap) — a JSON parse failure cannot distinguish "the model was cut off" from "the model emitted bad JSON on its own," and only one of those calls for a higher-cap retry (§4.3) | 2026-07-28 |
+| 44 | Empty text extraction now logs the actual API content block types instead of silently trusting the text-block filter | Diagnosed a real mystery ledger row (4,096 output tokens billed, zero text extracted) the moment this ran against the real API: all 4 empty extractions this run were `['thinking']` blocks that consumed the entire output cap before any text — not a distinct bug from truncation, its most extreme case (§4.3) | 2026-07-28 |
+| 45 | Every real API attempt now bills its own `llm_calls` row and `RunGuard.record_call`, immediately — never deferred to "whichever attempt the retry loop ends on"; new ledger status `'reconciliation'` added for one-off, reviewed, committed-script adjustments to real spend a since-fixed bug failed to capture at the time | Found live, only because this was the project's first execution of the retry path against the real (billed) API: a truncated-then-successfully-retried section recorded only the retry's tokens, silently dropping the wasted first attempt's real billed cost — same shape of failure as #42 (ledger disagrees with Console), running in the other direction. The 4 truncation-retry cases were reconciled with one labelled adjustment entry, not 4 reconstructed ones, since the wasted attempts' real input token counts are unrecoverable; a 5th case (a generic, non-truncation parse retry, section 1937 — the same pre-existing gap, not new) had no output-token figure at all logged and was deliberately left undocumented in the ledger rather than assigned a fabricated number (§4.3) | 2026-07-28 |

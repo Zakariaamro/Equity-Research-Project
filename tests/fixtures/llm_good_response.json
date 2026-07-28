@@ -1,0 +1,12 @@
+{
+  "material": true,
+  "findings": [
+    {
+      "category": "accounting_change",
+      "severity": "medium",
+      "headline": "Tax Act increased provision",
+      "detail": "The company's income tax provision increased due to the 2025 Tax Act.",
+      "quote": "The 2025 Tax Act increased our income tax provision, primarily due to a decrease"
+    }
+  ]
+}
