@@ -326,6 +326,24 @@ def compute_input_hash(rendered_prompt: str, model: str, prompt_version: str) ->
     prompt_version doesn't appear in the rendered text itself, so a version
     bump always produces a fresh analysis even in the (unlikely) case a
     template change doesn't alter the rendered output for a given section.
+
+    Deliberately covers content the model SEES -- prompt, model, prompt
+    version -- never request CONFIGURATION (temperature, thinking, max_tokens,
+    ...). The two are different questions: "was this exact question asked
+    before" (input_hash's job) versus "was it asked the same way" (not
+    tracked, and not this function's job). Confirmed live 2026-07-28: disabling
+    `thinking` (ARCHITECTURE.md §4.3) changed how every future call is made
+    without touching this hash at all, so the 257 analyses already cached
+    under adaptive thinking correctly remain cache hits -- they answer the
+    same question, and were already validated (quote-verified, numeric-support
+    measured) under the config that produced them. This is a deliberate policy,
+    not an oversight: a request-configuration change that is believed to
+    MATERIALLY alter output quality should force regeneration via a deliberate
+    prompt_version bump (which DOES invalidate the cache, by design), decided
+    case by case against whether regeneration cost is worth the improvement --
+    never by silently baking every tunable request parameter into this hash,
+    which would invalidate the entire cache on every knob turn regardless of
+    whether the knob mattered.
     """
     payload = f"{model}|{prompt_version}|{rendered_prompt}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -410,6 +428,22 @@ class _RealAnthropicClient:
         response = self._client.messages.create(
             model=model,
             max_tokens=max_tokens,
+            # 2026-07-28: explicitly disabled, not omitted. Omitting `thinking`
+            # does NOT mean "off" for this model -- it defaults to `adaptive`
+            # (the model decides per-call whether to reason, with no budget
+            # cap of its own; it shares `max_tokens` with the actual text
+            # output). That is exactly the truncation-risk mechanism §4.3
+            # documents: all 4 real truncations in the first execute run were
+            # a "thinking" block consuming the entire output cap before any
+            # text. A 4-section real-API probe with thinking explicitly
+            # disabled (scripts/probe_extended_thinking_2026_07_28.py)
+            # completed every one of those same 4 sections in a single call,
+            # 78-89% fewer output tokens, 67-83% lower cost, equal-or-more
+            # kept findings, identical materiality calls -- see
+            # ARCHITECTURE.md §4.3 and SPEC-006 v1.2/decision log #47 for the
+            # full measurement. A structured JSON extraction against an
+            # explicit schema does not need free-form reasoning tokens.
+            thinking={"type": "disabled"},
             messages=[{"role": "user", "content": prompt}],
         )
         text = "".join(block.text for block in response.content if getattr(block, "type", None) == "text")

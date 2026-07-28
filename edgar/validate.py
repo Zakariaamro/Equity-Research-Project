@@ -985,12 +985,13 @@ def _check_llm_numeric_support(conn: sqlite3.Connection) -> list[dict]:
             row["prompt_version"],
             {
                 "checked": 0, "supported_in_quote": 0, "supported_in_note_only": 0,
-                "findings_with_unsupported": 0, "examples": [],
+                "derived_verified": 0, "findings_with_unsupported": 0, "examples": [],
             },
         )
         bucket["checked"] += numeric.checked
         bucket["supported_in_quote"] += numeric.supported_in_quote
         bucket["supported_in_note_only"] += numeric.supported_in_note_only
+        bucket["derived_verified"] += numeric.derived_verified_count
         if numeric.unsupported:
             bucket["findings_with_unsupported"] += 1
             if len(bucket["examples"]) < 5:
@@ -1005,6 +1006,7 @@ def _check_llm_numeric_support(conn: sqlite3.Connection) -> list[dict]:
                 "supported": supported,
                 "supported_in_quote": d["supported_in_quote"],
                 "supported_in_note_only": d["supported_in_note_only"],
+                "derived_verified": d["derived_verified"],
                 "support_rate": (supported / d["checked"]) if d["checked"] else None,
                 "findings_with_unsupported": d["findings_with_unsupported"],
                 "examples": d["examples"],
@@ -1246,7 +1248,8 @@ def format_report(report: ValidationReport) -> str:
         report.llm_numeric_support,
         lambda v: f"{v['prompt_version']}: {v['supported']}/{v['checked']} numeric tokens found in source "
         + (f"({v['support_rate']:.0%} supported)" if v["support_rate"] is not None else "(no numbers)")
-        + f" [in quote: {v['supported_in_quote']}, in note only: {v['supported_in_note_only']}]"
+        + f" [in quote: {v['supported_in_quote']}, in note only: {v['supported_in_note_only']}, "
+        + f"derived-verified: {v['derived_verified']}]"
         + f", {v['findings_with_unsupported']} finding(s) with >=1 unsupported number"
         + (f"; e.g. {v['examples'][0]['unsupported']} in finding_id={v['examples'][0]['finding_id']}" if v["examples"] else ""),
     )

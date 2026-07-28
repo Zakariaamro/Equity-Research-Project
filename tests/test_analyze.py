@@ -457,6 +457,77 @@ def test_numeric_support_tolerates_redundant_decimal_tail():
     assert result.unsupported == []
 
 
+# --- 2026-07-28: ordinal-word normalisation (real false positive found live) ---
+# A finding wrote "Q4 FY2026" (digit form) while the source spelled out "the
+# fourth quarter of fiscal year 2026" -- extract_numeric_tokens only ever
+# produces digit-form tokens, so the gap was entirely on the source side.
+
+
+def test_numeric_support_recognises_spelled_out_ordinal_in_source():
+    source = "We expect to commence new leases in the fourth quarter of fiscal year 2026."
+    result = analyze.check_numeric_support(
+        "New leases expected to commence in Q4 FY2026", "Detail text.", "", source
+    )
+    assert result.unsupported == []
+    assert result.supported_in_note_only == 2  # "4" (fourth) and "2026"
+
+
+def test_numeric_support_ordinal_normalisation_never_touches_quote_verification():
+    # The whole point of scoping this to numeric-support only: verify_quote
+    # must stay strictly verbatim, never treat "fourth" and "4" as equal.
+    source = "We expect to commence new leases in the fourth quarter of fiscal year 2026."
+    assert not analyze.verify_quote("We expect to commence new leases in Q4 FY2026", source)
+
+
+# --- 2026-07-28: derived-sum verification ---
+# Absent-from-source numbers get one more check: are they a correct subset-sum
+# of the quote's OWN numbers? A real customer-concentration case, live: three
+# customers disclosed at 27%, 18%, 12% in the quote; the model's headline
+# summed them to "57% combined" -- correct arithmetic, not in the source
+# verbatim. The DANGEROUS case this exists to catch is the same shape but
+# wrong: a headline claiming "58%" for that same quote must stay unsupported,
+# since the sum genuinely doesn't check out.
+
+_CONCENTRATION_QUOTE = "Three direct customers accounted for 27%, 18% and 12% of our accounts receivable balance."
+
+
+def test_numeric_support_verifies_correct_derived_sum():
+    result = analyze.check_numeric_support(
+        "Three customers account for 57% combined of accounts receivable",
+        "Detail text.",
+        _CONCENTRATION_QUOTE,
+        NUMERIC_SOURCE,
+    )
+    assert "57" in result.derived_verified
+    assert "57" not in result.unsupported
+    assert result.derived_verified_count == 1
+
+
+def test_numeric_support_rejects_incorrect_looking_sum():
+    """The dangerous case: a sum that LOOKS plausible (same shape as the real
+    one above) but is arithmetically wrong must stay unsupported, never get
+    waved through as derived-verified just because it resembles a sum."""
+    result = analyze.check_numeric_support(
+        "Three customers account for 58% combined of accounts receivable",
+        "Detail text.",
+        _CONCENTRATION_QUOTE,
+        NUMERIC_SOURCE,
+    )
+    assert "58" not in result.derived_verified
+    assert "58" in result.unsupported
+
+
+def test_numeric_support_derived_sum_requires_at_least_two_addends():
+    # A single quote number equal to the token is already handled by
+    # supported_in_quote -- derived-sum must not redundantly "verify" it via
+    # a size-1 "sum", which would just be membership wearing a different name.
+    result = analyze.check_numeric_support(
+        "Concentration reached 27%", "Detail text.", _CONCENTRATION_QUOTE, NUMERIC_SOURCE
+    )
+    assert result.supported_in_quote == 1
+    assert result.derived_verified == []
+
+
 def test_unsupported_number_is_counted_but_finding_is_kept(conn):
     """The whole point of the metric while NUMERIC_SUPPORT_ENFORCE is False:
     the finding survives, the number is counted against the rate."""

@@ -8,6 +8,7 @@ never the Anthropic API directly.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import random
 import re
@@ -109,6 +110,42 @@ def verify_quote(quote: str, source_text: str) -> bool:
 
 _NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
 
+# 2026-07-28 checker fix: a real false-positive found live -- a finding wrote
+# "Q4 FY2026" (digit form, the model's own shorthand) while the source note
+# spelled out "the fourth quarter of fiscal year 2026". `extract_numeric_tokens`
+# only ever produces digit-form tokens (by construction of `_NUMBER_RE`, which
+# cannot match a word), so the gap is entirely on the SOURCE side: the source's
+# spelled-out ordinal never gets compared against the digit form the model
+# wrote. Bounded to ordinals 1st-20th -- the only spelled-out numeric forms
+# actually observed in this corpus (fiscal quarters/halves, ranked items) --
+# deliberately NOT extended to cardinals ("three customers"): that is a
+# different, unconfirmed failure mode and adding it now would be guessing
+# ahead of a finding, not fixing one.
+#
+# Applied ONLY within numeric-support checking, NEVER to `verify_quote` (R6)
+# -- quote verification's whole point is VERBATIM wording; silently treating
+# "fourth" and "4" as the same token there would let a paraphrased quote pass.
+_ORDINAL_WORDS: dict[str, str] = {
+    word: str(n)
+    for n, word in enumerate(
+        [
+            "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth",
+            "eleventh", "twelfth", "thirteenth", "fourteenth", "fifteenth", "sixteenth", "seventeenth",
+            "eighteenth", "nineteenth", "twentieth",
+        ],
+        start=1,
+    )
+}
+_ORDINAL_WORD_RE = re.compile(r"\b(" + "|".join(_ORDINAL_WORDS) + r")\b", re.IGNORECASE)
+
+
+def _normalize_ordinal_words(text: str) -> str:
+    """Numeric-support-only normalisation (never quote verification, see
+    `_ORDINAL_WORDS` above): 'the fourth quarter' -> 'the 4 quarter', so a
+    model-written 'Q4' or '4' is recognised against a note that spelled the
+    ordinal out."""
+    return _ORDINAL_WORD_RE.sub(lambda m: _ORDINAL_WORDS[m.group(0).lower()], text)
+
 
 def _normalize_number(token: str) -> str:
     """Drop thousands separators so '1,160' and '1160' compare equal."""
@@ -148,6 +185,49 @@ def _number_in_source(number: str, normalized_source: str) -> bool:
     return False
 
 
+# 2026-07-28 checker addition: derived-sum verification. A number absent from
+# both quote and note is not automatically a fabrication -- it may be the
+# model correctly ADDING disclosed figures (three customers at 27%, 18%, 12%
+# correctly summed to "57% combined"). Simple presence-checking cannot tell
+# that apart from the DANGEROUS case this exists to catch: a number that also
+# LOOKS like a plausible sum but whose arithmetic is actually wrong (e.g. the
+# model claims "58% combined" for that same 27/18/12 -- a wrong-looking sum
+# that presence-checking alone would flag identically to a correct one, with
+# no way to tell them apart). Verifying the arithmetic against the quote's OWN
+# numbers separates the two: a real subset-sum match is "derived_verified", a
+# non-match stays "unsupported" -- now specifically meaning "not present, AND
+# not a correct sum of what IS present," which is a strictly more dangerous
+# signal than presence-checking alone could produce.
+#
+# Scoped to the quote's own numbers, never the wider note: the point is
+# verifying that the CITED quote itself supports the derived figure, the same
+# grounding principle as supported_in_quote vs supported_in_note_only above.
+_MAX_QUOTE_NUMBERS_FOR_SUBSET_SUM = 20  # defensive bound, 2**20 worst case; real quotes hold a handful
+
+
+def _quote_numeric_values(quote: str) -> list[float]:
+    """Every numeric literal in the quote, as a float, WITH duplicates and in
+    no particular deduplicated set -- unlike `extract_numeric_tokens`, a
+    repeated figure is a repeated addend a real sum could legitimately use."""
+    return [float(_normalize_number(m.group(0))) for m in _NUMBER_RE.finditer(quote)]
+
+
+def _is_verified_subset_sum(target: float, quote_values: list[float], tolerance: float = 1e-6) -> bool:
+    """True if some subset of >= 2 of `quote_values` sums to `target` (within
+    floating tolerance). Subsets of size 1 are deliberately excluded -- a
+    single quote number equal to `target` would already have been caught by
+    `_number_in_source`'s substring check against the quote; this function
+    only runs on tokens that already failed that check, so a size-1 match
+    here would be redundant, never a new finding."""
+    if len(quote_values) > _MAX_QUOTE_NUMBERS_FOR_SUBSET_SUM:
+        return False
+    for size in range(2, len(quote_values) + 1):
+        for combo in itertools.combinations(quote_values, size):
+            if abs(sum(combo) - target) < tolerance:
+                return True
+    return False
+
+
 @dataclass
 class NumericSupportResult:
     """checked: distinct numeric tokens found in headline+detail.
@@ -158,17 +238,29 @@ class NumericSupportResult:
     quote itself -- real, but one inferential step weaker: the model could
     have pulled the figure from the right note without it being the figure
     the cited quote actually names.
-    unsupported: present in neither.
+    derived_verified: absent from both, but arithmetically verified as a
+    subset-sum of the quote's own numbers (2026-07-28) -- e.g. "57% combined"
+    when the quote discloses 27%, 18%, and 12% separately. A weaker tier than
+    presence but a REAL check, not a shrug: the arithmetic was confirmed, not
+    merely assumed correct because it looked plausible.
+    unsupported: present in neither, AND not a verified sum -- the token this
+    check exists to surface. Still not discarded (config.NUMERIC_SUPPORT_ENFORCE
+    is False); this is measurement, not enforcement.
     """
 
     checked: int
     supported_in_quote: int
     supported_in_note_only: int
+    derived_verified: list[str]
     unsupported: list[str]
 
     @property
     def supported(self) -> int:
         return self.supported_in_quote + self.supported_in_note_only
+
+    @property
+    def derived_verified_count(self) -> int:
+        return len(self.derived_verified)
 
 
 def check_numeric_support(headline: str, detail: str, quote: str, source_text: str) -> NumericSupportResult:
@@ -176,26 +268,39 @@ def check_numeric_support(headline: str, detail: str, quote: str, source_text: s
     appear in the note it came from, and -- of the ones that do -- whether
     they appear in the finding's own cited `quote` or only elsewhere in the
     note (2026-07-27 reporting addition: the two are different strengths of
-    evidence, see NumericSupportResult).
+    evidence, see NumericSupportResult). A token present in neither gets one
+    more chance (2026-07-28): a verified subset-sum of the quote's own
+    numbers reclassifies it as `derived_verified` rather than `unsupported`.
+
+    Both the source and the quote are normalised for spelled-out ordinals
+    ("fourth" -> "4") before matching, numeric-support-only (never for
+    `verify_quote`, which must stay strictly verbatim) -- see
+    `_normalize_ordinal_words`.
 
     Applied to KEPT findings only -- discarded findings are never persisted,
     so validate.py could not recompute the same figure for them and the
     run-time and stored rates would disagree.
     """
-    normalized_source = _normalize_number(_normalize_whitespace(source_text))
-    normalized_quote = _normalize_number(_normalize_whitespace(quote))
+    normalized_source = _normalize_number(_normalize_ordinal_words(_normalize_whitespace(source_text)))
+    normalized_quote = _normalize_number(_normalize_ordinal_words(_normalize_whitespace(quote)))
+    quote_values = _quote_numeric_values(quote)
     tokens = extract_numeric_tokens(f"{headline} {detail}")
     supported_in_quote = 0
     supported_in_note_only = 0
+    derived_verified: list[str] = []
     unsupported: list[str] = []
     for token in tokens:
         if _number_in_source(token, normalized_quote):
             supported_in_quote += 1
         elif _number_in_source(token, normalized_source):
             supported_in_note_only += 1
+        elif _is_verified_subset_sum(float(token), quote_values):
+            derived_verified.append(token)
         else:
             unsupported.append(token)
-    return NumericSupportResult(len(tokens), supported_in_quote, supported_in_note_only, unsupported)
+    return NumericSupportResult(
+        len(tokens), supported_in_quote, supported_in_note_only, derived_verified, unsupported
+    )
 
 
 # --- R4: what gets analysed ---
@@ -282,6 +387,15 @@ class RunStats:
     # drift out of sync with the total.
     numeric_tokens_supported_in_quote: int = 0
     numeric_tokens_supported_in_note_only: int = 0
+    # 2026-07-28: absent from the quote/note but a verified subset-sum of the
+    # quote's own numbers (e.g. "57% combined" from a quote disclosing 27%,
+    # 18%, 12% separately) -- a real, checked tier, not presence-based, see
+    # analyze.NumericSupportResult. Counted separately from
+    # numeric_tokens_supported_in_*, never folded into it: the whole point is
+    # that "verified by arithmetic" and "found verbatim" are different kinds
+    # of evidence, and collapsing them would erase exactly the distinction
+    # this addition exists to report.
+    numeric_tokens_derived_verified: int = 0
     findings_with_unsupported_numbers: int = 0
     total_cost_usd: float = 0.0
     seed_used: int | None = None
@@ -343,6 +457,16 @@ class RunStats:
             return None
         return self.numeric_tokens_supported_in_note_only / self.numeric_tokens_checked
 
+    @property
+    def numeric_derived_verified_rate(self) -> float | None:
+        """Fraction of checked numeric tokens absent from quote/note but
+        verified as a correct subset-sum of the quote's own numbers
+        (2026-07-28) -- a real, arithmetic-checked tier, distinct from
+        presence-based support."""
+        if self.numeric_tokens_checked == 0:
+            return None
+        return self.numeric_tokens_derived_verified / self.numeric_tokens_checked
+
 
 def _write_finding(conn: sqlite3.Connection, analysis_id: int, accession_no: str, finding: dict) -> None:
     conn.execute(
@@ -363,6 +487,7 @@ class SectionResult:
     numeric_tokens_checked: int = 0
     numeric_tokens_supported_in_quote: int = 0
     numeric_tokens_supported_in_note_only: int = 0
+    numeric_tokens_derived_verified: int = 0
     findings_with_unsupported_numbers: int = 0
     note: str | None = None
 
@@ -422,11 +547,23 @@ def analyze_one_section(
         result.numeric_tokens_checked += numeric.checked
         result.numeric_tokens_supported_in_quote += numeric.supported_in_quote
         result.numeric_tokens_supported_in_note_only += numeric.supported_in_note_only
+        result.numeric_tokens_derived_verified += numeric.derived_verified_count
+        if numeric.derived_verified:
+            logger.info(
+                "Derived-verified number(s) %s (correct subset-sum of the quote's own figures): "
+                "accession=%s note=%s prompt_version=%s headline=%r",
+                numeric.derived_verified, row["accession_no"], row["short_name"],
+                config.SECTION_ANALYSIS_PROMPT_VERSION, finding.get("headline"),
+            )
         if numeric.unsupported:
             result.findings_with_unsupported_numbers += 1
             # Kept, not discarded (config.NUMERIC_SUPPORT_ENFORCE is False) --
             # logged with the offending tokens so the rate can be judged on
-            # what actually failed, not just how often.
+            # what actually failed, not just how often. Reaching here means
+            # the token was not just absent -- it was also checked against
+            # every subset-sum of the quote's own numbers and did not match
+            # any of them (2026-07-28): a correct-looking sum failing this
+            # check is the dangerous case this addition exists to surface.
             logger.info(
                 "Kept finding with unsupported number(s) %s: accession=%s note=%s prompt_version=%s headline=%r",
                 numeric.unsupported, row["accession_no"], row["short_name"],
@@ -558,6 +695,7 @@ def run_analysis(
             stats.numeric_tokens_checked += result.numeric_tokens_checked
             stats.numeric_tokens_supported_in_quote += result.numeric_tokens_supported_in_quote
             stats.numeric_tokens_supported_in_note_only += result.numeric_tokens_supported_in_note_only
+            stats.numeric_tokens_derived_verified += result.numeric_tokens_derived_verified
             stats.findings_with_unsupported_numbers += result.findings_with_unsupported_numbers
         elif result.status == "refused":
             stats.refused += 1

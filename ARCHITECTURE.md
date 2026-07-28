@@ -1,11 +1,27 @@
 # Equity Research Platform — Architecture
 
-**Version:** 2.5
-**Date:** 2026-07-27
+**Version:** 2.6
+**Date:** 2026-07-28
 **Owner:** Zakaria
 **Status:** Approved for V1 implementation
 
 **Changelog**
+- v2.6 — Live error-analysis round after the first real, paid `analyze-sections --execute`
+  run (§4.3, decision log 43–49). Three ledger/truncation bugs found and fixed (stop_reason-
+  driven truncation with a raised-cap retry; empty-text extraction now logs actual content
+  block types, diagnosing every empty response as a `thinking` block consuming the whole
+  output cap; every real API attempt now bills its own ledger row, closing a gap where a
+  retried call recorded only the retry's tokens, reconciled via one labelled adjustment
+  entry, never reconstructed rows). Root cause of the `thinking` blocks measured then fixed:
+  extended thinking was on by default (adaptive, uncapped) on every call this project has
+  ever made; disabled explicitly after a real-API probe showed lower cost, no truncation,
+  and no loss of recall on the hardest known cases — applied without invalidating the
+  existing cache (`input_hash` covers content, not request configuration, a policy now
+  documented explicitly). `LLM_BUDGET_USD` re-aligned $10.00 → $8.50 against the real Console
+  balance, which has drifted from the ledger's own total for the same reason it did in the
+  2026-07-27 incident. Numeric-support checker gained ordinal-word normalisation and
+  derived-sum verification after a by-hand review of every real unsupported-number finding
+  found zero fabrications.
 - v2.5 — SPEC-006A budget guardrails, written up after the 2026-07-27 incident (§4.2): a
   $10 balance was exhausted, ~$6.28 of it Claude Code billing to the same account because
   the project's own key shared `ANTHROPIC_API_KEY`'s name (decision log 40). Ten
@@ -560,7 +576,7 @@ Only L1 catches what the code cannot see — exactly the class of failure that h
 | Layer | What it does | Where |
 |---|---|---|
 | L1 | Prepaid balance, auto-reload OFF; monthly Console spend limit; balance kept near what the next phase needs, not a comfortable buffer | **Operator action — no code enforces this** |
-| L2 | Lifetime cap, `LLM_BUDGET_USD = 10.00`, tracks money actually available | `llm.ensure_budget_available` |
+| L2 | Lifetime cap, `LLM_BUDGET_USD = 8.50` (re-aligned 2026-07-28, was 10.00 — see §4.3 and decision log #46), tracks money actually available, NOT the ledger's own recorded total (they measure different things and need periodic re-alignment) | `llm.ensure_budget_available` |
 | L3 | Per-run cost ceiling, `LLM_MAX_RUN_COST_USD = 2.00`, overridable via `--max-run-cost` | `llm.RunGuard` |
 | L4 | `--confirm-cost N` required above `LLM_CONFIRM_THRESHOLD_USD = 1.00`; N must match the dry-run estimate | `pipeline.cmd_analyze_sections` |
 | L5 | Cache-hit/new-call report every run; `--acknowledge-cache-invalidation` required above `LLM_CACHE_INVALIDATION_WARN = 50` | `analyze.run_analysis` (dry-run pass) |
@@ -681,6 +697,100 @@ same class of bug could reintroduce, the way this one was caught by a report the
 asked for, not by validate.py.** `validate.py` category 25 (`llm_cost_recomputation_mismatches`)
 checks stored `cost_usd` against `compute_cost` for existing `'ok'`/`'error'` rows — it cannot
 detect a call that was made but never got a row at all, which is exactly what this bug was.
+
+**Root cause of the "thinking" blocks, measured then applied (2026-07-28).** The Anthropic
+SDK's `messages.create` accepts a `thinking` request parameter with three modes —
+`enabled` (fixed `budget_tokens`), `disabled`, and `adaptive` (the model decides per-request
+whether to reason, with no budget cap of its own — it shares the same `max_tokens` ceiling as
+the text output, which is exactly the truncation risk this section is about). This project's
+client (`edgar/llm.py`, `_RealAnthropicClient.messages_create`) has never set this parameter at
+all; every real call this project has ever made has been running under whatever the API
+defaults to when `thinking` is omitted, which — confirmed by the real `['thinking']` blocks
+appearing unrequested — is not `disabled`.
+
+`scripts/probe_extended_thinking_2026_07_28.py` re-ran the same 4 real sections that
+truncated during the 2026-07-28 execute run, this time with `thinking={"type": "disabled"}`
+explicitly, at the standard 4,096-token cap (no retry-cap involved). Real, billed, one-off
+diagnostic calls — recorded honestly to `llm_calls` under `prompt_name =
+"section_analysis_thinking_probe"`, never written to `analyses`/`findings`. Result, compared
+against each section's own real production baseline (adaptive thinking, truncated at 4,096,
+succeeded on retry at 8,192):
+
+| section | ticker | thinking disabled: tokens / stop_reason / findings | baseline (adaptive, retried at 8,192): tokens / findings |
+|---|---|---|---|
+| 2168 | MU | 835 out, `end_turn`, **4** findings, $0.0189 | 4,415 out (after truncating at 4,096 first), 3 findings |
+| 8 | AMZN | 1,706 out, `end_turn`, **7** findings, $0.0572 | 5,402 out (after truncating first), 6 findings |
+| 2118 | AMZN | 952 out, `end_turn`, **4** findings, $0.0258 | 5,300 out (after truncating first), 3 findings |
+| 2069 | NVDA | 588 out, `end_turn`, **3** findings, $0.0202 | 4,936 out (after truncating first), 3 findings |
+
+Every one of the 4 hardest known real cases completed in a single call, well inside the
+standard cap, with **zero** `thinking` content blocks — confirming thinking was never actually
+required to be off by design, only never turned off. Output tokens dropped 78–89%; each
+section's total real cost (both the wasted truncated attempt and its retry, under adaptive
+thinking) was 67–83% higher than the single disabled-thinking call. Materiality determination
+was identical (`true`) in all 4; kept-finding counts were equal or higher with thinking
+disabled, never lower — no sign that removing it cost recall on this sample.
+
+**Applied**: `_RealAnthropicClient.messages_create` now sends `thinking={"type": "disabled"}`
+explicitly on every real call (decision log #48). This does NOT invalidate the existing cache.
+`llm.compute_input_hash` covers content the model SEES — the rendered prompt, model, and
+prompt version — never request CONFIGURATION (`thinking`, `max_tokens`, `temperature`, ...).
+The 257 analyses already produced under adaptive thinking answer the same question this hash
+tracks, and were already validated by this project's own mechanisms (quote verification, the
+numeric-support checker below) under the configuration that produced them; regenerating all 257
+would cost real money to re-derive output already known to be sound. **The general rule going
+forward**: a request-configuration change believed to MATERIALLY alter output quality forces
+regeneration through a deliberate `SECTION_ANALYSIS_PROMPT_VERSION` bump (which DOES invalidate
+the cache, by existing design, R3) — decided case by case against whether the regeneration cost
+is worth the improvement, never by silently folding every tunable request parameter into
+`input_hash` itself, which would invalidate the whole cache on every knob turn regardless of
+whether that knob mattered. This one was a deliberate choice not to bump: thinking's removal is
+believed to reduce truncation/cost, not change what a well-formed, already-validated response
+says, so a version bump was judged not worth its cost here — a future change believed to alter
+FINDINGS THEMSELVES (a prompt wording change, a schema change) still gets one.
+
+**`LLM_BUDGET_USD` re-aligned 10.00 → 8.50 (2026-07-28, decision log #46).** The ledger's
+recorded lifetime total and the real Console prepaid balance are not the same number and were
+never going to be — the original $10 balance absorbed both this project's ledgered spend and
+the Claude Code leak (decision log #40), but `LLM_BUDGET_USD` only ever tracked the former.
+Setting the cap to what the ledger shows, rather than below what Console actually has left,
+turns L2 into a rubber stamp on money that may already be gone. The new value is NOT derived
+from the ledger total (that would repeat the same mistake) — it is set to sit comfortably
+below the real Console balance at re-alignment time (~$2.80), the same "money actually
+available, not a round number" principle L1/L2 were already built on. These two numbers —
+`LLM_BUDGET_USD` and the real Console balance — measure different things and will drift apart
+again the moment anything spends against the same key outside this ledger's view, exactly as
+happened before; re-aligning them, periodically, is L1's existing operator responsibility
+(§4.2) applied on an ongoing basis, not a one-time correction.
+
+**Numeric-support checker improved, enforcement still off (2026-07-28, decision log #49).**
+Reviewing all 6 real "unsupported number" findings from the 2026-07-28 run by hand: 5 of 6 were
+the model correctly ADDING disclosed figures the checker had no way to verify (three customers
+at 27%, 18%, 12% correctly summed to "57% combined"); 1 of 6 was a checker artifact ("Q4"
+against a source that spelled out "fourth quarter"). Zero were fabrications. Two additions to
+`analyze.check_numeric_support`, `NUMERIC_SUPPORT_ENFORCE` left `False` either way — this
+changes what the metric measures, not whether it discards:
+
+1. **Ordinal-word normalisation.** `extract_numeric_tokens` only ever produces digit-form
+   tokens (`_NUMBER_RE` cannot match a word), so a source that spells out an ordinal the model
+   wrote as a digit ("fourth quarter" vs. the model's "Q4") registered as unsupported for a
+   reason that has nothing to do with grounding. Bounded to ordinals 1st–20th, the only
+   spelled-out form actually observed in this corpus, and applied ONLY within numeric-support
+   checking — never `verify_quote` (R6), which must stay strictly verbatim; treating "fourth"
+   and "4" as equal there would let a paraphrased quote pass.
+2. **Derived-sum verification.** A number absent from both quote and note gets one more check:
+   is it a correct subset-sum of the quote's OWN numbers? If so, it is `derived_verified` — a
+   real, arithmetic-checked tier, distinct from both presence-based support and from
+   `unsupported`. This is not a relaxation: a number that merely *looks* like a plausible sum
+   but is arithmetically wrong (the actually dangerous case — a checker that can't verify
+   arithmetic can't tell a correct sum from an incorrect one that happens to look the same
+   shape) still fails this check and stays `unsupported`. Scoped to the quote's own numbers
+   only, matching the same grounding principle as supported-in-quote vs. supported-in-note-only.
+
+`RunStats`/`SectionResult` gained `numeric_tokens_derived_verified` (and
+`numeric_derived_verified_rate`), reported alongside the existing quote/note-only split, never
+folded into it — "verified by arithmetic" and "found verbatim" remain visibly different kinds
+of evidence.
 
 ---
 
@@ -1251,3 +1361,7 @@ SPEC-005 changelog and decision log entry 31.
 | 43 | Truncation now read from the API's `stop_reason` field, retried once at `LLM_TRUNCATION_RETRY_OUTPUT_TOKENS` (8,192), and counted as its own `AnalysisOutcome`/`RunStats` status, `"truncated"`, distinct from `"error"` | Recomputing 6 real ledger error rows found 3 were truncation misfiled as a generic parse error (2 at the current 4,096 cap, 1 at the prior 1,024 cap) — a JSON parse failure cannot distinguish "the model was cut off" from "the model emitted bad JSON on its own," and only one of those calls for a higher-cap retry (§4.3) | 2026-07-28 |
 | 44 | Empty text extraction now logs the actual API content block types instead of silently trusting the text-block filter | Diagnosed a real mystery ledger row (4,096 output tokens billed, zero text extracted) the moment this ran against the real API: all 4 empty extractions this run were `['thinking']` blocks that consumed the entire output cap before any text — not a distinct bug from truncation, its most extreme case (§4.3) | 2026-07-28 |
 | 45 | Every real API attempt now bills its own `llm_calls` row and `RunGuard.record_call`, immediately — never deferred to "whichever attempt the retry loop ends on"; new ledger status `'reconciliation'` added for one-off, reviewed, committed-script adjustments to real spend a since-fixed bug failed to capture at the time | Found live, only because this was the project's first execution of the retry path against the real (billed) API: a truncated-then-successfully-retried section recorded only the retry's tokens, silently dropping the wasted first attempt's real billed cost — same shape of failure as #42 (ledger disagrees with Console), running in the other direction. The 4 truncation-retry cases were reconciled with one labelled adjustment entry, not 4 reconstructed ones, since the wasted attempts' real input token counts are unrecoverable; a 5th case (a generic, non-truncation parse retry, section 1937 — the same pre-existing gap, not new) had no output-token figure at all logged and was deliberately left undocumented in the ledger rather than assigned a fabricated number (§4.3) | 2026-07-28 |
+| 46 | `LLM_BUDGET_USD` re-aligned $10.00 → $8.50 | The ledger's recorded lifetime total ($5.99) and the real Console prepaid balance (~$2.80) are different numbers measuring different things — the original $10 balance absorbed both this project's ledgered spend AND the Claude Code leak (#40), but the cap only ever tracked the former. Re-aligned below the real Console balance, not derived from the ledger total; the two require periodic re-alignment against Console going forward, the same standing operator responsibility as L1 (§4.2/§4.3) | 2026-07-28 |
+| 47 | Extended "thinking" confirmed enabled by default (adaptive mode, no budget cap of its own, sharing `max_tokens` with the text output) on every real call this project has made | A 4-section real-API probe with `thinking={"type":"disabled"}` explicitly set: all 4 (previously truncating) sections completed in a single call inside the standard 4,096 cap, zero `thinking` blocks, 78–89% fewer output tokens, 67–83% lower cost per section, equal-or-more kept findings, identical materiality calls. Confirms the truncation risk and much of the per-call cost were coming from an unrequested, uncapped reasoning mode a structured-JSON-extraction task does not need (§4.3) | 2026-07-28 |
+| 48 | `thinking={"type": "disabled"}` now sent explicitly on every real call (`_RealAnthropicClient.messages_create`) — applied, not just measured | Directly acts on #47's measurement. Not a cache-invalidating change: `compute_input_hash` covers content the model sees (prompt, model, prompt version), never request configuration, so the 257 analyses already cached under adaptive thinking remain valid cache hits — a deliberate policy, not an oversight (§4.3) | 2026-07-28 |
+| 49 | Numeric-support checker gained two tiers: ordinal-word normalisation ("fourth" → "4", numeric-support-only, never `verify_quote`) and derived-sum verification (an absent number that is a correct subset-sum of the quote's own numbers → `derived_verified`, distinct from `unsupported`) | Both found live reviewing the 6 real unsupported-token findings from the 2026-07-28 run: 5 of 6 were the model correctly summing disclosed percentages (real evidence a presence-only checker cannot distinguish from a wrong-looking sum, which is the actually dangerous case); 1 of 6 was "Q4" vs. the source's spelled-out "fourth quarter" — a checker artifact, not a real ungrounded number. `NUMERIC_SUPPORT_ENFORCE` stays False either way — this improves what the metric MEASURES, not whether it discards (§4.3) | 2026-07-28 |

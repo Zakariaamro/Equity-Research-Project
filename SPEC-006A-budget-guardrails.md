@@ -1,11 +1,20 @@
 # SPEC-006A — Budget Guardrails
 
-**Version:** 1.0
+**Version:** 1.1
 **For:** Claude Code
 **Depends on:** SPEC-006 (in progress)
-**Reference:** `ARCHITECTURE.md`
+**Reference:** `ARCHITECTURE.md` — sections 4.2, 4.3
 **Estimated effort:** 2–3 hours
 **Priority:** Do this before resuming any paid run.
+
+**Changelog**
+- v1.1 (2026-07-28) — `LLM_BUDGET_USD` re-aligned $10.00 → $8.50: the ledger's recorded
+  lifetime total and the real Console prepaid balance are different numbers (the original
+  $10 absorbed both this project's spend and the Claude Code leak below; the cap only ever
+  tracked the former) and need periodic re-alignment against Console, not a one-time setting.
+  Full account in `ARCHITECTURE.md` §4.3, decision log #46. L1's own text below (re-topping
+  up "to what the next phase needs") is the same standing responsibility this re-alignment
+  exercised, not a new requirement.
 
 ---
 

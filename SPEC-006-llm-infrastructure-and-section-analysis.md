@@ -1,12 +1,34 @@
 # SPEC-006 — LLM Infrastructure and Section Analysis
 
-**Version:** 1.2
+**Version:** 1.3
 **For:** Claude Code
 **Depends on:** SPEC-005 (complete, commit `ccc0927`)
 **Reference:** `ARCHITECTURE.md` — sections 2, 6, 4.3
 **Estimated effort:** 8–10 hours
 
 **Changelog**
+- v1.3 — Acted on v1.2's same-day follow-up measurement, plus a checker improvement from
+  reviewing that run's own unsupported-number findings by hand (2026-07-28; full account
+  in `ARCHITECTURE.md` §4.3):
+  1. `thinking={"type": "disabled"}` now sent explicitly on every real call
+     (`_RealAnthropicClient.messages_create`) — v1.2's measurement (item 4 below) applied,
+     not just reported. Deliberately NOT a cache-invalidating change: `compute_input_hash`
+     covers content the model sees, never request configuration, so the 257 analyses
+     already cached under adaptive thinking remain valid — see `llm.compute_input_hash`'s
+     docstring for the general rule this establishes (a request-configuration change
+     believed to materially alter output forces regeneration via a deliberate
+     `SECTION_ANALYSIS_PROMPT_VERSION` bump, decided case by case, never by silently
+     folding the changed parameter into `input_hash` itself).
+  2. Numeric-support checker (R6-adjacent, informational only — `NUMERIC_SUPPORT_ENFORCE`
+     stays `False`) gained two tiers, from reviewing all 6 real "unsupported number"
+     findings from the v1.2 run by hand: ordinal-word normalisation ("fourth" → "4",
+     numeric-support-only, never `verify_quote`) fixed 1 of 6 (a checker artifact, not a
+     real ungrounded number); derived-sum verification (an absent number that is a correct
+     subset-sum of the quote's own numbers → `derived_verified`, distinct from
+     `unsupported`) correctly classified the other 5 (all legitimate arithmetic) while
+     still failing a number that merely LOOKS like a plausible sum but is arithmetically
+     wrong — the actually dangerous case a presence-only checker cannot distinguish from
+     a correct one.
 - v1.2 — Live error-analysis pass over the ledger after the first real, paid
   `analyze-sections --execute` run (2026-07-28; full account in `ARCHITECTURE.md` §4.3).
   Three fixes, all found from real data, none from a test failure:
@@ -24,6 +46,19 @@
      status `reconciliation` added for the one, reviewed, committed-script adjustment entry
      this required for the 4 historical rows it affected (their exact wasted-attempt input
      token counts are unrecoverable, so one labelled estimate, not four reconstructed rows).
+
+  Same-day follow-up, after reviewing the run's own report:
+  4. Root cause of the "thinking" blocks measured, not yet acted on: the Anthropic client
+     has never set the `thinking` request parameter, and the API defaults to an adaptive
+     reasoning mode (no budget cap of its own — shares `max_tokens` with the text output)
+     when it is omitted. A 4-section real-API probe with `thinking={"type":"disabled"}`
+     explicit: all 4 previously-truncating sections completed in one call inside the
+     standard cap, 78–89% fewer output tokens, 67–83% lower cost, equal-or-more findings
+     kept, identical materiality calls. See `ARCHITECTURE.md` §4.3 and decision log #47 —
+     applied in v1.3 (item 1 above).
+  5. `LLM_BUDGET_USD` re-aligned $10.00 → $8.50 (decision log #46): the ledger's recorded
+     total and the real Console balance measure different things and drifted apart again
+     for the same reason they did in the 2026-07-27 incident. See `ARCHITECTURE.md` §4.3.
 - v1.1 — Pre-implementation review, verified against live sources before any code was
   written:
   1. Metrics removed from the section-analysis prompt entirely (R5). Each layer does only
@@ -483,6 +518,7 @@ tests/fixtures/llm_*.json
 tests/test_llm.py
 tests/test_analyze.py
 scripts/backfill_2026_07_28_truncation_ledger_gap.py  (v1.2, one-off, idempotent, §4.3)
+scripts/probe_extended_thinking_2026_07_28.py         (v1.2, one-off diagnostic, §4.3)
 ```
 
 ---

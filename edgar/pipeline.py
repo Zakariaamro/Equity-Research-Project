@@ -427,7 +427,9 @@ def cmd_analyze_sections(args: argparse.Namespace) -> None:
                 f"tokens found in source ({rate:.0%}) -- "
                 f"in quote: {stats.numeric_tokens_supported_in_quote} ({stats.numeric_support_rate_in_quote:.0%}), "
                 f"in note only: {stats.numeric_tokens_supported_in_note_only} "
-                f"({stats.numeric_support_rate_in_note_only:.0%}); "
+                f"({stats.numeric_support_rate_in_note_only:.0%}), "
+                f"derived-verified: {stats.numeric_tokens_derived_verified} "
+                f"({stats.numeric_derived_verified_rate:.0%}); "
                 f"{stats.findings_with_unsupported_numbers} finding(s) with at least one unsupported number "
                 f"(warning only, not discarded)"
             )

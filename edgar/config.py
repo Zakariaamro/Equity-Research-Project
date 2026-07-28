@@ -1145,10 +1145,30 @@ LLM_MODEL: str = "claude-sonnet-5"
 # intent. On 2026-07-27 the real $10 prepaid balance was exhausted -- ~$3.79
 # of it this project's own pipeline (working as designed), ~$6.28 of it
 # Claude Code billing to the same account (see _ANTHROPIC_API_KEY_ENV_VAR
-# above). LLM_BUDGET_USD stays at 10.00 -- the real remaining balance after
-# a top-up to "roughly what the next phase needs" (L1) -- until a deliberate
-# edit raises it, never as a default.
-LLM_BUDGET_USD: float = 10.00
+# above).
+#
+# Re-aligned 2026-07-28 (10.00 -> 8.50): `llm_calls`'s recorded lifetime total
+# ($5.99 at the time) and the real Console prepaid balance (~$2.80) are NOT
+# the same number and were never going to be -- the ORIGINAL $10 balance
+# absorbed both this project's ledgered spend AND the Claude Code leak
+# (decision log #40), but LLM_BUDGET_USD only ever tracked the former. A cap
+# set to what the ledger shows, rather than to what Console shows, is a
+# rubber stamp on money that may already be gone, not an early-warning layer.
+# 8.50 was chosen as comfortably BELOW the real remaining balance at
+# re-alignment time, the same "money actually available, not a round number"
+# principle L2 was already built on (see the original 2026-07-27 note this
+# replaces) -- not derived from the ledger total at all.
+#
+# These two numbers -- this cap and the real Console balance -- measure
+# DIFFERENT things (recorded pipeline spend vs. actual prepaid balance after
+# every process that bills to the same key) and will drift apart again the
+# moment anything spends against the account outside this ledger's view,
+# exactly as it did before. No code in this project reads the Console
+# balance -- L1 (ARCHITECTURE.md §4.2) is already explicit that this is an
+# operator responsibility no code enforces. Re-aligning LLM_BUDGET_USD
+# against the real Console figure, periodically, is that same responsibility
+# applied on an ongoing basis, not a one-time correction.
+LLM_BUDGET_USD: float = 8.50
 LLM_WARN_FRACTION: float = 0.75
 
 # --- SPEC-006A: budget guardrails (L3-L7) ---
@@ -1233,9 +1253,10 @@ _ANTHROPIC_PRICING_VERIFIED_DATE = "2026-07-27"
 # this project's own share of the 2026-07-27 incident was measured at. The
 # ledger was silently overstating its own numbers by 50%, which is worse
 # than a smaller cap: a ledger an operator cannot trust against Console is
-# not doing its one job. LLM_BUDGET_USD=10.00 (L2) is the real, harder-money
-# conservatism now; this table tells the truth about what a call actually
-# costs today.
+# not doing its one job. LLM_BUDGET_USD=10.00 (L2, since re-aligned to 8.50
+# on 2026-07-28 -- see LLM_BUDGET_USD's own comment) was the real, harder-
+# money conservatism at the time; this table tells the truth about what a
+# call actually costs today.
 #
 # This table now uses the rate ACTUALLY IN EFFECT (introductory, through
 # 2026-08-31). It will go stale again on 2026-09-01 -- see
