@@ -1,11 +1,17 @@
 # Equity Research Platform — Architecture
 
-**Version:** 2.6
+**Version:** 2.7
 **Date:** 2026-07-28
 **Owner:** Zakaria
-**Status:** Approved for V1 implementation
+**Status:** Approved for V1 implementation — SPEC-006 complete
 
 **Changelog**
+- v2.7 — SPEC-006 complete (decision log #50): remaining 17 sections executed after the
+  thinking-disable fix, zero truncations and zero errors in the batch. Full corpus: 273/273
+  sections analysed, 253 findings (NVDA 92, AMZN 81, MU 80; litigation 71, note_item 59,
+  concentration 48, liquidity 37, accounting_change 36, red_flag 2; medium 163, low 54, high
+  36). Lifetime spend $6.3792 of the re-aligned $8.50 cap. `validate` exits 0, all
+  hard-failing categories clean.
 - v2.6 — Live error-analysis round after the first real, paid `analyze-sections --execute`
   run (§4.3, decision log 43–49). Three ledger/truncation bugs found and fixed (stop_reason-
   driven truncation with a raised-cap retry; empty-text extraction now logs actual content
@@ -1365,3 +1371,4 @@ SPEC-005 changelog and decision log entry 31.
 | 47 | Extended "thinking" confirmed enabled by default (adaptive mode, no budget cap of its own, sharing `max_tokens` with the text output) on every real call this project has made | A 4-section real-API probe with `thinking={"type":"disabled"}` explicitly set: all 4 (previously truncating) sections completed in a single call inside the standard 4,096 cap, zero `thinking` blocks, 78–89% fewer output tokens, 67–83% lower cost per section, equal-or-more kept findings, identical materiality calls. Confirms the truncation risk and much of the per-call cost were coming from an unrequested, uncapped reasoning mode a structured-JSON-extraction task does not need (§4.3) | 2026-07-28 |
 | 48 | `thinking={"type": "disabled"}` now sent explicitly on every real call (`_RealAnthropicClient.messages_create`) — applied, not just measured | Directly acts on #47's measurement. Not a cache-invalidating change: `compute_input_hash` covers content the model sees (prompt, model, prompt version), never request configuration, so the 257 analyses already cached under adaptive thinking remain valid cache hits — a deliberate policy, not an oversight (§4.3) | 2026-07-28 |
 | 49 | Numeric-support checker gained two tiers: ordinal-word normalisation ("fourth" → "4", numeric-support-only, never `verify_quote`) and derived-sum verification (an absent number that is a correct subset-sum of the quote's own numbers → `derived_verified`, distinct from `unsupported`) | Both found live reviewing the 6 real unsupported-token findings from the 2026-07-28 run: 5 of 6 were the model correctly summing disclosed percentages (real evidence a presence-only checker cannot distinguish from a wrong-looking sum, which is the actually dangerous case); 1 of 6 was "Q4" vs. the source's spelled-out "fourth quarter" — a checker artifact, not a real ungrounded number. `NUMERIC_SUPPORT_ENFORCE` stays False either way — this improves what the metric MEASURES, not whether it discards (§4.3) | 2026-07-28 |
+| 50 | SPEC-006 complete: remaining 17 sections executed after the thinking-disable fix | Zero truncations, zero errors in the batch — direct confirmation of decision log #47/#48's fix under real, additional load, not just the original 4-section probe. Full corpus: 273/273 sections analysed, 253 findings, $6.3792 of the re-aligned $8.50 budget spent, `validate` exits 0 | 2026-07-28 |

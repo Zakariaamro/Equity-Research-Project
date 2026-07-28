@@ -1,12 +1,28 @@
 # SPEC-006 — LLM Infrastructure and Section Analysis
 
-**Version:** 1.3
+**Version:** 1.4 (complete)
 **For:** Claude Code
 **Depends on:** SPEC-005 (complete, commit `ccc0927`)
 **Reference:** `ARCHITECTURE.md` — sections 2, 6, 4.3
 **Estimated effort:** 8–10 hours
 
 **Changelog**
+- v1.4 — Full run completed, remaining 17 sections executed after the thinking-disable fix
+  (zero truncations, zero errors this batch — confirming v1.3's fix). Final, whole-corpus
+  numbers against the Acceptance Criteria below:
+  - AC8 (full run completes for all in-window Notes): **273/273 sections analysed**, 0
+    skipped, 0 unprocessed.
+  - AC9 (total spend under $10, now $8.50 — decision log #46): **lifetime spend $6.3792**,
+    $2.1208 remaining under the re-aligned cap.
+  - **253 total findings** kept across the corpus. By company: NVDA 92, AMZN 81, MU 80. By
+    category: litigation 71, note_item 59, concentration 48, liquidity 37, accounting_change
+    36, red_flag 2. By severity: medium 163, low 54, high 36.
+  - AC15 (`validate` exits 0): confirmed, all hard-failing categories clean.
+  - Numeric support corpus-wide (category 24): v3 (250/253 kept findings) — 376/393 tokens
+    supported (96%), 320 in quote, 56 in note only, 13 derived-verified (v1.3's addition,
+    already catching real cases in this batch), 3 findings still flagged with a genuinely
+    unsupported number — a real residual rate, not zero, and not enforced
+    (`NUMERIC_SUPPORT_ENFORCE` stays `False`).
 - v1.3 — Acted on v1.2's same-day follow-up measurement, plus a checker improvement from
   reviewing that run's own unsupported-number findings by hand (2026-07-28; full account
   in `ARCHITECTURE.md` §4.3):
