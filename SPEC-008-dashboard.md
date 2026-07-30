@@ -1,6 +1,6 @@
 # SPEC-008 — Dashboard
 
-**Version:** 1.1
+**Version:** 1.2
 **For:** Claude Code
 **Depends on:** SPEC-007 (complete, commit `18ed734`)
 **Reference:** `ARCHITECTURE.md`; SPEC-007 Residual Risk
@@ -8,6 +8,15 @@
 **Estimated API cost:** $0.00 — this spec makes no API calls at all
 
 **Changelog**
+- v1.2 — Real gap in how this build was verified, found the first time `streamlit run`
+  was actually tried outside the environment used to write it (2026-07-30, reported by the
+  operator). See "A real gap in AppTest verification" below — `dashboard` was never
+  installed as an importable package in the project's own `.venv`; every check performed
+  during the build (`pytest`, `streamlit.testing.v1.AppTest`) passed anyway because it ran
+  through a different Python environment whose accidental CWD-based import resolution
+  papered over exactly this gap. Fixed (`pip install -e .`, after `pyproject.toml`'s
+  `packages.find` already listed `dashboard*`); the underlying lesson and the deployment
+  implication are recorded below, not just the one-line fix.
 - v1.1 — Pre-implementation review (2026-07-30), against real data and the installed
   Streamlit version (1.51.0). Seven changes, none yet built:
   1. **Overview anchors to the latest 10-K or 10-Q, never an 8-K** (R3). Confirmed live:
@@ -378,6 +387,60 @@ adds finance leases only when the resolved tag does not already include them. Ei
 than a config-only change. **Not implemented here** — this section exists so the operator
 can decide the shape of the fix with the real facts in hand, per the standing instruction
 not to fix this during the dashboard build.
+
+---
+
+## A real gap in AppTest verification (v1.2, 2026-07-30)
+
+**What happened.** `streamlit run dashboard/app.py` failed for the operator with
+`ModuleNotFoundError: No module named 'dashboard'`. Root cause: `pyproject.toml`'s
+`[tool.setuptools.packages.find]` was updated during this build to include `dashboard*`
+alongside `edgar*`, but the project's `.venv` had an editable install of `edgar` performed
+*before* that change — an editable install's package mapping is fixed at install time, not
+re-read on every import, so adding `dashboard*` to `pyproject.toml` did nothing to an
+already-installed venv until `pip install -e .` ran again. The venv also never had
+`streamlit`/`plotly` installed at all (both new dependencies added in this same build).
+`pip install -e .` fixed both at once.
+
+**Why every verification step taken during the build missed this, specifically.** This
+build was verified with `pytest` and `streamlit.testing.v1.AppTest` (headless, no browser),
+run via ad hoc `python3 -c "..."` invocations and `python3 -m pytest`, all launched with the
+repository root as the working directory. Python's `-c` flag, and pytest's own rootdir
+handling (via `tests/__init__.py`, per the operator's own diagnosis), both insert the
+current working directory onto `sys.path` — so `import dashboard` resolved *by accident*,
+through the working directory, in the exact environment used to write and check this code,
+regardless of whether `dashboard` was ever properly installed anywhere. Confirmed directly:
+the project's own `.venv` had never had `edgar` importable outside its own repo root either
+— `pip show edgar` in the environment actually used to build this returned "not found" the
+whole time, and every test still passed, for the identical reason.
+
+**This is a structural blind spot in this verification method, not a one-off mistake.**
+Any check that imports project code via a `-c` flag or a pytest run from the repo root will
+silently succeed on a packaging gap that a real, independently-launched process — a
+different working directory, a systemd unit, a Docker container, Streamlit Community
+Cloud's own runner — will not paper over. `AppTest` itself is sound (it caught a real
+`st.navigation` URL-collision bug during this same build, correctly); the surrounding
+process of invoking it did not exercise the actual install boundary. **The fix going
+forward: verification of anything packaging-related must run through the project's own
+declared environment (`.venv/bin/python3`, not an ambient interpreter), and at least once
+per build, from a working directory outside the repository** — exactly reproducing how an
+unrelated process would actually launch it. Confirmed after the fact: `.venv/bin/streamlit
+run` (absolute paths, launched from `/tmp`) now serves correctly.
+
+**Deployment implication, since this is heading for Streamlit Community Cloud (Forward-
+Looking Concern 2).** Streamlit Cloud builds its own fresh environment from the repo on
+every deploy — it does not inherit whatever happens to be installed on a developer's
+machine, so this exact failure mode (a stale or absent install of the project's own
+packages) is the *default* outcome unless the build step explicitly installs this project,
+not just its third-party dependencies. Concretely, before the first real deployment:
+confirm Streamlit Cloud's build actually runs `pip install .` (or equivalent) against
+`pyproject.toml` — not only a `requirements.txt`-style install of `streamlit`/`plotly`/
+`requests`/`beautifulsoup4` that would leave `edgar`/`dashboard` themselves unimportable,
+reproducing this exact error on the very first deploy. **Recorded as binding on the future
+deployment/GitHub Actions spec**: its own acceptance criteria must include "a genuinely
+fresh clone, fresh environment, `pip install .`, `streamlit run` succeeds" as an explicit,
+automated check — not something caught by a developer's already-warm machine, which is
+precisely how this one got through.
 
 ---
 

@@ -1,11 +1,21 @@
 # Equity Research Platform — Architecture
 
-**Version:** 2.8
+**Version:** 2.9
 **Date:** 2026-07-30
 **Owner:** Zakaria
-**Status:** Approved for V1 implementation — SPEC-006 and SPEC-007 complete
+**Status:** Approved for V1 implementation — SPEC-006 and SPEC-007 complete; SPEC-008 built, operator verification in progress
 
 **Changelog**
+- v2.9 — SPEC-008 (Dashboard) implemented; a real packaging/verification gap found the
+  first time `streamlit run` was tried outside the build environment (decision log #52):
+  `dashboard` was never installed in the project's own `.venv` (the editable install
+  predated `pyproject.toml`'s `dashboard*` addition; `streamlit`/`plotly` were new
+  dependencies too), and every build-time check passed anyway because it ran through a
+  different Python environment whose accidental CWD-based import resolution masked it.
+  Fixed with `pip install -e .`; the deployment implication (Streamlit Cloud builds a fresh
+  environment on every deploy and will reproduce this exact failure unless its build step
+  installs the project itself, not just third-party dependencies) is recorded as binding on
+  the future deployment spec in SPEC-008 directly.
 - v2.8 — SPEC-007 (The Grounded Brief) complete (decision log #51): capped/ranked
   observation+finding selection (R2 v2.1's diversity fixes), typed-sentence generation with
   per-type mechanical verification (R4, including the unit-aware aggregation check, §2.5),
@@ -1407,3 +1417,4 @@ without either being lost or quietly expanding V1's scope in the meantime.
 | 49 | Numeric-support checker gained two tiers: ordinal-word normalisation ("fourth" → "4", numeric-support-only, never `verify_quote`) and derived-sum verification (an absent number that is a correct subset-sum of the quote's own numbers → `derived_verified`, distinct from `unsupported`) | Both found live reviewing the 6 real unsupported-token findings from the 2026-07-28 run: 5 of 6 were the model correctly summing disclosed percentages (real evidence a presence-only checker cannot distinguish from a wrong-looking sum, which is the actually dangerous case); 1 of 6 was "Q4" vs. the source's spelled-out "fourth quarter" — a checker artifact, not a real ungrounded number. `NUMERIC_SUPPORT_ENFORCE` stays False either way — this improves what the metric MEASURES, not whether it discards (§4.3) | 2026-07-28 |
 | 50 | SPEC-006 complete: remaining 17 sections executed after the thinking-disable fix | Zero truncations, zero errors in the batch — direct confirmation of decision log #47/#48's fix under real, additional load, not just the original 4-section probe. Full corpus: 273/273 sections analysed, 253 findings, $6.3792 of the re-aligned $8.50 budget spent, `validate` exits 0 | 2026-07-28 |
 | 51 | SPEC-007 (The Grounded Brief) complete | Full run: 18 briefs, 204 kept sentences (restatement 70%, juxtaposition 19%, grouping 10%, sourced_causal/aggregation ~0.5% each), 19 dropped at the R4 type check, 20 dropped by the R5 verifier. Cost $0.5250, ~1.8x the $0.2905 dry-run estimate — every brief ignored the "3-6 sentences" instruction (8-15 kept per brief, always), which is the direct cause; reported as a real finding for a future prompt version, not silently tuned around (SPEC-007 v2.2, AC12's "do not tune to improve them") | 2026-07-30 |
+| 52 | Packaging/verification gap: `dashboard` was never installed in the project's own `.venv` (`pip install -e .` had not been re-run since `pyproject.toml` added `dashboard*`; `streamlit`/`plotly` were new deps too) | `streamlit run` failed for the operator with `ModuleNotFoundError`. Every build-time check (`pytest`, `AppTest`) had passed anyway — all invoked via `python3 -c`/pytest from the repo root, both of which put the repo root on `sys.path` by accident, masking that `edgar` itself was never importable outside the repo root in the actual environment used to build this either. Fixed with `pip install -e .`; confirmed after with `.venv/bin/streamlit run`, absolute paths, launched from outside the repo. Binding on the future deployment spec (SPEC-008 "A real gap in AppTest verification"): its acceptance criteria must include a genuinely fresh clone + fresh install + `streamlit run` check, since Streamlit Cloud builds a fresh environment on every deploy and will reproduce this exact failure if the build step only installs third-party dependencies | 2026-07-30 |
