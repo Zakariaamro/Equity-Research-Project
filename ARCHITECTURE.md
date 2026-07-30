@@ -361,6 +361,25 @@ solved here, since SPEC-005 itself has no top-N display surface: `observations` 
 the complete, uncapped, unranked record, and the cap applies only where a bounded
 selection is actually made.
 
+### 2.5 Arithmetic verification without unit verification is not verification (SPEC-007)
+
+Found in SPEC-007's pre-implementation review (2026-07-30), before `brief.py` was written:
+SPEC-006's derived-sum verifier (`analyze._is_verified_subset_sum`) checks that a claimed
+number equals a subset-sum of numbers present in a source — correctly, and it was built to
+verify arithmetic, nothing else. It has no concept of what a number's UNIT is, because
+`analyze.py`'s numeric tokens are bare digit strings with no unit attached. That is exactly
+the gap: a sentence claiming *"$1.27B combined"* from a source with a $525M verdict and a
+€746M fine passes the arithmetic check (525 + 746 = 1271 ≈ 1.27B is correct addition) while
+silently treating two different currencies as one figure. **A check that confirms the sum is
+correct is not the same claim as a check that confirms the sum means anything** — the second
+requires knowing that every addend, and the total, denote the same unit (a currency, or a
+percentage, never mixed).
+
+This generalises beyond SPEC-007: any future mechanical check that verifies an arithmetic
+relationship between extracted numbers (a sum, a difference, a ratio) must also verify that
+every number involved shares a unit before treating the arithmetic as meaningful. Verifying
+that 2 + 2 = 4 is not verifying that two apples and two dollars make four of anything.
+
 ---
 
 ## 3. Verified Findings (2026-07-25)
