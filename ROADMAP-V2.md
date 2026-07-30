@@ -106,6 +106,48 @@ labour — the model reads the press release, Python does the comparison.
 
 ---
 
+## SPEC-007 v2 prompt improvements
+
+Found reviewing the first two real AC12 briefs (Amazon's and Micron's most recent 10-Ks,
+2026-07-30) — real weaknesses in the GENERATOR's prompt, not in the verification machinery,
+which caught nothing wrong here because nothing here is wrong: every sentence below is
+accurate and grounded. This is about which TRUE, VERIFIED sentences get written, not about
+fabrication. Parked rather than fixed immediately for the same reason as everything else in
+this file — not designed until actually picked up. **Binding constraint on any future attempt
+at either item: it must raise the connective share (juxtaposition/grouping over restatement)
+without loosening a single R4/R5 verification constraint.** A prompt change that produces
+more connected sentences by relaxing what gets checked is not an improvement.
+
+1. **Prefer cross-type pairings for juxtaposition — an observation with a finding, or a
+   metric with a section — over structural-to-structural.** Amazon's brief paired two
+   `section_wording_changed`/`section_length_change` observations about the SAME note
+   (near-tautological: a note that grew 73% longer is necessarily going to read as less
+   similar to what it replaced) and, separately, paired the length of one note with the
+   wording similarity of an entirely unrelated note (arbitrary — connected only by both
+   surviving R2's selection, not by any real relationship between them). Micron's best
+   juxtaposition, by contrast, connected a note's length change to the substantive
+   litigation finding actually driving it (the Contingencies note growing 25% longer,
+   paired with the $445M Netlist verdict behind it) — real, informative, and not
+   coincidental. The fix is a prompt-level PREFERENCE, never a mechanical requirement
+   (same-type pairings can be genuinely meaningful too, as Micron's SG&A/days-payables
+   juxtaposition shows) — nothing for R4 to enforce here.
+
+2. **Related restatements should merge into one sentence, not stay separate.** Amazon's
+   brief listed the shortened server useful life ($1.0B), the store-impairment charge
+   ($1.3B), and severance costs ($2.7B) as three independent restatements when they are one
+   theme — three distinct charges that reduced 2025 earnings. Likewise, gross margin and
+   operating margin both reaching 6-year highs in the same period were reported as two
+   restatements rather than one. This is exactly what JUXTAPOSITION (or AGGREGATION, for a
+   themed total) already exists to do — the fix is prompting the generator to reach for
+   those types more often, not a new sentence type or a relaxed check.
+
+Both point the same direction: the real run's restatement/juxtaposition/grouping mix
+(70%/19%/10%) should shift toward more of the latter two, entirely at the generator-prompt
+level — R4/R5 already accept everything a better-tuned generator would produce; nothing
+about verification needs to change for either fix.
+
+---
+
 ## Explicitly rejected
 
 | Idea | Why not |
