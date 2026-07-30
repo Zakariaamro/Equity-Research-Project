@@ -14,6 +14,12 @@ dependencies = [
     # alternative but adds a C-extension build dependency for no real gain
     # here since these documents are not huge.
     "beautifulsoup4>=4.12",
+    # SPEC-008: the dashboard. Streamlit is the only web framework SPEC-008
+    # permits; Plotly is the only charting library, needed for evidence-panel
+    # click events (st.plotly_chart(..., on_select=...)) that Streamlit's own
+    # native charts don't expose.
+    "streamlit>=1.51",
+    "plotly>=5.24",
 ]
 
 [project.optional-dependencies]
@@ -22,7 +28,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["edgar*"]
+include = ["edgar*", "dashboard*"]
 
 [build-system]
 requires = ["setuptools>=68"]

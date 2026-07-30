@@ -465,42 +465,100 @@ class MetricDef:
     extreme_informative: bool = True
     headline: bool = True
 
+    # --- SPEC-008 R1: dashboard display metadata ---
+    # No default is ever actually blank in METRIC_REGISTRY below -- every real
+    # entry sets all six (checked at import time, see
+    # _validate_metric_display_metadata) -- but dataclass field ordering
+    # requires defaults here, since the fields above already have them. A
+    # metric missing display metadata fails loudly at import, never renders
+    # as a raw identifier at runtime (SPEC-008 Testing Requirements).
+    display_name: str = ""
+    unit: str = ""  # "percent" | "usd" | "usd_per_share" | "days" | "ratio" | "times"
+    precision: int = 2
+    higher_is_better: bool | None = None
+    group: str = ""  # Growth | Margins | Returns | Capital & Cash | Working Capital | Solvency | Quality
+    description: str = ""
+
 
 METRIC_REGISTRY: dict[str, MetricDef] = {
     # --- Growth ---
-    "revenue_yoy": MetricDef("revenue_yoy", ("revenue",), "both", (-0.9, 10.0), True, "growth"),
-    "revenue_qoq": MetricDef("revenue_qoq", ("revenue",), "quarterly", (-0.9, 10.0), True, "growth"),
+    "revenue_yoy": MetricDef("revenue_yoy", ("revenue",), "both", (-0.9, 10.0), True, "growth",
+        display_name='Revenue growth (YoY)', unit='percent', precision=1,
+        higher_is_better=True, group='Growth',
+        description='Revenue compared to the same period one year earlier.',
+    ),
+    "revenue_qoq": MetricDef("revenue_qoq", ("revenue",), "quarterly", (-0.9, 10.0), True, "growth",
+        display_name='Revenue growth (QoQ)', unit='percent', precision=1,
+        higher_is_better=True, group='Growth',
+        description='Revenue compared to the prior quarter.',
+    ),
     # Range widened -5..5 -> -10..30 live: Micron's memory-cycle earnings swings are
     # genuinely this large, not errors (R6a).
     "operating_income_yoy": MetricDef(
         "operating_income_yoy", ("operating_income",), "both", (-10.0, 30.0), True, "growth"
+    ,
+        display_name='Operating income growth (YoY)', unit='percent', precision=1,
+        higher_is_better=True, group='Growth',
+        description='Operating income compared to the same period one year earlier.',
     ),
     # Range widened -5..5 -> -10..20 live, same reason (R6a).
     "eps_diluted_yoy": MetricDef(
         "eps_diluted_yoy", ("eps_diluted",), "both", (-10.0, 20.0), True, "growth"
+    ,
+        display_name='Diluted EPS growth (YoY)', unit='percent', precision=1,
+        higher_is_better=True, group='Growth',
+        description='Diluted earnings per share compared to the same period one year earlier.',
     ),
     # --- Margins ---
     "gross_margin": MetricDef(
         "gross_margin", ("gross_profit", "revenue", "cogs"), "both", (-1.0, 1.0), False, "margins"
+    ,
+        display_name='Gross margin', unit='percent', precision=1,
+        higher_is_better=True, group='Margins',
+        description='Gross profit as a share of revenue.',
     ),
     "operating_margin": MetricDef(
         "operating_margin", ("operating_income", "revenue"), "both", (-2.0, 1.0), False, "margins"
+    ,
+        display_name='Operating margin', unit='percent', precision=1,
+        higher_is_better=True, group='Margins',
+        description='Operating income as a share of revenue.',
     ),
     "net_margin": MetricDef(
         "net_margin", ("net_income", "revenue"), "both", (-2.0, 1.0), False, "margins"
+    ,
+        display_name='Net margin', unit='percent', precision=1,
+        higher_is_better=True, group='Margins',
+        description='Net income as a share of revenue.',
     ),
     "ebitda": MetricDef(
         "ebitda", ("operating_income", "dep_amort"), "both", None, False, "margins",
         extreme_informative=False, headline=False,
+    
+        display_name='EBITDA', unit='usd', precision=0,
+        higher_is_better=True, group='Margins',
+        description='Operating income plus depreciation and amortization.',
     ),
     "ebitda_margin": MetricDef(
         "ebitda_margin", ("operating_income", "dep_amort", "revenue"), "both", (-2.0, 1.0), False, "margins"
+    ,
+        display_name='EBITDA margin', unit='percent', precision=1,
+        higher_is_better=True, group='Margins',
+        description='EBITDA as a share of revenue.',
     ),
     "rnd_intensity": MetricDef(
         "rnd_intensity", ("rnd_expense", "revenue"), "both", (0.0, 0.6), False, "margins"
+    ,
+        display_name='R&D intensity', unit='percent', precision=1,
+        higher_is_better=None, group='Margins',
+        description='Research and development expense as a share of revenue.',
     ),
     "sga_intensity": MetricDef(
         "sga_intensity", ("sga_expense", "revenue"), "both", (0.0, 0.6), False, "margins"
+    ,
+        display_name='SG&A intensity', unit='percent', precision=1,
+        higher_is_better=False, group='Margins',
+        description='Selling, general and administrative expense as a share of revenue.',
     ),
     # Range deliberately NOT widened for the live outlier (R6a) -- that outlier was a
     # near-zero Δrevenue amplifying noise, not a genuinely extreme value. Guarded via
@@ -512,16 +570,28 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         (-5.0, 5.0),
         True,
         "margins",
+    
+        display_name='Incremental gross margin', unit='percent', precision=1,
+        higher_is_better=True, group='Margins',
+        description='Change in gross profit divided by change in revenue versus the prior period.',
     ),
     # --- Returns ---
     # Range widened -0.5..1.0 -> -3.0..2.0 live: real large negative rates occur (R6a).
     "effective_tax_rate": MetricDef(
         "effective_tax_rate", ("tax_expense", "pretax_income"), "both", (-3.0, 2.0), False, "returns",
         headline=False,
+    
+        display_name='Effective tax rate', unit='percent', precision=1,
+        higher_is_better=None, group='Returns',
+        description='Income tax expense as a share of pre-tax income.',
     ),
     "nopat": MetricDef(
         "nopat", ("operating_income", "tax_expense", "pretax_income"), "both", None, False, "returns",
         extreme_informative=False, headline=False,
+    
+        display_name='NOPAT', unit='usd', precision=0,
+        higher_is_better=True, group='Returns',
+        description='Net operating profit after tax: operating income adjusted for the effective tax rate.',
     ),
     "invested_capital": MetricDef(
         "invested_capital",
@@ -536,6 +606,10 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         "returns",
         extreme_informative=False,
         headline=False,
+    
+        display_name='Invested capital', unit='usd', precision=0,
+        higher_is_better=None, group='Returns',
+        description='Total debt plus equity, net of cash -- the capital base ROIC is measured against.',
     ),
     "roic": MetricDef(
         "roic",
@@ -549,36 +623,80 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         (-2.0, 2.0),
         False,
         "returns",
+    
+        display_name='Return on invested capital', unit='percent', precision=1,
+        higher_is_better=True, group='Returns',
+        description='NOPAT divided by invested capital.',
     ),
-    "roe": MetricDef("roe", ("net_income", "equity"), "both", (-2.0, 2.0), False, "returns"),
+    "roe": MetricDef("roe", ("net_income", "equity"), "both", (-2.0, 2.0), False, "returns",
+        display_name='Return on equity', unit='percent', precision=1,
+        higher_is_better=True, group='Returns',
+        description="Net income divided by shareholders' equity.",
+    ),
     "asset_turnover": MetricDef(
         "asset_turnover", ("revenue", "total_assets"), "both", (0.0, 5.0), False, "returns"
+    ,
+        display_name='Asset turnover', unit='times', precision=2,
+        higher_is_better=True, group='Returns',
+        description='Revenue divided by total assets.',
     ),
     "equity_multiplier": MetricDef(
         "equity_multiplier", ("total_assets", "equity"), "both", (0.0, 20.0), False, "returns"
+    ,
+        display_name='Equity multiplier', unit='times', precision=2,
+        higher_is_better=None, group='Returns',
+        description='Total assets divided by equity -- a measure of financial leverage.',
     ),
     "fixed_asset_turnover": MetricDef(
         "fixed_asset_turnover", ("revenue", "ppe_net", "ppe_and_lease_net"), "both", (0.0, 50.0), False, "returns"
+    ,
+        display_name='Fixed asset turnover', unit='times', precision=2,
+        higher_is_better=True, group='Returns',
+        description='Revenue divided by net property, plant and equipment.',
     ),
     # --- Capital and cash ---
     "capex_to_revenue": MetricDef(
         "capex_to_revenue", ("capex", "revenue"), "both", (0.0, 1.0), False, "capital_cash"
+    ,
+        display_name='Capex to revenue', unit='percent', precision=1,
+        higher_is_better=None, group='Capital & Cash',
+        description='Capital expenditure as a share of revenue.',
     ),
     "capex_to_depreciation": MetricDef(
         "capex_to_depreciation", ("capex", "depreciation", "dep_amort"), "both", (0.0, 10.0), False, "capital_cash"
+    ,
+        display_name='Capex to depreciation', unit='times', precision=2,
+        higher_is_better=None, group='Capital & Cash',
+        description='Capital expenditure divided by depreciation -- above 1x means the asset base is growing.',
     ),
     "free_cash_flow": MetricDef(
         "free_cash_flow", ("cfo", "capex"), "both", None, False, "capital_cash",
         extreme_informative=False,
+    
+        display_name='Free cash flow', unit='usd', precision=0,
+        higher_is_better=True, group='Capital & Cash',
+        description='Cash from operations minus capital expenditure.',
     ),
     "fcf_margin": MetricDef(
         "fcf_margin", ("cfo", "capex", "revenue"), "both", (-2.0, 1.0), False, "capital_cash"
+    ,
+        display_name='FCF margin', unit='percent', precision=1,
+        higher_is_better=True, group='Capital & Cash',
+        description='Free cash flow as a share of revenue.',
     ),
     "fcf_conversion": MetricDef(
         "fcf_conversion", ("cfo", "capex", "net_income"), "both", (-10.0, 10.0), False, "capital_cash"
+    ,
+        display_name='FCF conversion', unit='times', precision=2,
+        higher_is_better=True, group='Capital & Cash',
+        description='Free cash flow divided by net income.',
     ),
     "sbc_to_revenue": MetricDef(
         "sbc_to_revenue", ("sbc", "revenue"), "both", (0.0, 0.6), False, "capital_cash"
+    ,
+        display_name='Stock comp to revenue', unit='percent', precision=1,
+        higher_is_better=False, group='Capital & Cash',
+        description='Stock-based compensation expense as a share of revenue.',
     ),
     "depreciation_rate": MetricDef(
         "depreciation_rate",
@@ -587,16 +705,32 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         (0.0, 1.0),
         False,
         "capital_cash",
+    
+        display_name='Depreciation rate', unit='percent', precision=1,
+        higher_is_better=None, group='Capital & Cash',
+        description='Depreciation divided by gross property, plant and equipment.',
     ),
     # --- Working capital (annual basis only) ---
     "days_inventory": MetricDef(
         "days_inventory", ("inventory", "cogs"), "annual", (0.0, 730.0), False, "working_capital"
+    ,
+        display_name='Days inventory', unit='days', precision=0,
+        higher_is_better=False, group='Working Capital',
+        description='Average days inventory is held before sale.',
     ),
     "days_receivables": MetricDef(
         "days_receivables", ("receivables", "revenue"), "annual", (0.0, 365.0), False, "working_capital"
+    ,
+        display_name='Days receivables', unit='days', precision=0,
+        higher_is_better=False, group='Working Capital',
+        description='Average days to collect a receivable.',
     ),
     "days_payables": MetricDef(
         "days_payables", ("payables", "cogs"), "annual", (0.0, 365.0), False, "working_capital"
+    ,
+        display_name='Days payables', unit='days', precision=0,
+        higher_is_better=True, group='Working Capital',
+        description='Average days taken to pay a supplier.',
     ),
     "cash_conversion_cycle": MetricDef(
         "cash_conversion_cycle",
@@ -605,6 +739,10 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         (-365.0, 730.0),
         False,
         "working_capital",
+    
+        display_name='Cash conversion cycle', unit='days', precision=0,
+        higher_is_better=False, group='Working Capital',
+        description='Days inventory plus days receivables minus days payables.',
     ),
     "inventory_growth_less_revenue_growth": MetricDef(
         "inventory_growth_less_revenue_growth",
@@ -613,6 +751,10 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         (-5.0, 5.0),
         True,
         "working_capital",
+    
+        display_name='Inventory growth vs revenue growth', unit='percent', precision=1,
+        higher_is_better=False, group='Working Capital',
+        description='Year-over-year inventory growth minus year-over-year revenue growth -- positive means inventory is building faster than sales.',
     ),
     # --- Solvency ---
     "net_debt": MetricDef(
@@ -627,6 +769,10 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         False,
         "solvency",
         extreme_informative=False,
+    
+        display_name='Net debt', unit='usd', precision=0,
+        higher_is_better=False, group='Solvency',
+        description='Total debt minus cash and short-term investments.',
     ),
     "net_debt_to_ebitda": MetricDef(
         "net_debt_to_ebitda",
@@ -639,14 +785,26 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         (-20.0, 20.0),
         False,
         "solvency",
+    
+        display_name='Net debt to EBITDA', unit='times', precision=2,
+        higher_is_better=False, group='Solvency',
+        description='Net debt divided by EBITDA -- a common leverage measure.',
     ),
     # Range widened -100..200 -> -200..5000 live: near-zero interest_expense for a
     # low-debt company/quarter makes this ratio legitimately huge (R6a).
     "interest_coverage": MetricDef(
         "interest_coverage", ("operating_income", "interest_expense"), "both", (-200.0, 5000.0), False, "solvency"
+    ,
+        display_name='Interest coverage', unit='times', precision=1,
+        higher_is_better=True, group='Solvency',
+        description='Operating income divided by interest expense.',
     ),
     "current_ratio": MetricDef(
         "current_ratio", ("current_assets", "current_liabilities"), "both", (0.0, 10.0), False, "solvency"
+    ,
+        display_name='Current ratio', unit='times', precision=2,
+        higher_is_better=True, group='Solvency',
+        description='Current assets divided by current liabilities.',
     ),
     # --- Quality: Beneish M-score and its 8 stored components ---
     "beneish_m_score": MetricDef(
@@ -661,16 +819,28 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         (-10.0, 10.0),
         True,
         "quality",
+    
+        display_name='Beneish M-score', unit='ratio', precision=2,
+        higher_is_better=False, group='Quality',
+        description='Composite earnings-manipulation index; above -1.78 is the conventional flag threshold.',
     ),
     # All 8 components: headline=False -- an analyst reads these as
     # beneish_m_score's inputs, not as findings in their own right. Only the
     # composite score is a headline quality signal.
     "beneish_dsri": MetricDef(
         "beneish_dsri", ("receivables", "revenue"), "annual", (0.0, 20.0), True, "quality", headline=False
+    ,
+        display_name='Beneish DSRI', unit='ratio', precision=2,
+        higher_is_better=False, group='Quality',
+        description='Days sales in receivables index -- a Beneish M-score component.',
     ),
     "beneish_gmi": MetricDef(
         "beneish_gmi", ("gross_profit", "revenue", "cogs"), "annual", (-20.0, 20.0), True, "quality",
         headline=False,
+    
+        display_name='Beneish GMI', unit='ratio', precision=2,
+        higher_is_better=False, group='Quality',
+        description='Gross margin index -- a Beneish M-score component.',
     ),
     "beneish_aqi": MetricDef(
         "beneish_aqi",
@@ -680,9 +850,17 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         True,
         "quality",
         headline=False,
+    
+        display_name='Beneish AQI', unit='ratio', precision=2,
+        higher_is_better=False, group='Quality',
+        description='Asset quality index -- a Beneish M-score component.',
     ),
     "beneish_sgi": MetricDef(
         "beneish_sgi", ("revenue",), "annual", (0.0, 20.0), True, "quality", headline=False
+    ,
+        display_name='Beneish SGI', unit='ratio', precision=2,
+        higher_is_better=False, group='Quality',
+        description='Sales growth index -- a Beneish M-score component.',
     ),
     "beneish_depi": MetricDef(
         "beneish_depi",
@@ -692,9 +870,17 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         True,
         "quality",
         headline=False,
+    
+        display_name='Beneish DEPI', unit='ratio', precision=2,
+        higher_is_better=False, group='Quality',
+        description='Depreciation index -- a Beneish M-score component.',
     ),
     "beneish_sgai": MetricDef(
         "beneish_sgai", ("sga_expense", "revenue"), "annual", (-20.0, 20.0), True, "quality", headline=False
+    ,
+        display_name='Beneish SGAI', unit='ratio', precision=2,
+        higher_is_better=False, group='Quality',
+        description='SG&A expense index -- a Beneish M-score component.',
     ),
     "beneish_lvgi": MetricDef(
         "beneish_lvgi",
@@ -708,13 +894,44 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         True,
         "quality",
         headline=False,
+    
+        display_name='Beneish LVGI', unit='ratio', precision=2,
+        higher_is_better=False, group='Quality',
+        description='Leverage index -- a Beneish M-score component.',
     ),
     "beneish_tata": MetricDef(
         # The one Beneish index computed from a single period -- no t-1 comparison.
         "beneish_tata", ("net_income", "cfo", "total_assets"), "annual", (-2.0, 2.0), False, "quality",
         headline=False,
+    
+        display_name='Beneish TATA', unit='ratio', precision=2,
+        higher_is_better=False, group='Quality',
+        description='Total accruals to total assets -- a Beneish M-score component.',
     ),
 }
+
+
+def _validate_metric_display_metadata() -> None:
+    """SPEC-008 R1: a metric without display metadata must fail loudly at
+    import, never render as a raw identifier at runtime (Testing
+    Requirements: `test_metric_registry_display_fields_present_for_every_metric`).
+    Runs here, at config.py import time, rather than only when metrics.py or
+    a dashboard module happens to import it first -- the invariant must hold
+    regardless of import order."""
+    _valid_units = {"percent", "usd", "usd_per_share", "days", "ratio", "times"}
+    _valid_groups = {"Growth", "Margins", "Returns", "Capital & Cash", "Working Capital", "Solvency", "Quality"}
+    for _name, _mdef in METRIC_REGISTRY.items():
+        if not _mdef.display_name:
+            raise RuntimeError(f"Metric {_name!r} has no display_name (SPEC-008 R1)")
+        if _mdef.unit not in _valid_units:
+            raise RuntimeError(f"Metric {_name!r} has unit {_mdef.unit!r}, not one of {sorted(_valid_units)}")
+        if _mdef.group not in _valid_groups:
+            raise RuntimeError(f"Metric {_name!r} has group {_mdef.group!r}, not one of {sorted(_valid_groups)}")
+        if not _mdef.description:
+            raise RuntimeError(f"Metric {_name!r} has no description (SPEC-008 R1)")
+
+
+_validate_metric_display_metadata()
 
 # Metrics that need a prior-year (annual) or prior-quarter (quarterly) period.
 BENEISH_METRIC_NAMES: tuple[str, ...] = (

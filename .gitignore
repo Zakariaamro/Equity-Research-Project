@@ -7,3 +7,5 @@ venv/
 .pytest_cache/
 .claude/
 data/*.bak
+# SPEC-008: dashboard password, per-deployment -- never committed.
+.streamlit/secrets.toml
