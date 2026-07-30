@@ -1,6 +1,6 @@
 # SPEC-007 — The Grounded Brief
 
-**Version:** 2.1
+**Version:** 2.2 (complete)
 **For:** Claude Code
 **Depends on:** SPEC-006 (complete, commit `7a170da`)
 **Reference:** `ARCHITECTURE.md` — sections 2, 6; SPEC-005 R11
@@ -8,7 +8,39 @@
 **Estimated API cost:** ~$0.50 for all 18 in-window filings (two passes per brief) — a
 real-data simulation against Amazon's and Micron's most recent 10-Ks (2026-07-30 pre-
 implementation review) measured ~$0.017/brief, ~$0.30–0.35 total; the stated figure keeps
-real margin, not a tight fit.
+real margin, not a tight fit. **Actual full-run cost: $0.5250** (see v2.2) — slightly OVER
+the ~$0.50 estimate stated above, not under it: real briefs ran far longer per filing (8–15
+kept sentences, never the stated 3–6) than the pre-implementation sample suggested, which is
+exactly why the "real margin" claim above did not hold in practice. See v2.2 for the full
+account -- this is reported, not smoothed over.
+
+**Changelog**
+- v2.2 — Full run executed against all 18 in-window filings (2026-07-30). All three demos
+  (`test_verifier_pass_rejects_fabricated_causal_claim`,
+  `test_aggregation_with_wrong_sum_dropped`, `test_aggregation_with_mismatched_units_dropped`)
+  passed against fakes before any real call, per the standing rule. Real results: 18 briefs,
+  243 sentences returned by the generator, 204 kept, 19 dropped at R4, 20 dropped by the
+  verifier. Actual cost $0.5250 (lifetime spend $6.9042 of the $8.50 cap) — about 1.8× the
+  $0.2905 dry-run estimate. **Two real findings, reported per this spec's own "Notes for the
+  Implementer" (report discrepancies, don't silently tune around them) — neither fixed here,
+  since AC12's demonstration explicitly must not be tuned:**
+  1. **Every one of the 18 briefs ignored the "3 to 6 sentences" instruction (R3)** — kept
+     counts ranged 8–15 per brief (mean ~11.3), never once landing in the stated range. This
+     is the direct cause of the cost overrun: `BRIEF_ESTIMATED_GENERATOR_OUTPUT_TOKENS`/
+     `BRIEF_ESTIMATED_VERIFIER_OUTPUT_TOKENS` were calibrated (pre-implementation review)
+     against real output that itself undercounted how many sentences a real full run would
+     produce, since that review measured raw API behavior on a token-count basis, not
+     sentence-count adherence to R3's own stated limit.
+  2. **Sentence-type distribution is heavily skewed toward `restatement`**: 143 of 204 kept
+     (70%), `juxtaposition` 39 (19%), `grouping` 20 (10%), `sourced_causal` 1, `aggregation`
+     1. `sourced_causal`'s rarity was predicted (v1.2/v2.1 changelog) and confirmed exactly.
+     `aggregation`'s rarity was not predicted and is worth noting: real filings apparently
+     offer few opportunities for a clean same-unit sum the generator reaches for, at least
+     under a prompt that never explicitly prioritizes finding one. The real AC12 briefs (see
+     `ARCHITECTURE.md` §2.5's neighbor entry) read as genuinely useful, verbatim-grounded
+     prose, not merely "a list" — but a v2 generator prompt should be judged on whether it
+     can raise the `juxtaposition`/`grouping` share without fabricating connections, and
+     whether it can be made to actually respect the sentence-count bound.
 
 **Changelog**
 - v2.1 — Pre-implementation review against real data (2026-07-30), before writing `brief.py`.

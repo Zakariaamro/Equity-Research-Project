@@ -1,11 +1,22 @@
 # Equity Research Platform — Architecture
 
-**Version:** 2.7
-**Date:** 2026-07-28
+**Version:** 2.8
+**Date:** 2026-07-30
 **Owner:** Zakaria
-**Status:** Approved for V1 implementation — SPEC-006 complete
+**Status:** Approved for V1 implementation — SPEC-006 and SPEC-007 complete
 
 **Changelog**
+- v2.8 — SPEC-007 (The Grounded Brief) complete (decision log #51): capped/ranked
+  observation+finding selection (R2 v2.1's diversity fixes), typed-sentence generation with
+  per-type mechanical verification (R4, including the unit-aware aggregation check, §2.5),
+  and an independent adversarial verifier pass (R5) — all built and tested against fakes
+  first, including all three required pre-execution demonstrations. Full run: 18 briefs, 243
+  sentences returned, 204 kept (restatement 70%, juxtaposition 19%, grouping 10%,
+  sourced_causal/aggregation ~0.5% each), 19 dropped at the type check, 20 dropped by the
+  verifier. Actual cost $0.5250 — slightly over the ~$0.50 estimate, because every brief
+  ignored the prompt's "3 to 6 sentences" instruction (8–15 kept per brief, never once in
+  range) -- reported as a real finding for a future prompt version, not tuned around, per
+  AC12's "do not tune to improve them."
 - v2.7 — SPEC-006 complete (decision log #50): remaining 17 sections executed after the
   thinking-disable fix, zero truncations and zero errors in the batch. Full corpus: 273/273
   sections analysed, 253 findings (NVDA 92, AMZN 81, MU 80; litigation 71, note_item 59,
@@ -1395,3 +1406,4 @@ without either being lost or quietly expanding V1's scope in the meantime.
 | 48 | `thinking={"type": "disabled"}` now sent explicitly on every real call (`_RealAnthropicClient.messages_create`) — applied, not just measured | Directly acts on #47's measurement. Not a cache-invalidating change: `compute_input_hash` covers content the model sees (prompt, model, prompt version), never request configuration, so the 257 analyses already cached under adaptive thinking remain valid cache hits — a deliberate policy, not an oversight (§4.3) | 2026-07-28 |
 | 49 | Numeric-support checker gained two tiers: ordinal-word normalisation ("fourth" → "4", numeric-support-only, never `verify_quote`) and derived-sum verification (an absent number that is a correct subset-sum of the quote's own numbers → `derived_verified`, distinct from `unsupported`) | Both found live reviewing the 6 real unsupported-token findings from the 2026-07-28 run: 5 of 6 were the model correctly summing disclosed percentages (real evidence a presence-only checker cannot distinguish from a wrong-looking sum, which is the actually dangerous case); 1 of 6 was "Q4" vs. the source's spelled-out "fourth quarter" — a checker artifact, not a real ungrounded number. `NUMERIC_SUPPORT_ENFORCE` stays False either way — this improves what the metric MEASURES, not whether it discards (§4.3) | 2026-07-28 |
 | 50 | SPEC-006 complete: remaining 17 sections executed after the thinking-disable fix | Zero truncations, zero errors in the batch — direct confirmation of decision log #47/#48's fix under real, additional load, not just the original 4-section probe. Full corpus: 273/273 sections analysed, 253 findings, $6.3792 of the re-aligned $8.50 budget spent, `validate` exits 0 | 2026-07-28 |
+| 51 | SPEC-007 (The Grounded Brief) complete | Full run: 18 briefs, 204 kept sentences (restatement 70%, juxtaposition 19%, grouping 10%, sourced_causal/aggregation ~0.5% each), 19 dropped at the R4 type check, 20 dropped by the R5 verifier. Cost $0.5250, ~1.8x the $0.2905 dry-run estimate — every brief ignored the "3-6 sentences" instruction (8-15 kept per brief, always), which is the direct cause; reported as a real finding for a future prompt version, not silently tuned around (SPEC-007 v2.2, AC12's "do not tune to improve them") | 2026-07-30 |

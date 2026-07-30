@@ -1409,3 +1409,105 @@ LLM_ESTIMATED_OUTPUT_TOKENS: int = 1024
 # practice. Estimated via CHARS_PER_TOKEN_ESTIMATE, same method as
 # estimate_cost.
 LLM_MAX_INPUT_TOKENS_ESTIMATE: int = 150_000
+
+# --- SPEC-007: The Grounded Brief ---
+
+# R2: input selection caps. Ranking and slot/cap logic itself lives in
+# brief.py -- these are the numeric limits only, matching the
+# config.py/engine split already established (CONCEPT_REGISTRY/xbrl.py,
+# RULE_REGISTRY/observations.py).
+BRIEF_MAX_OBSERVATIONS: int = 8
+BRIEF_MAX_FINDINGS: int = 8
+
+# R2 v2.1: for a metric-subject rule, the slot is (rule_name, metric_category)
+# -- config.METRIC_REGISTRY[subject].category, SPEC-005's existing field --
+# capped at this many; for a section-subject rule the slot is (rule_name,)
+# alone (SPEC-005 R11's original form, unchanged -- no metric-category
+# concept for a note name). Found live, pre-implementation: a flat "2 per
+# rule_name" treated metric_multi_year_extreme's ~30 metrics across 7
+# categories as one thing, and silently dropped whole categories
+# (working_capital, returns) from a real Amazon 10-K's selection.
+BRIEF_OBSERVATION_SLOT_CAP: int = 2
+
+# R2 v2.1: regardless of how many distinct (rule, category) slots a single
+# rule_name contributes across, it may never supply more than this many of
+# BRIEF_MAX_OBSERVATIONS. Binding only for a metric-subject rule touching 3+
+# categories in one filing -- a section-subject rule's slot cap of 2 already
+# satisfies this trivially.
+BRIEF_OBSERVATION_RULE_CEILING: int = 4
+
+# R2 v2.1: mirrors the observation slot cap, one layer up -- findings have no
+# rule_name (they come from the LLM, not a deterministic rule), so the
+# diversity dimension is `category` directly. Found live: uncapped, Amazon's
+# real most-recent 10-K selected 8 of 8 findings from category="litigation",
+# excluding the filing's only red_flag finding entirely -- the second time in
+# this project a ranking with no diversity constraint has collapsed onto
+# whichever dimension happened to be over-represented (the first was SPEC-005
+# R11, for observations, for the identical structural reason).
+BRIEF_MAX_FINDINGS_PER_CATEGORY: int = 2
+
+# R2 v2.1: severity descending, then id ascending -- expressed directly as a
+# SQL CASE expression in brief.py's ORDER BY clauses, not as a Python dict
+# here (a literal SQL CASE is the actual mechanism; nothing in brief.py
+# consumes this ranking as a Python value). A reproducibility rule, not a
+# claim that a lower id is more analytically important -- stated explicitly
+# so the SAME filing selects an IDENTICAL set on every run (R1's input_hash
+# is computed over the rendered prompt, which embeds whichever set was
+# selected; a non-deterministic tie-break would hash the same logical
+# question differently run to run, and the cache would stop meaning
+# anything).
+
+# R3/R4: the only sentence types a stored brief_sentences.sentence_type may
+# hold -- an unrecognised type is dropped in code (R4), never persisted.
+BRIEF_SENTENCE_TYPES: frozenset[str] = frozenset(
+    {"restatement", "juxtaposition", "aggregation", "grouping", "sourced_causal"}
+)
+BRIEF_MIN_SENTENCES: int = 3
+BRIEF_MAX_SENTENCES: int = 6
+
+# R4: causal connectives -- a cited SOURCE must contain one of these for a
+# `sourced_causal` sentence to survive; a sentence of any OTHER type
+# containing one is dropped (stating a cause outside the one type built to
+# carry it). Deliberately a fixed list, not a model judgement call.
+BRIEF_CAUSAL_CONNECTIVES: tuple[str, ...] = (
+    "because", "due to", "driven by", "as a result of", "caused by",
+    "owing to", "reflecting", "attributable to", "stemming from",
+)
+
+# R4: predictive/modal constructions -- any sentence containing one is
+# dropped regardless of declared type. "No fabricated narrative is worth
+# more than having a narrative at all" (Objective) applies hardest here.
+BRIEF_PREDICTIVE_TERMS: tuple[str, ...] = (
+    "will", "expects", "likely", "suggests", "indicates", "points to", "implies",
+)
+
+# R3: prompt file identity, versioned per the same convention as SPEC-006
+# (a prompt change is a new version file, never an edit to an existing one).
+BRIEF_GENERATOR_PROMPT_NAME: str = "filing_brief"
+BRIEF_GENERATOR_PROMPT_VERSION: str = "v1"
+
+# R5: the adversarial verifier pass has its OWN version, independent of the
+# generator's prompt_version -- R1: "a change to the verifier can change
+# which sentences survive, so it changes the output," and `input_hash`
+# includes it for exactly that reason.
+BRIEF_VERIFIER_PROMPT_NAME: str = "brief_verifier"
+BRIEF_VERIFIER_VERSION: str = "v1"
+
+# Output caps. Deliberately much smaller than SPEC-006's LLM_MAX_OUTPUT_TOKENS
+# (4096, sized for section-analysis's long verbatim quotes) -- a brief is
+# 3-6 short sentences of JSON, and the verifier's response is a compact
+# per-sentence verdict list. Real-data pre-implementation review (2026-07-30)
+# measured generator output ~400-600 tokens and verifier output ~150-300
+# tokens for Amazon's and Micron's real most-recent 10-Ks; these caps keep
+# generous headroom above that without inheriting SPEC-006's truncation
+# history at a much larger size.
+BRIEF_MAX_OUTPUT_TOKENS: int = 2048
+BRIEF_VERIFIER_MAX_OUTPUT_TOKENS: int = 1024
+
+# What --dry-run assumes a call will actually EMIT, as distinct from the caps
+# above -- same asymmetry as LLM_ESTIMATED_OUTPUT_TOKENS vs
+# LLM_MAX_OUTPUT_TOKENS (SPEC-006): a dry-run estimate should reflect real
+# expected usage, not the defensive ceiling. From the same real-data
+# measurement above.
+BRIEF_ESTIMATED_GENERATOR_OUTPUT_TOKENS: int = 500
+BRIEF_ESTIMATED_VERIFIER_OUTPUT_TOKENS: int = 250

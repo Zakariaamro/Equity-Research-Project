@@ -14,6 +14,7 @@ from datetime import date
 from pathlib import Path
 
 from edgar import analyze as analyze_mod
+from edgar import brief as brief_mod
 from edgar import config
 from edgar import llm as llm_mod
 from edgar import metrics as metrics_mod
@@ -52,6 +53,12 @@ class ValidationReport:
     llm_quote_integrity_violations: list[dict] = field(default_factory=list)
     llm_discard_rate: list[dict] = field(default_factory=list)
     llm_numeric_support: list[dict] = field(default_factory=list)
+    brief_orphan_refs: list[dict] = field(default_factory=list)
+    brief_cross_filing_refs: list[dict] = field(default_factory=list)
+    brief_invalid_types: list[dict] = field(default_factory=list)
+    brief_reverification_failures: list[dict] = field(default_factory=list)
+    brief_empty: list[dict] = field(default_factory=list)
+    brief_drop_rates: list[dict] = field(default_factory=list)
 
     @property
     def hard_failure_count(self) -> int:
@@ -69,6 +76,10 @@ class ValidationReport:
             + (1 if self.llm_budget.get("over_budget") else 0)
             + len(self.llm_orphan_findings)
             + len(self.llm_quote_integrity_violations)
+            + len(self.brief_orphan_refs)
+            + len(self.brief_cross_filing_refs)
+            + len(self.brief_invalid_types)
+            + len(self.brief_reverification_failures)
         )
 
 
@@ -1041,6 +1052,184 @@ def _check_llm_discard_rate(conn: sqlite3.Connection) -> list[dict]:
     return findings
 
 
+# --- SPEC-007: The Grounded Brief (R7) ---
+
+
+def _check_brief_orphan_references(conn: sqlite3.Connection) -> list[dict]:
+    """Hard failure (R7): every reference in every stored sentence must
+    resolve to a live observation or finding row. A model cannot cite what
+    does not exist, and this must still hold true after the fact -- R4's
+    write-time check is not assumed to be the only thing keeping this true."""
+    violations = []
+    for row in conn.execute("SELECT id, brief_id, refs_json FROM brief_sentences"):
+        refs = json.loads(row["refs_json"])
+        for ref in refs:
+            parsed = brief_mod.parse_ref(ref)
+            if parsed is None:
+                violations.append({"sentence_id": row["id"], "brief_id": row["brief_id"], "ref": ref, "problem": "malformed ref"})
+                continue
+            kind, id_ = parsed
+            table = "observations" if kind == "obs" else "findings"
+            exists = conn.execute(f"SELECT 1 FROM {table} WHERE id = ?", (id_,)).fetchone()
+            if not exists:
+                violations.append(
+                    {"sentence_id": row["id"], "brief_id": row["brief_id"], "ref": ref, "problem": f"no such {table} row"}
+                )
+    return violations
+
+
+def _check_brief_cross_filing_references(conn: sqlite3.Connection) -> list[dict]:
+    """Hard failure (R7): no sentence may cite a source from a DIFFERENT
+    filing than the brief it belongs to -- R2's whole selection is scoped to
+    one filing's accession_no; a cross-filing reference means either a
+    selection bug or a resolved-but-wrong reference slipped through."""
+    violations = []
+    rows = conn.execute(
+        "SELECT bs.id AS sentence_id, bs.brief_id, bs.refs_json, b.accession_no "
+        "FROM brief_sentences bs JOIN briefs b ON b.id = bs.brief_id"
+    ).fetchall()
+    for row in rows:
+        refs = json.loads(row["refs_json"])
+        for ref in refs:
+            parsed = brief_mod.parse_ref(ref)
+            if parsed is None:
+                continue  # already caught by the orphan-reference check
+            kind, id_ = parsed
+            table = "observations" if kind == "obs" else "findings"
+            source_row = conn.execute(f"SELECT accession_no FROM {table} WHERE id = ?", (id_,)).fetchone()
+            if source_row is not None and source_row["accession_no"] != row["accession_no"]:
+                violations.append(
+                    {
+                        "sentence_id": row["sentence_id"], "brief_id": row["brief_id"], "ref": ref,
+                        "brief_accession_no": row["accession_no"], "source_accession_no": source_row["accession_no"],
+                    }
+                )
+    return violations
+
+
+def _check_brief_sentence_type_validity(conn: sqlite3.Connection) -> list[dict]:
+    """Hard failure (R7): every stored sentence_type must be one of the five
+    permitted values -- R4 drops an unrecognised type before it is ever
+    written, so any row failing this means corruption, not a live model
+    response."""
+    violations = []
+    for row in conn.execute("SELECT id, brief_id, sentence_type FROM brief_sentences"):
+        if row["sentence_type"] not in config.BRIEF_SENTENCE_TYPES:
+            violations.append({"sentence_id": row["id"], "brief_id": row["brief_id"], "sentence_type": row["sentence_type"]})
+    return violations
+
+
+def _source_text_for_row(kind: str, row: dict) -> str:
+    """Same construction as brief._source_text -- duplicated rather than
+    imported (that name is private to brief.py), matching this project's
+    established convention of small per-module formatting helpers."""
+    if kind == "obs":
+        return row["statement"]
+    return f"{row['headline']} {row['detail'] or ''} {row['quote'] or ''}"
+
+
+def _check_brief_reverification(conn: sqlite3.Connection) -> list[dict]:
+    """Hard failure (R7): re-run R4's per-type mechanical checks against
+    every STORED sentence, resolving each cited ref to its CURRENT text
+    (not re-doing R2's selection, which could have legitimately changed
+    since generation -- only whether the stored sentence itself still
+    passes its own declared type's rules against its own cited sources).
+    Any failure means corruption: a bad sentence was persisted despite R4,
+    or an underlying observation/finding's text changed underneath it."""
+    violations = []
+    for row in conn.execute("SELECT id, brief_id, sentence_type, text, refs_json FROM brief_sentences"):
+        refs = json.loads(row["refs_json"])
+        supplied_index: dict[str, dict] = {}
+        unresolved = False
+        for ref in refs:
+            parsed = brief_mod.parse_ref(ref)
+            if parsed is None:
+                unresolved = True
+                break
+            kind, id_ = parsed
+            table = "observations" if kind == "obs" else "findings"
+            source_row = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (id_,)).fetchone()
+            if source_row is None:
+                unresolved = True
+                break
+            supplied_index[ref] = {"kind": kind, "row": dict(source_row), "text": _source_text_for_row(kind, dict(source_row))}
+        if unresolved:
+            continue  # already caught by the orphan-reference check
+        sentence = {"type": row["sentence_type"], "text": row["text"], "refs": refs}
+        kept, reason = brief_mod.verify_sentence(sentence, supplied_index)
+        if not kept:
+            violations.append({"sentence_id": row["id"], "brief_id": row["brief_id"], "reason": reason})
+    return violations
+
+
+def _check_brief_empty(conn: sqlite3.Connection) -> list[dict]:
+    """Informational (R7): every brief with zero stored sentences, and why --
+    "Do not pay to be told nothing happened" made no call at all (no
+    observations/findings supplied); a real call producing zero surviving
+    sentences means the generator, R4, or the verifier discarded everything.
+    A quiet quarter is legitimate; this is reported, never a failure."""
+    rows = conn.execute(
+        """
+        SELECT b.id AS brief_id, b.accession_no, b.prompt_version, b.verifier_version,
+               b.generator_dropped, b.verifier_dropped, b.call_id,
+               (SELECT COUNT(*) FROM brief_sentences bs WHERE bs.brief_id = b.id) AS n_sentences
+        FROM briefs b
+        """
+    ).fetchall()
+    empties = []
+    for row in rows:
+        if row["n_sentences"] > 0:
+            continue
+        reason = "no observations or findings supplied" if row["call_id"] is None else (
+            f"all sentences dropped (generator={row['generator_dropped']}, verifier={row['verifier_dropped']})"
+        )
+        empties.append(
+            {
+                "brief_id": row["brief_id"], "accession_no": row["accession_no"],
+                "prompt_version": row["prompt_version"], "verifier_version": row["verifier_version"], "reason": reason,
+            }
+        )
+    return empties
+
+
+def _check_brief_drop_rates(conn: sqlite3.Connection) -> list[dict]:
+    """Informational (R7): generator-side and verifier-side drop rates, per
+    (prompt_version, verifier_version). A rising generator rate means the
+    generator got looser; a persistently zero verifier rate over many
+    briefs means the verifier is not actually adversarial and should be
+    checked with a deliberately bad sentence (R5)."""
+    rows = conn.execute(
+        """
+        SELECT b.prompt_version, b.verifier_version, b.generator_dropped, b.verifier_dropped,
+               (SELECT COUNT(*) FROM brief_sentences bs WHERE bs.brief_id = b.id) AS kept_count
+        FROM briefs b WHERE b.call_id IS NOT NULL
+        """
+    ).fetchall()
+    totals: dict[tuple[str, str], dict[str, int]] = {}
+    for row in rows:
+        key = (row["prompt_version"], row["verifier_version"])
+        bucket = totals.setdefault(key, {"generator_dropped": 0, "verifier_dropped": 0, "kept": 0, "briefs": 0})
+        bucket["generator_dropped"] += row["generator_dropped"]
+        bucket["verifier_dropped"] += row["verifier_dropped"]
+        bucket["kept"] += row["kept_count"]
+        bucket["briefs"] += 1
+    results = []
+    for (prompt_version, verifier_version), d in sorted(totals.items()):
+        survived_r4 = d["kept"] + d["verifier_dropped"]
+        raw_total = survived_r4 + d["generator_dropped"]
+        results.append(
+            {
+                "prompt_version": prompt_version, "verifier_version": verifier_version, "briefs": d["briefs"],
+                "raw_sentences": raw_total, "generator_dropped": d["generator_dropped"],
+                "generator_drop_rate": (d["generator_dropped"] / raw_total) if raw_total else None,
+                "survived_r4": survived_r4, "verifier_dropped": d["verifier_dropped"],
+                "verifier_drop_rate": (d["verifier_dropped"] / survived_r4) if survived_r4 else None,
+                "kept": d["kept"],
+            }
+        )
+    return results
+
+
 def run_validate(conn: sqlite3.Connection, tickers: list[str] | None = None) -> ValidationReport:
     return ValidationReport(
         range_violations=_check_range_violations(conn, tickers),
@@ -1072,6 +1261,12 @@ def run_validate(conn: sqlite3.Connection, tickers: list[str] | None = None) -> 
         llm_quote_integrity_violations=_check_llm_quote_integrity(conn),
         llm_discard_rate=_check_llm_discard_rate(conn),
         llm_numeric_support=_check_llm_numeric_support(conn),
+        brief_orphan_refs=_check_brief_orphan_references(conn),
+        brief_cross_filing_refs=_check_brief_cross_filing_references(conn),
+        brief_invalid_types=_check_brief_sentence_type_validity(conn),
+        brief_reverification_failures=_check_brief_reverification(conn),
+        brief_empty=_check_brief_empty(conn),
+        brief_drop_rates=_check_brief_drop_rates(conn),
     )
 
 
@@ -1266,10 +1461,46 @@ def format_report(report: ValidationReport) -> str:
         f"but LLM_PRICING still shows input_per_mtok={v['current_input_per_mtok']} -- bump to the standard "
         "$3.00/$15.00 rate",
     )
+    _section(
+        "27. Brief orphan references (every ref must resolve to a live observation/finding)",
+        report.brief_orphan_refs,
+        lambda v: f"sentence_id={v['sentence_id']} brief_id={v['brief_id']} ref={v['ref']!r}: {v['problem']}",
+    )
+    _section(
+        "28. Brief cross-filing references (no sentence may cite another filing's source)",
+        report.brief_cross_filing_refs,
+        lambda v: f"sentence_id={v['sentence_id']} brief_id={v['brief_id']} ref={v['ref']!r}: "
+        f"brief is for {v['brief_accession_no']}, source belongs to {v['source_accession_no']}",
+    )
+    _section(
+        "29. Brief sentence type validity (every stored type must be one of the five permitted)",
+        report.brief_invalid_types,
+        lambda v: f"sentence_id={v['sentence_id']} brief_id={v['brief_id']}: unrecognised type {v['sentence_type']!r}",
+    )
+    _section(
+        "30. Brief re-verification (R4's checks re-run against stored sentences)",
+        report.brief_reverification_failures,
+        lambda v: f"sentence_id={v['sentence_id']} brief_id={v['brief_id']}: {v['reason']}",
+    )
+    _section(
+        "31. Empty briefs (informational -- a quiet quarter is legitimate)",
+        report.brief_empty,
+        lambda v: f"accession_no={v['accession_no']} brief_id={v['brief_id']} ({v['prompt_version']}/{v['verifier_version']}): {v['reason']}",
+    )
+    _section(
+        "32. Brief drop rates (informational, generator-side and verifier-side, by prompt/verifier version)",
+        report.brief_drop_rates,
+        lambda v: f"{v['prompt_version']}/{v['verifier_version']} ({v['briefs']} brief(s)): "
+        f"generator dropped {v['generator_dropped']}/{v['raw_sentences']} "
+        + (f"({v['generator_drop_rate']:.0%})" if v["generator_drop_rate"] is not None else "(no sentences)")
+        + f"; verifier dropped {v['verifier_dropped']}/{v['survived_r4']} "
+        + (f"({v['verifier_drop_rate']:.0%})" if v["verifier_drop_rate"] is not None else "(none survived R4)")
+        + f"; kept {v['kept']}",
+    )
 
     lines.append(
         f"\n{report.hard_failure_count} finding(s) in hard-failing categories "
-        "(1, 2, 3, 4, 5, 6, 14, 15, 16, 19, 20, 21, 22) -- would exit non-zero."
+        "(1, 2, 3, 4, 5, 6, 14, 15, 16, 19, 20, 21, 22, 27, 28, 29, 30) -- would exit non-zero."
         if report.hard_failure_count
         else "\nAll hard-failing categories clean."
     )

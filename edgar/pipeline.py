@@ -7,12 +7,13 @@ the project belong here -- library modules only log.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import shutil
 import sqlite3
 import sys
 
-from edgar import analyze, config, db, fetch, llm, metrics, monitor, observations, section_store, sections, validate, xbrl
+from edgar import analyze, brief, config, db, fetch, llm, metrics, monitor, observations, section_store, sections, validate, xbrl
 from edgar.edgar_client import EdgarClient
 from edgar.monitor import DiscoveredFiling
 
@@ -471,6 +472,157 @@ def cmd_spend(args: argparse.Namespace) -> None:
         conn.close()
 
 
+def _print_brief_cache_impact(stats: brief.BriefRunStats) -> None:
+    """SPEC-006A L5, applied to briefs: reported before every run, execute
+    or dry-run alike."""
+    print(
+        f"  cache: {stats.cache_hits_dry} hit(s), {stats.new_calls_dry} new call(s), "
+        f"no observations/findings (no cost): {stats.empty_no_input_dry}, "
+        f"estimated cost of new calls: ${stats.estimated_cost_usd:.4f}"
+    )
+    if stats.version_bumped:
+        print(
+            f"  prompt/verifier version changed since last run "
+            f"(prior prompt version(s): {', '.join(stats.prior_prompt_versions) or '-'}, "
+            f"current: {config.BRIEF_GENERATOR_PROMPT_VERSION}; "
+            f"prior verifier version(s): {', '.join(stats.prior_verifier_versions) or '-'}, "
+            f"current: {config.BRIEF_VERIFIER_VERSION}): "
+            f"{stats.invalidated_by_version_bump} previously-cached brief(s) invalidated, "
+            f"${stats.invalidated_cost_usd:.4f} to regenerate"
+        )
+
+
+def cmd_generate_briefs(args: argparse.Namespace) -> None:
+    tickers = None
+    if args.ticker:
+        _validate_ticker(args.ticker)
+        tickers = [args.ticker]
+
+    conn = db.get_connection()
+    try:
+        # SPEC-006A: dry-run pass first, execute or not -- makes zero calls,
+        # no spend, either way.
+        dry_stats = brief.run_brief_generation(conn, tickers=tickers, accession=args.accession, execute=False)
+        print(f"[DRY RUN] {dry_stats.candidates} candidate filing(s), {dry_stats.processed} selected.")
+        _print_brief_cache_impact(dry_stats)
+
+        if not args.execute:
+            return
+
+        # L4: confirmation gate, unchanged from analyze-sections.
+        estimate = dry_stats.estimated_cost_usd
+        if estimate > config.LLM_CONFIRM_THRESHOLD_USD:
+            if args.confirm_cost is None:
+                llm.record_refusal(
+                    conn,
+                    f"L4: estimated cost ${estimate:.4f} exceeds confirmation threshold "
+                    f"${config.LLM_CONFIRM_THRESHOLD_USD:.2f} and no --confirm-cost was given",
+                    prompt_name=config.BRIEF_GENERATOR_PROMPT_NAME,
+                    prompt_version=config.BRIEF_GENERATOR_PROMPT_VERSION,
+                )
+                raise SystemExit(
+                    f"Refusing: estimated cost ${estimate:.4f} exceeds the "
+                    f"${config.LLM_CONFIRM_THRESHOLD_USD:.2f} confirmation threshold. "
+                    f"Re-run with --confirm-cost {estimate:.4f} to proceed."
+                )
+            tolerance = _confirm_cost_tolerance(estimate)
+            if abs(args.confirm_cost - estimate) > tolerance:
+                llm.record_refusal(
+                    conn,
+                    f"L4: --confirm-cost {args.confirm_cost:.4f} does not match dry-run estimate "
+                    f"${estimate:.4f} (tolerance ${tolerance:.4f})",
+                    prompt_name=config.BRIEF_GENERATOR_PROMPT_NAME,
+                    prompt_version=config.BRIEF_GENERATOR_PROMPT_VERSION,
+                )
+                raise SystemExit(
+                    f"Refusing: --confirm-cost {args.confirm_cost:.4f} does not match the current "
+                    f"dry-run estimate of ${estimate:.4f} (tolerance ${tolerance:.4f}). "
+                    "Re-read the estimate above and pass it exactly."
+                )
+
+        # L5: cache-invalidation acknowledgement gate.
+        if (
+            dry_stats.invalidated_by_version_bump > config.LLM_CACHE_INVALIDATION_WARN
+            and not args.acknowledge_cache_invalidation
+        ):
+            llm.record_refusal(
+                conn,
+                f"L5: prompt/verifier version bump invalidates {dry_stats.invalidated_by_version_bump} "
+                f"previously-cached brief(s) (> {config.LLM_CACHE_INVALIDATION_WARN}), costing "
+                f"${dry_stats.invalidated_cost_usd:.4f} to regenerate, and --acknowledge-cache-invalidation "
+                "was not given",
+                prompt_name=config.BRIEF_GENERATOR_PROMPT_NAME,
+                prompt_version=config.BRIEF_GENERATOR_PROMPT_VERSION,
+            )
+            raise SystemExit(
+                f"Refusing: this run would invalidate {dry_stats.invalidated_by_version_bump} previously-cached "
+                f"briefs (${dry_stats.invalidated_cost_usd:.4f} to regenerate). "
+                "Re-run with --acknowledge-cache-invalidation to proceed."
+            )
+
+        client = llm.LLMClient()
+
+        stats = brief.run_brief_generation(
+            conn, tickers=tickers, accession=args.accession, execute=True, client=client,
+        )
+
+        print(f"[EXECUTE] {stats.candidates} candidate filing(s), {stats.processed} processed.")
+        print(
+            f"  calls made: {stats.calls_made}, cache hits: {stats.cache_hits}, "
+            f"no observations/findings: {stats.empty_no_input}, refused: {stats.refused}, "
+            f"errors: {stats.errors}, truncated: {stats.truncated}, skipped (oversized): {stats.skipped_oversized}"
+        )
+        print(
+            f"  briefs with sentences: {stats.briefs_with_sentences}, "
+            f"empty after drop: {stats.briefs_empty_after_drop}, "
+            f"generator dropped: {stats.generator_dropped_total}, verifier dropped: {stats.verifier_dropped_total}"
+        )
+        # L10: every paid command states this run's cost, lifetime spend,
+        # and remaining budget on completion.
+        print(
+            f"  this run's cost: ${stats.run_cost_usd:.4f} | "
+            f"lifetime spend: ${stats.total_cost_usd:.4f} of ${config.LLM_BUDGET_USD:.2f} budget | "
+            f"remaining: ${config.LLM_BUDGET_USD - stats.total_cost_usd:.4f}"
+        )
+
+        if stats.stopped_reason is not None:
+            print(f"  STOPPED EARLY: {stats.stopped_reason}")
+            raise SystemExit(1)
+    finally:
+        conn.close()
+
+
+def cmd_show_brief(args: argparse.Namespace) -> None:
+    conn = db.get_connection()
+    try:
+        result = brief.get_latest_brief(conn, args.accession)
+        if result is None:
+            print(f"No brief found for accession {args.accession}.")
+            return
+        b, sentences = result["brief"], result["sentences"]
+        print(
+            f"Brief for {args.accession} "
+            f"(prompt {b['prompt_version']}, verifier {b['verifier_version']}, model {b['model']})"
+        )
+        if not sentences:
+            print("  (empty brief -- no material developments this period, or every sentence was dropped)")
+            return
+        for s in sentences:
+            print(f"\n[{s['sentence_type']}] {s['text']}")
+            for ref in json.loads(s["refs_json"]):
+                resolved = brief.resolve_ref(conn, ref)
+                if resolved is None:
+                    print(f"    {ref}: (unresolved)")
+                    continue
+                row = resolved["row"]
+                if resolved["kind"] == "observation":
+                    print(f"    {ref}: [{row['severity']}] {row['statement']}")
+                else:
+                    print(f"    {ref}: [{row['severity']}] ({row['category']}) {row['headline']}")
+    finally:
+        conn.close()
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     conn = db.get_connection()
     try:
@@ -641,6 +793,32 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("spend", help="Report LLM spend: total, remaining, and breakdown by prompt/model/status")
 
+    p_generate_briefs = sub.add_parser(
+        "generate-briefs", help="Write a short grounded narrative brief per filing from observations and findings"
+    )
+    p_generate_briefs.add_argument("--ticker", help="Restrict to one watchlist ticker")
+    p_generate_briefs.add_argument("--accession", help="Restrict to a single filing by accession number")
+    p_generate_briefs.add_argument(
+        "--execute", action="store_true", help="Make real API calls. Without this flag, performs a dry run (no calls, no spend)."
+    )
+    p_generate_briefs.add_argument(
+        "--confirm-cost", type=float, default=None,
+        help=(
+            "SPEC-006A L4: required when the dry-run estimate exceeds "
+            f"${config.LLM_CONFIRM_THRESHOLD_USD:.2f} -- must match the printed estimate within a small tolerance."
+        ),
+    )
+    p_generate_briefs.add_argument(
+        "--acknowledge-cache-invalidation", action="store_true",
+        help=(
+            "SPEC-006A L5: required when a prompt/verifier version bump would invalidate more than "
+            f"{config.LLM_CACHE_INVALIDATION_WARN} previously-cached briefs."
+        ),
+    )
+
+    p_show_brief = sub.add_parser("show-brief", help="Print a stored brief, each sentence with its type and resolved sources")
+    p_show_brief.add_argument("--accession", required=True, help="Filing to show the brief for")
+
     sub.add_parser("status", help="Summarize filings by company, form, and status")
 
     return parser
@@ -682,6 +860,10 @@ def main(argv: list[str] | None = None) -> int:
         cmd_analyze_sections(args)
     elif args.command == "spend":
         cmd_spend(args)
+    elif args.command == "generate-briefs":
+        cmd_generate_briefs(args)
+    elif args.command == "show-brief":
+        cmd_show_brief(args)
     elif args.command == "status":
         cmd_status(args)
 

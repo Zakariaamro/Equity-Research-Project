@@ -175,6 +175,57 @@ CREATE TABLE IF NOT EXISTS observations (
     created_at    TEXT NOT NULL,
     UNIQUE(cik, period_end, rule_name, rule_version, subject)
 );
+
+-- ============ SPEC-007: THE GROUNDED BRIEF ============
+-- One short narrative per filing, written only from observations and
+-- findings already verified (ARCHITECTURE.md §2). References llm_calls
+-- (SPEC-006's ledger) for the GENERATOR call only -- the verifier pass is a
+-- second real, billed call, recorded in llm_calls under its own prompt_name
+-- (config.BRIEF_VERIFIER_PROMPT_NAME) but not linked here by a second FK,
+-- matching this table's schema as specified (SPEC-007 R1).
+CREATE TABLE IF NOT EXISTS briefs (
+    id               INTEGER PRIMARY KEY,
+    accession_no     TEXT NOT NULL REFERENCES filings(accession_no),
+    cik              TEXT NOT NULL REFERENCES companies(cik),
+    prompt_name      TEXT NOT NULL,
+    prompt_version   TEXT NOT NULL,
+    verifier_version TEXT NOT NULL,
+    model            TEXT NOT NULL,
+    -- sha256 of (model|prompt_version|verifier_version|rendered_prompt) --
+    -- includes verifier_version because a verifier change can change which
+    -- sentences survive, so it changes the output (SPEC-007 R1).
+    input_hash       TEXT NOT NULL,
+    call_id          INTEGER REFERENCES llm_calls(id),
+    -- COUNTS only, never the rejected text itself -- R1 warns against
+    -- storing rejected SENTENCES ("invites it being displayed by
+    -- accident"), which a bare integer cannot be. Needed for R7's drop-rate
+    -- check (generator-side and verifier-side, per prompt version):
+    -- dropped sentences are never persisted, so without these two counts
+    -- validate.py would have no way to recompute a drop rate after the
+    -- fact -- unlike findings, where analyses.output_json retains every
+    -- returned finding (dropped or kept) for exactly this reason.
+    generator_dropped INTEGER NOT NULL DEFAULT 0,
+    verifier_dropped   INTEGER NOT NULL DEFAULT 0,
+    created_at       TEXT NOT NULL,
+    UNIQUE(input_hash)
+);
+
+-- Dropped sentences (failed a type check or the verifier pass) are NEVER
+-- stored here -- only counted and reported (SPEC-007 R1). Storing rejected
+-- output invites it being displayed by accident.
+CREATE TABLE IF NOT EXISTS brief_sentences (
+    id            INTEGER PRIMARY KEY,
+    brief_id      INTEGER NOT NULL REFERENCES briefs(id),
+    position      INTEGER NOT NULL,
+    -- restatement | juxtaposition | aggregation | grouping | sourced_causal
+    sentence_type TEXT NOT NULL,
+    text          TEXT NOT NULL,
+    -- JSON list of ref strings, e.g. ["obs:1234", "finding:567"] -- every
+    -- one already verified to resolve to an observation or finding
+    -- belonging to this filing and supplied in this brief's input (R4).
+    refs_json     TEXT NOT NULL,
+    UNIQUE(brief_id, position)
+);
 """
 
 TABLE_NAMES = (
@@ -187,6 +238,8 @@ TABLE_NAMES = (
     "analyses",
     "findings",
     "observations",
+    "briefs",
+    "brief_sentences",
 )
 
 # SPEC-005: columns added to tables that already existed (and, for the real
