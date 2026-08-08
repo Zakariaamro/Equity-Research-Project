@@ -742,6 +742,50 @@ def _classify_blank_cell(
     return "gap", gap_reason_fn()
 
 
+# --- SPEC-008-batch-1 item 1 (D13, approved 2026-08-09): year-over-year growth ---
+
+
+def _fiscal_labels(cik: str, db_path: Path) -> dict[str, tuple[int, str]]:
+    """period_end -> (fiscal_year, fiscal_period), from `filings` -- the
+    authoritative SEC-declared fiscal calendar (dei:DocumentFiscalYearFocus/
+    PeriodFocus), same source `edgar.metrics`'s discrete-quarter derivation
+    uses for the same reason (SPEC-008 C4/D12): no date arithmetic, robust
+    to MU/NVDA's floating fiscal year-end by construction. A dashboard-owned
+    read-only copy of the query shape, not a reach into `edgar.metrics` (a
+    pipeline module) -- this module owns every SQL query the dashboard
+    makes (SPEC-008's hard rule), full stop, no exceptions for convenience.
+
+    `ORDER BY filing_date` so that if two accessions somehow share a
+    period_end (unobserved in this project's real data, but not
+    structurally impossible), the LATEST filing's label wins building the
+    dict -- the same "latest wins" convention SPEC-004 R4 already commits
+    to elsewhere, not a new policy invented here."""
+    rows = _run(
+        db_path,
+        "SELECT period_end, fiscal_year, fiscal_period FROM filings "
+        "WHERE cik = ? AND fiscal_period IS NOT NULL ORDER BY filing_date",
+        (cik,),
+    )
+    return {row["period_end"]: (row["fiscal_year"], row["fiscal_period"]) for row in rows}
+
+
+def _year_ago_period_end(period_end: str, fiscal_labels: dict[str, tuple[int, str]]) -> str | None:
+    """The period_end of the SAME fiscal quarter one fiscal year earlier --
+    None if this period_end has no fiscal label at all, or if no filing
+    carries the target (fiscal_year - 1, SAME fiscal_period) label. Never a
+    calendar guess (e.g. "365 days earlier"): fails closed to None exactly
+    like every other discrete-quarter lookup in this project when the
+    authoritative fiscal calendar doesn't have an answer."""
+    label = fiscal_labels.get(period_end)
+    if label is None:
+        return None
+    target = (label[0] - 1, label[1])
+    for candidate_end, candidate_label in fiscal_labels.items():
+        if candidate_label == target:
+            return candidate_end
+    return None
+
+
 def _annotate_blanks(
     cells: list[dict], other_cells: list[dict] | None, other_label: str | None, gap_reason_fn,
 ) -> None:
@@ -767,6 +811,7 @@ def _resolve_line_across_periods(
     effective_periods: list[tuple[str | None, str]],
     ticker: str,
     db_path: Path,
+    fiscal_labels: dict[str, tuple[int, str]],
 ) -> list[dict]:
     """One line item's row(s) across every column. `effective_periods` is
     `(period_start, period_end)` per column -- every statement's own
@@ -847,7 +892,7 @@ def _resolve_line_across_periods(
                 }
             )
         _annotate_blanks(merged_cells, None, None, _gap_reason)
-        return [_finalize_statement_row(label, canonical, merged_cells)]
+        return [_finalize_statement_row(label, canonical, merged_cells, fiscal_labels)]
 
     primary_used = any(c["value"] is not None for c in primary_cells)
     rows = []
@@ -859,14 +904,16 @@ def _resolve_line_across_periods(
         # line; only a fallback-only line drops the permanently-empty
         # primary row.
         _annotate_blanks(primary_cells, fallback_cells if fallback_used else None, fallback_label, _gap_reason)
-        rows.append(_finalize_statement_row(label, canonical, primary_cells))
+        rows.append(_finalize_statement_row(label, canonical, primary_cells, fiscal_labels))
     if fallback_used:
         _annotate_blanks(fallback_cells, primary_cells, label, _gap_reason)
-        rows.append(_finalize_statement_row(fallback_label, canonical, fallback_cells))
+        rows.append(_finalize_statement_row(fallback_label, canonical, fallback_cells, fiscal_labels))
     return rows
 
 
-def _finalize_statement_row(label: str, canonical: str, cells: list[dict]) -> dict:
+def _finalize_statement_row(
+    label: str, canonical: str, cells: list[dict], fiscal_labels: dict[str, tuple[int, str]]
+) -> dict:
     """Attaches each cell's growth_pct -- R8: derived here, in the data
     layer, never computed inline in a page. `growth_pct` is None whenever
     there is no valid prior cell to compare against (no immediately
@@ -882,11 +929,26 @@ def _finalize_statement_row(label: str, canonical: str, cells: list[dict]) -> di
     (`_classify_growth`) -- a zero or sign-crossing base, or a base under
     10% of this row's own typical (median) magnitude. `growth_pct` stays
     populated even when flagged; the reason is what tells the caller to
-    render "n/m" instead of the number, not the absence of a number."""
+    render "n/m" instead of the number, not the absence of a number.
+
+    SPEC-008-batch-1 item 1 (D13): also attaches `yoy_growth_pct`/
+    `yoy_growth_not_meaningful` -- the SAME cell compared against the SAME
+    fiscal quarter one fiscal year earlier (`_year_ago_period_end`,
+    `filings.fiscal_year`/`fiscal_period`, no date arithmetic), fails
+    closed to None when that quarter isn't among `cells` at all or its own
+    value is missing, and shares item 2's n/m classification -- a
+    meaningless base is exactly as meaningless one year apart as one
+    quarter apart. On the annual basis this is numerically identical to
+    the sequential value by construction (a fiscal year's "one year
+    earlier, same fiscal period" IS its immediately preceding annual
+    cell) -- deliberately not special-cased here; which of the two
+    (if either) to SHOW is a display decision, out of scope for this
+    batch."""
     typical_magnitude = None
     row_values = [cell["value"] for cell in cells if cell["value"] is not None]
     if row_values:
         typical_magnitude = statistics.median(abs(v) for v in row_values)
+    cells_by_period_end = {cell["period_end"]: cell for cell in cells}
 
     prior: dict | None = None
     for cell in cells:
@@ -896,6 +958,18 @@ def _finalize_statement_row(label: str, canonical: str, cells: list[dict]) -> di
             growth_pct, not_meaningful = _classify_growth(prior["value"], cell["value"], typical_magnitude)
         cell["growth_pct"] = growth_pct
         cell["growth_not_meaningful"] = not_meaningful
+
+        yoy_growth_pct = None
+        yoy_not_meaningful = None
+        year_ago_end = _year_ago_period_end(cell["period_end"], fiscal_labels)
+        year_ago_cell = cells_by_period_end.get(year_ago_end) if year_ago_end is not None else None
+        if year_ago_cell is not None and year_ago_cell["value"] is not None and cell["value"] is not None:
+            yoy_growth_pct, yoy_not_meaningful = _classify_growth(
+                year_ago_cell["value"], cell["value"], typical_magnitude
+            )
+        cell["yoy_growth_pct"] = yoy_growth_pct
+        cell["yoy_growth_not_meaningful"] = yoy_not_meaningful
+
         prior = cell
     return {"label": label, "canonical": canonical, "cells": cells}
 
@@ -916,12 +990,17 @@ def _statement_table(
     # `_resolve_line_across_periods` itself. `get_cash_flow_period` is
     # unchanged and still used by the Summary tab.
     effective_periods = [(p["period_start"], p["period_end"]) for p in periods]
+    # SPEC-008-batch-1 item 1 (D13): computed once per table, not once per
+    # line -- every line's YoY lookup shares the same (cik-wide) fiscal
+    # calendar.
+    fiscal_labels = _fiscal_labels(cik, db_path)
 
     rows: list[dict] = []
     for canonical, label, fallback_canonical, fallback_label in lines:
         rows.extend(
             _resolve_line_across_periods(
-                cik, canonical, label, fallback_canonical, fallback_label, effective_periods, ticker, db_path
+                cik, canonical, label, fallback_canonical, fallback_label, effective_periods, ticker, db_path,
+                fiscal_labels,
             )
         )
     return rows

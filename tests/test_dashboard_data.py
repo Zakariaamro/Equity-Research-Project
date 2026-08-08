@@ -646,6 +646,154 @@ def test_cash_flow_table_renders_not_meaningful_flag_for_a_near_zero_base(db_pat
     assert q3_cell["growth_not_meaningful"] == "near_zero_base"
 
 
+# --- SPEC-008-batch-1 item 1 (D13, approved 2026-08-09): year-over-year growth ---
+
+
+def test_year_ago_period_end_matches_same_fiscal_quarter_one_year_earlier():
+    fiscal_labels = {
+        "2025-03-31": (2025, "Q1"), "2025-06-30": (2025, "Q2"),
+        "2026-03-31": (2026, "Q1"), "2026-06-30": (2026, "Q2"),
+    }
+    assert data._year_ago_period_end("2026-06-30", fiscal_labels) == "2025-06-30"
+    assert data._year_ago_period_end("2026-03-31", fiscal_labels) == "2025-03-31"
+
+
+def test_year_ago_period_end_fails_closed_when_the_prior_year_quarter_is_absent():
+    fiscal_labels = {"2026-06-30": (2026, "Q2")}  # no 2025 Q2 at all
+    assert data._year_ago_period_end("2026-06-30", fiscal_labels) is None
+
+
+def test_year_ago_period_end_fails_closed_for_an_unlabelled_period():
+    assert data._year_ago_period_end("2026-06-30", {}) is None
+
+
+def test_year_ago_period_end_never_matches_a_different_fiscal_quarter():
+    # A same-numbered fiscal_year that's the WRONG quarter must not match --
+    # this is a same-QUARTER, year-ago lookup, not a same-year lookup.
+    fiscal_labels = {"2026-06-30": (2026, "Q2"), "2025-03-31": (2025, "Q1")}
+    assert data._year_ago_period_end("2026-06-30", fiscal_labels) is None
+
+
+def test_fiscal_labels_reads_from_filings_table(db_path):
+    _insert_filing(db_path, "acc-q2-2026", form_type="10-Q", period_end="2026-06-30", fiscal_year=2026, fiscal_period="Q2")
+    _insert_filing(db_path, "acc-q2-2025", form_type="10-Q", period_end="2025-06-30", fiscal_year=2025, fiscal_period="Q2")
+    labels = data._fiscal_labels(AMZN_CIK, db_path)
+    assert labels["2026-06-30"] == (2026, "Q2")
+    assert labels["2025-06-30"] == (2025, "Q2")
+
+
+def test_income_statement_table_computes_yoy_growth_against_the_same_fiscal_quarter(db_path):
+    _insert_filing(db_path, "acc-q2-2025", form_type="10-Q", period_end="2025-06-30", fiscal_year=2025, fiscal_period="Q2")
+    _insert_filing(db_path, "acc-q3-2025", form_type="10-Q", period_end="2025-09-30", fiscal_year=2025, fiscal_period="Q3")
+    _insert_filing(db_path, "acc-q2-2026", form_type="10-Q", period_end="2026-06-30", fiscal_year=2026, fiscal_period="Q2")
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-07-01", "2025-09-30", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2026-04-01", "2026-06-30", 0.5)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "RevenueFromContractWithCustomerExcludingAssessedTax", "2025-06-30",
+        100_000_000, period_start="2025-04-01",
+    )
+    # The SEQUENTIAL prior quarter (Q3 2025) is deliberately a very
+    # different number from the YEAR-AGO quarter (Q2 2025) -- if YoY ever
+    # silently fell back to comparing against the sequential prior cell
+    # instead of the true fiscal-year-ago one, this would catch it.
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "RevenueFromContractWithCustomerExcludingAssessedTax", "2025-09-30",
+        999_000_000, period_start="2025-07-01", accession_no="acc-fact-q3",
+    )
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "RevenueFromContractWithCustomerExcludingAssessedTax", "2026-06-30",
+        150_000_000, period_start="2026-04-01", accession_no="acc-fact-q2-2026",
+    )
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_income_statement_table(AMZN_CIK, periods, "AMZN", db_path)
+    revenue_row = next(r for r in rows if r["canonical"] == "revenue")
+    q2_2026_cell = next(c for c in revenue_row["cells"] if c["period_end"] == "2026-06-30")
+    assert q2_2026_cell["yoy_growth_pct"] == pytest.approx(0.5)  # (150M - 100M) / 100M, vs Q2 2025
+
+
+def test_income_statement_table_yoy_fails_closed_when_year_ago_quarter_missing(db_path):
+    _insert_filing(db_path, "acc-q2-2026", form_type="10-Q", period_end="2026-06-30", fiscal_year=2026, fiscal_period="Q2")
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2026-04-01", "2026-06-30", 0.5)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "RevenueFromContractWithCustomerExcludingAssessedTax", "2026-06-30",
+        150_000_000, period_start="2026-04-01",
+    )
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_income_statement_table(AMZN_CIK, periods, "AMZN", db_path)
+    revenue_row = next(r for r in rows if r["canonical"] == "revenue")
+    q2_2026_cell = next(c for c in revenue_row["cells"] if c["period_end"] == "2026-06-30")
+    assert q2_2026_cell["yoy_growth_pct"] is None
+
+
+def test_income_statement_table_yoy_fails_closed_when_year_ago_value_itself_missing(db_path):
+    # The year-ago fiscal quarter EXISTS (a filing was made) but its own
+    # revenue value was never resolved -- still None, never a comparison
+    # against a blank.
+    _insert_filing(db_path, "acc-q2-2025", form_type="10-Q", period_end="2025-06-30", fiscal_year=2025, fiscal_period="Q2")
+    _insert_filing(db_path, "acc-q2-2026", form_type="10-Q", period_end="2026-06-30", fiscal_year=2026, fiscal_period="Q2")
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2026-04-01", "2026-06-30", 0.5)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "RevenueFromContractWithCustomerExcludingAssessedTax", "2026-06-30",
+        150_000_000, period_start="2026-04-01",
+    )
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_income_statement_table(AMZN_CIK, periods, "AMZN", db_path)
+    revenue_row = next(r for r in rows if r["canonical"] == "revenue")
+    q2_2026_cell = next(c for c in revenue_row["cells"] if c["period_end"] == "2026-06-30")
+    assert q2_2026_cell["yoy_growth_pct"] is None
+
+
+def test_yoy_growth_gets_the_same_n_slash_m_treatment_as_sequential_growth(db_path):
+    _insert_filing(db_path, "acc-q2-2025", form_type="10-Q", period_end="2025-06-30", fiscal_year=2025, fiscal_period="Q2")
+    _insert_filing(db_path, "acc-q3-2025", form_type="10-Q", period_end="2025-09-30", fiscal_year=2025, fiscal_period="Q3")
+    _insert_filing(db_path, "acc-q2-2026", form_type="10-Q", period_end="2026-06-30", fiscal_year=2026, fiscal_period="Q2")
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-07-01", "2025-09-30", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2026-04-01", "2026-06-30", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "free_cash_flow", "2025-04-01", "2025-06-30", 800_000_000)
+    _insert_metric(db_path, AMZN_CIK, "free_cash_flow", "2025-07-01", "2025-09-30", 700_000_000)
+    _insert_metric(db_path, AMZN_CIK, "free_cash_flow", "2026-04-01", "2026-06-30", 72_000_000)
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
+    fcf_row = next(r for r in rows if r["canonical"] == "free_cash_flow")
+    q2_2026_cell = next(c for c in fcf_row["cells"] if c["period_end"] == "2026-06-30")
+    # YoY base is 800M, comfortably above 10% of this row's own median --
+    # NOT flagged. Confirms n/m is computed independently for YoY, not
+    # just copied from the sequential flag (whose own base, 700M, is also
+    # not near-zero here -- both should be clean, this isolates that YoY
+    # uses ITS OWN base, the year-ago cell, not the sequential prior one).
+    assert q2_2026_cell["yoy_growth_not_meaningful"] is None
+    assert q2_2026_cell["yoy_growth_pct"] == pytest.approx((72_000_000 - 800_000_000) / 800_000_000)
+
+
+def test_annual_basis_yoy_equals_sequential_by_construction(db_path):
+    # D13's own constraint: on the annual basis, YoY and sequential are
+    # numerically identical (a fiscal year's "same period, one year
+    # earlier" IS its immediately preceding annual cell) -- not special-
+    # cased in the data layer, just a natural consequence of the fiscal-
+    # label lookup. Which one to SHOW is a display decision (out of scope
+    # for this batch); this confirms the data layer doesn't need to care.
+    _insert_filing(db_path, "acc-fy2024", form_type="10-K", period_end="2024-12-31", fiscal_year=2024, fiscal_period="FY")
+    _insert_filing(db_path, "acc-fy2025", form_type="10-K", period_end="2025-12-31", fiscal_year=2025, fiscal_period="FY")
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2024-01-01", "2024-12-31", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-12-31", 0.5)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "RevenueFromContractWithCustomerExcludingAssessedTax", "2024-12-31",
+        600_000_000, period_start="2024-01-01",
+    )
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "RevenueFromContractWithCustomerExcludingAssessedTax", "2025-12-31",
+        700_000_000, period_start="2025-01-01", accession_no="acc-fact-2",
+    )
+    periods = data.get_statement_periods(AMZN_CIK, "annual", db_path)
+    rows = data.get_income_statement_table(AMZN_CIK, periods, "AMZN", db_path)
+    revenue_row = next(r for r in rows if r["canonical"] == "revenue")
+    fy2025_cell = next(c for c in revenue_row["cells"] if c["period_end"] == "2025-12-31")
+    assert fy2025_cell["yoy_growth_pct"] == pytest.approx(fy2025_cell["growth_pct"])
+
+
 def test_income_statement_table_computes_growth_between_adjacent_periods(db_path):
     _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
     _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)
