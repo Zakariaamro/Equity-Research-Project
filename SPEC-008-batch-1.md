@@ -76,6 +76,42 @@ from a number to `n/m`, per company).
 
 This is a foundation item: item 1 depends on it.
 
+### Resolution (implemented 2026-08-09)
+
+**Threshold: 10% of the row's own median absolute value**, computed across every period
+currently in that row (a property of THIS line for THIS company, not a global constant —
+matches "the line's own typical magnitude" literally).
+
+**Why 10%, not something else:** chosen by checking this spec's own cited example against
+the real corpus, not picked blind. Micron's real free cash flow went from $72M to $3,022M
+(`+4097.2%`, exactly reproducing the number quoted above) — $72M against Micron's real FCF
+median ($786M) is a ratio of 0.092. A 5% threshold would **miss** this spec's own example;
+10% is the smallest round number that catches it. Checked three candidates against the full
+real corpus (all three companies, both cash flow and income statement, every quarterly
+period) before choosing:
+
+| Threshold | Cells flipped from a number to `n/m` |
+|---|---|
+| 5% | 55 (misses the review's own example) |
+| **10% (chosen)** | **72** |
+| 15% | 79 (7 more than 10%, diminishing returns) |
+
+**Per company at 10%:** AMZN 23, NVDA 15, MU 34 — 72 total.
+
+**By reason, at 10%:** 49 sign-crossing (independent of the threshold — a company's own
+sign either flips between two periods or it doesn't), 23 near-zero-base, 0 exactly-zero-base
+(a zero base already yields no `growth_pct` at all — division by zero — so there is nothing
+to "flip"; those cells were blank before this item and remain blank, now for a stated reason
+`n/m` rather than an unstated one).
+
+**Sign-crossing definition:** flagged only when both the prior and current values are
+non-zero and differ in sign. A move TO exactly zero (`100 -> 0`, a clean `-100%`) is
+meaningful and is not flagged — only a genuine crossing (`72 -> -113`) is.
+
+Implementation: `dashboard/data.py`'s `_classify_growth`/`_GROWTH_NEAR_ZERO_BASE_FRACTION`,
+applied inside `_finalize_statement_row` so both sequential and (once item 1 lands) YoY
+growth get the same treatment from one place, not two.
+
 ---
 
 ## Item 3 — Micron's interest expense of exactly 0 (D15)
