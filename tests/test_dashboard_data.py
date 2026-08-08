@@ -794,6 +794,91 @@ def test_annual_basis_yoy_equals_sequential_by_construction(db_path):
     assert fy2025_cell["yoy_growth_pct"] == pytest.approx(fy2025_cell["growth_pct"])
 
 
+# --- SPEC-008-batch-1 item 4 (approved 2026-08-09): gross profit derived from components ---
+
+
+def test_gross_profit_derived_from_revenue_minus_cogs_when_not_filed(db_path):
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "RevenueFromContractWithCustomerExcludingAssessedTax", "2025-03-31",
+        1_000_000_000, period_start="2025-01-01",
+    )
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "CostOfGoodsAndServicesSold", "2025-03-31",
+        600_000_000, period_start="2025-01-01",
+    )
+    # No GrossProfit fact filed at all for this period.
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_income_statement_table(AMZN_CIK, periods, "AMZN", db_path)
+    gp_row = next(r for r in rows if r["canonical"] == "gross_profit")
+    cell = gp_row["cells"][0]
+    assert cell["value"] == 400_000_000.0
+    assert cell["is_derived_quarter"] is True
+    assert "blank_cause" not in cell
+
+
+def test_gross_profit_prefers_the_filed_figure_over_the_derived_one(db_path):
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "RevenueFromContractWithCustomerExcludingAssessedTax", "2025-03-31",
+        1_000_000_000, period_start="2025-01-01",
+    )
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "CostOfGoodsAndServicesSold", "2025-03-31",
+        600_000_000, period_start="2025-01-01",
+    )
+    _insert_xbrl_fact(db_path, AMZN_CIK, "GrossProfit", "2025-03-31", 450_000_000, period_start="2025-01-01")
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_income_statement_table(AMZN_CIK, periods, "AMZN", db_path)
+    gp_row = next(r for r in rows if r["canonical"] == "gross_profit")
+    cell = gp_row["cells"][0]
+    assert cell["value"] == 450_000_000.0  # the FILED figure, not 400M implied by revenue-cogs
+    assert cell.get("is_derived_quarter") is not True
+
+
+def test_gross_profit_stays_blank_when_revenue_or_cogs_also_missing(db_path):
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "RevenueFromContractWithCustomerExcludingAssessedTax", "2025-03-31",
+        1_000_000_000, period_start="2025-01-01",
+    )
+    # No cogs at all -- can't derive.
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_income_statement_table(AMZN_CIK, periods, "AMZN", db_path)
+    gp_row = next(r for r in rows if r["canonical"] == "gross_profit")
+    cell = gp_row["cells"][0]
+    assert cell["value"] is None
+    assert cell["blank_cause"] == "gap"
+
+
+def test_gross_profit_derived_cells_get_growth_and_yoy_like_any_other_cell(db_path):
+    _insert_filing(db_path, "acc-q1-2025", form_type="10-Q", period_end="2025-03-31", fiscal_year=2025, fiscal_period="Q1")
+    _insert_filing(db_path, "acc-q1-2026", form_type="10-Q", period_end="2026-03-31", fiscal_year=2026, fiscal_period="Q1")
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2026-01-01", "2026-03-31", 0.5)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "RevenueFromContractWithCustomerExcludingAssessedTax", "2025-03-31",
+        1_000_000_000, period_start="2025-01-01",
+    )
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "CostOfGoodsAndServicesSold", "2025-03-31", 600_000_000, period_start="2025-01-01",
+    )
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "RevenueFromContractWithCustomerExcludingAssessedTax", "2026-03-31",
+        1_200_000_000, period_start="2026-01-01", accession_no="acc-fact-rev-2",
+    )
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "CostOfGoodsAndServicesSold", "2026-03-31", 600_000_000, period_start="2026-01-01",
+        accession_no="acc-fact-cogs-2",
+    )
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_income_statement_table(AMZN_CIK, periods, "AMZN", db_path)
+    gp_row = next(r for r in rows if r["canonical"] == "gross_profit")
+    fy2026_cell = next(c for c in gp_row["cells"] if c["period_end"] == "2026-03-31")
+    # 2025: 400M derived. 2026: 600M derived. YoY = (600-400)/400 = 0.5.
+    assert fy2026_cell["yoy_growth_pct"] == pytest.approx(0.5)
+
+
 def test_income_statement_table_computes_growth_between_adjacent_periods(db_path):
     _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
     _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)

@@ -1003,7 +1003,72 @@ def _statement_table(
                 fiscal_labels,
             )
         )
+    _derive_gross_profit_from_components(rows, fiscal_labels)
     return rows
+
+
+def _derive_gross_profit_from_components(rows: list[dict], fiscal_labels: dict[str, tuple[int, str]]) -> None:
+    """SPEC-008-batch-1 item 4 (approved 2026-08-09): gross_profit =
+    revenue - cogs, applied only where gross_profit itself (filed directly
+    or via its own `_discrete` fallback) is still blank at a period where
+    BOTH revenue and cogs resolve. A no-op for any table without all three
+    canonicals (balance sheet, cash flow) -- cheap to call unconditionally
+    rather than threading an income-statement-only flag through
+    `_statement_table`.
+
+    STRICT LIMIT (the item's own words): exact arithmetic on lines already
+    on the SAME statement, nothing requiring judgement about what belongs
+    in a line. Checked against the real corpus before this was written,
+    not assumed: revenue - cogs equals the FILED gross_profit in all 236
+    periods across the three companies where all three are filed
+    simultaneously -- zero mismatches. Two other candidates were checked
+    and REJECTED by the same test, not implemented: net_income = pretax_
+    income - tax_expense holds for NVDA (102/103) but not AMZN (5/123) or
+    MU (1/103) -- both companies have other components (minority
+    interest, equity-method income, ...) this project doesn't carry, so
+    the equation is not exact and R&D-style judgement would be needed to
+    fix it, which the item explicitly rules out. operating_income and
+    pretax_income were not even numerically checked -- both are known
+    from the review itself (Part 2, "Non-operating income share") to have
+    real components (AMZN's Anthropic/OpenAI marks) this dashboard
+    doesn't carry at all, so the equation can't be exact by construction.
+
+    A DIFFERENT kind of derivation than the discrete-quarter mechanism
+    (arithmetic across LINES within one period, not subtraction across
+    TIME for one line) -- deliberately not forced into `fallback_canonical`,
+    which only ever does a single-concept lookup, not arithmetic on two.
+    The reader-facing claim is identical though ("not filed, this project
+    computed it"), so it reuses the SAME marker, `is_derived_quarter`, one
+    visual language for that claim rather than two. Cells are re-
+    `_finalize_statement_row`'d after patching so growth/YoY reflect the
+    now-filled values instead of the stale blanks they were computed
+    against the first time."""
+    revenue_row = next((r for r in rows if r["canonical"] == "revenue"), None)
+    cogs_row = next((r for r in rows if r["canonical"] == "cogs"), None)
+    gross_profit_row = next((r for r in rows if r["canonical"] == "gross_profit"), None)
+    if revenue_row is None or cogs_row is None or gross_profit_row is None:
+        return
+
+    revenue_by_end = {cell["period_end"]: cell["value"] for cell in revenue_row["cells"]}
+    cogs_by_end = {cell["period_end"]: cell["value"] for cell in cogs_row["cells"]}
+    patched = False
+    for cell in gross_profit_row["cells"]:
+        if cell["value"] is not None:
+            continue
+        revenue_value = revenue_by_end.get(cell["period_end"])
+        cogs_value = cogs_by_end.get(cell["period_end"])
+        if revenue_value is None or cogs_value is None:
+            continue
+        cell["value"] = revenue_value - cogs_value
+        cell["is_derived_quarter"] = True
+        cell.pop("blank_cause", None)
+        cell.pop("blank_reason", None)
+        patched = True
+
+    if patched:
+        _finalize_statement_row(
+            gross_profit_row["label"], gross_profit_row["canonical"], gross_profit_row["cells"], fiscal_labels
+        )
 
 
 def get_income_statement_table(
