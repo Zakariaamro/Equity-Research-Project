@@ -38,6 +38,8 @@ class ValidationReport:
     coverage: list[dict] = field(default_factory=list)
     unresolved_concepts: list[dict] = field(default_factory=list)
     finance_lease_zero_assumptions: list[dict] = field(default_factory=list)
+    discrete_quarter_sum_violations: list[dict] = field(default_factory=list)
+    discrete_quarter_sum_exceptions: list[dict] = field(default_factory=list)
     observation_per_filing_contribution: list[dict] = field(default_factory=list)
     observation_dead_rules: list[dict] = field(default_factory=list)
     observation_lookahead_violations: list[dict] = field(default_factory=list)
@@ -67,6 +69,7 @@ class ValidationReport:
             + len(self.dupont_violations)
             + len(self.gross_profit_violations)
             + len(self.debt_reconciliation_violations)
+            + len(self.discrete_quarter_sum_violations)
             + len(self.period_mixing_violations)
             + len(self.alias_agreement_violations)
             + len(self.observation_lookahead_violations)
@@ -623,6 +626,108 @@ def _check_finance_lease_zero_assumptions(conn: sqlite3.Connection, tickers: lis
                 affected += 1
         if affected:
             findings.append({"ticker": ticker, "periods_affected": affected})
+    return findings
+
+
+# --- category 12: discrete quarter sum-back (SPEC-008 C4, approved 2026-08-08) ---
+
+
+def _find_discrete_quarter_sum_violations(conn: sqlite3.Connection, tickers: list[str] | None) -> list[dict]:
+    """Every (cik, canonical, fiscal year) where the four stored discrete
+    quarters (Q1 + Q2 + Q3 + Q4-discrete) don't sum to a FRESH read of the
+    filed FY figure -- regardless of whether it's in
+    DISCRETE_QUARTER_SUM_EXCEPTIONS. Partitioned by the caller.
+
+    This is an algebraic identity, not a business-tolerance check (contrast
+    category 3/4's relative tolerances for genuinely approximate cross-
+    checks). By construction, Q4-discrete = FY_filed - 9mo, so
+    Q1+Q2+Q3+Q4 telescopes to EXACTLY FY_filed whenever every input was
+    drawn from one consistent vintage:
+
+        Q1 + Q2 + Q3 + Q4
+      = V1 + (V2-V1) + (V3-V2) + (FY-V3)
+      = FY
+
+    The FY figure here is read FRESH from `xbrl_facts` (`metrics_mod.
+    _resolve`, not the `metrics` table) rather than reused from whatever
+    `compute_discrete_quarter_metrics` embedded in Q4-discrete's own stored
+    value -- deliberately, so this check catches STALENESS: if a
+    restatement changes the filed FY figure (or any quarterly YTD figure)
+    after `compute-metrics` last ran, the stored discrete quarters still
+    reflect the OLD vintage and the sum stops tying to the CURRENT filed
+    figure. A pure re-derivation compared against itself would trivially
+    always tie by the algebra above and catch nothing; comparing STORED
+    against FRESH is what makes this a real check."""
+    findings = []
+    for cik, ticker in _companies(tickers):
+        facts = metrics_mod._load_facts(conn, cik)
+        quarter_map = metrics_mod._fiscal_quarter_map(conn, cik)
+        fiscal_years = sorted({fy for (fy, _fp) in quarter_map})
+        for canonical in metrics_mod._DISCRETE_QUARTER_CANONICALS:
+            name = f"{canonical}_discrete"
+            for fy in fiscal_years:
+                fy_start = metrics_mod._fiscal_year_start(facts, quarter_map, fy, canonical)
+                fy_end = quarter_map.get((fy, "FY"))
+                if fy_start is None or fy_end is None:
+                    continue
+                fy_filed, _fy_alias = metrics_mod._resolve(canonical, facts, fy_start, fy_end)
+                if fy_filed is None:
+                    continue
+                quarter_values: list[float] = []
+                complete = True
+                for fp in ("Q1", "Q2", "Q3", "FY"):
+                    end = quarter_map.get((fy, fp))
+                    if end is None:
+                        complete = False
+                        break
+                    row = conn.execute(
+                        "SELECT value FROM metrics WHERE cik = ? AND period_end = ? AND name = ? AND calc_version = ?",
+                        (cik, end, name, config.CALC_VERSION),
+                    ).fetchone()
+                    if row is None or row["value"] is None:
+                        complete = False
+                        break
+                    quarter_values.append(row["value"])
+                if not complete:
+                    continue  # incomplete fiscal year -- nothing to check yet, not a violation
+                component_sum = sum(quarter_values)
+                diff = abs(component_sum - fy_filed)
+                if diff > config.DISCRETE_QUARTER_SUM_TOLERANCE_USD:
+                    findings.append(
+                        {
+                            "ticker": ticker,
+                            "cik": cik,
+                            "canonical": canonical,
+                            "fiscal_year": fy,
+                            "fy_period_end": fy_end,
+                            "filed_fy": fy_filed,
+                            "quarter_sum": component_sum,
+                            "diff": diff,
+                        }
+                    )
+    return findings
+
+
+def _check_discrete_quarter_sum(conn: sqlite3.Connection, tickers: list[str] | None) -> list[dict]:
+    """Hard-failing sum-back findings: (cik, canonical, fy_period_end) NOT in
+    DISCRETE_QUARTER_SUM_EXCEPTIONS."""
+    return [
+        f
+        for f in _find_discrete_quarter_sum_violations(conn, tickers)
+        if (f["cik"], f["canonical"], f["fy_period_end"]) not in config.DISCRETE_QUARTER_SUM_EXCEPTIONS
+    ]
+
+
+def _check_discrete_quarter_sum_exceptions(conn: sqlite3.Connection, tickers: list[str] | None) -> list[dict]:
+    """Sum-back findings covered by the register -- informational, with the
+    written reason attached."""
+    findings = [
+        f
+        for f in _find_discrete_quarter_sum_violations(conn, tickers)
+        if (f["cik"], f["canonical"], f["fy_period_end"]) in config.DISCRETE_QUARTER_SUM_EXCEPTIONS
+    ]
+    for f in findings:
+        f["reason"] = config.DISCRETE_QUARTER_SUM_EXCEPTIONS[(f["cik"], f["canonical"], f["fy_period_end"])].reason
     return findings
 
 
@@ -1246,6 +1351,8 @@ def run_validate(conn: sqlite3.Connection, tickers: list[str] | None = None) -> 
         coverage=_check_coverage(conn, tickers),
         unresolved_concepts=_check_unresolved_concepts(conn, tickers),
         finance_lease_zero_assumptions=_check_finance_lease_zero_assumptions(conn, tickers),
+        discrete_quarter_sum_violations=_check_discrete_quarter_sum(conn, tickers),
+        discrete_quarter_sum_exceptions=_check_discrete_quarter_sum_exceptions(conn, tickers),
         observation_per_filing_contribution=_check_observation_per_filing_contribution(conn, tickers),
         observation_dead_rules=_check_observation_dead_rules(conn, tickers),
         observation_lookahead_violations=_check_observation_lookahead(conn, tickers),
@@ -1497,10 +1604,22 @@ def format_report(report: ValidationReport) -> str:
         + (f"({v['verifier_drop_rate']:.0%})" if v["verifier_drop_rate"] is not None else "(none survived R4)")
         + f"; kept {v['kept']}",
     )
+    _section(
+        "33. Discrete quarter sum-back (SPEC-008 C4)",
+        report.discrete_quarter_sum_violations,
+        lambda v: f"{v['ticker']} {v['canonical']} FY ending {v['fy_period_end']}: "
+        f"Q1+Q2+Q3+Q4={v['quarter_sum']:,.0f} vs filed FY={v['filed_fy']:,.0f} (diff {v['diff']:,.0f})",
+    )
+    _section(
+        "33a. Discrete quarter sum-back exceptions (informational -- registered, not hard-failed)",
+        report.discrete_quarter_sum_exceptions,
+        lambda v: f"{v['ticker']} {v['canonical']} FY ending {v['fy_period_end']}: "
+        f"Q1+Q2+Q3+Q4={v['quarter_sum']:,.0f} vs filed FY={v['filed_fy']:,.0f} (diff {v['diff']:,.0f}) -- {v['reason']}",
+    )
 
     lines.append(
         f"\n{report.hard_failure_count} finding(s) in hard-failing categories "
-        "(1, 2, 3, 4, 5, 6, 14, 15, 16, 19, 20, 21, 22, 27, 28, 29, 30) -- would exit non-zero."
+        "(1, 2, 3, 4, 5, 6, 14, 15, 16, 19, 20, 21, 22, 27, 28, 29, 30, 33) -- would exit non-zero."
         if report.hard_failure_count
         else "\nAll hard-failing categories clean."
     )

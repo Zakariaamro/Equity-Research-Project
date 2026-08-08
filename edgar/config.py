@@ -351,6 +351,29 @@ DEBT_RECONCILIATION_EXCEPTIONS: dict[tuple[str, str], DebtReconciliationExceptio
 
 
 @dataclass(frozen=True)
+class DiscreteQuarterSumException:
+    """A documented, accepted exception to R8's discrete-quarter sum-back
+    check (SPEC-008 C4, approved 2026-08-08): the four derived discrete
+    quarters (cfo_discrete, capex_discrete, sbc_discrete, dep_amort_discrete)
+    for one (cik, canonical, fiscal year) failed to sum back to the filed FY
+    figure within DISCRETE_QUARTER_SUM_TOLERANCE_USD.
+
+    Keyed by (cik, canonical, fy_period_end) -- a specific company's
+    specific fiscal year for a specific line, not a standing property of the
+    canonical. A combination NOT in this register still hard-fails on any
+    disagreement, same discipline as DEBT_RECONCILIATION_EXCEPTIONS.
+    """
+
+    cik: str
+    canonical: str
+    fy_period_end: str
+    reason: str
+
+
+DISCRETE_QUARTER_SUM_EXCEPTIONS: dict[tuple[str, str, str], DiscreteQuarterSumException] = {}
+
+
+@dataclass(frozen=True)
 class RangeException:
     """A documented, accepted exception to R8 category 1 (range violations).
 
@@ -465,6 +488,15 @@ class MetricDef:
     extreme_informative: bool = True
     headline: bool = True
 
+    # SPEC-008 C4 (approved 2026-08-08): True for the discrete-quarter
+    # metrics (cfo_discrete, ...), whose own (period_start, period_end) is
+    # synthetic -- it doesn't match any period tuple `compute_metrics`'s
+    # generic loop discovers from real fact durations. Computed by a
+    # SEPARATE pass (`compute_discrete_quarter_metrics`) instead; the
+    # generic loop skips any metric flagged here rather than computing it
+    # (wrongly) at whatever period the generic loop happens to be on.
+    computed_separately: bool = False
+
     # --- SPEC-008 R1: dashboard display metadata ---
     # No default is ever actually blank in METRIC_REGISTRY below -- every real
     # entry sets all six (checked at import time, see
@@ -478,6 +510,14 @@ class MetricDef:
     higher_is_better: bool | None = None
     group: str = ""  # Growth | Margins | Returns | Capital & Cash | Working Capital | Solvency | Quality
     description: str = ""
+
+    # SPEC-008 review D7 (found live): a bare number ("-2.75") is meaningless
+    # to a reader who does not already know the metric's own conventional
+    # threshold. None for every metric except beneish_m_score, where one is
+    # both well-known and load-bearing to the question the tile is answering
+    # ("should I be suspicious?"); left generic (not a beneish-specific
+    # field) in case a future metric needs the same treatment.
+    flag_threshold: float | None = None
 
 
 METRIC_REGISTRY: dict[str, MetricDef] = {
@@ -672,10 +712,199 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
     "free_cash_flow": MetricDef(
         "free_cash_flow", ("cfo", "capex"), "both", None, False, "capital_cash",
         extreme_informative=False,
-    
+
         display_name='Free cash flow', unit='usd', precision=0,
         higher_is_better=True, group='Capital & Cash',
         description='Cash from operations minus capital expenditure.',
+    ),
+    # --- Discrete fiscal quarters (SPEC-008 C4, approved 2026-08-08) ---
+    # Computed by metrics.compute_discrete_quarter_metrics, a SEPARATE pass
+    # from the generic per-period loop above -- see that function's
+    # docstring for why (the discrete window's own (period_start, period_end)
+    # is synthetic, not a period any single filed fact already has).
+    # `basis="quarterly"` only: an annual figure is already discrete, there
+    # is no cumulative-within-year problem to solve for it.
+    #
+    # `plausible_range` on capex/sbc/dep_amort is (0.0, inf) -- not a
+    # cross-company magnitude bound (this project deliberately avoids those
+    # for raw dollar metrics, see free_cash_flow's own None above), but a
+    # SIGN check: these are cash outflows/expenses that cannot legitimately
+    # be negative, so a negative subtraction result can only mean a
+    # restated endpoint the arithmetic hasn't caught up with -- caught here,
+    # at compute time, not left to a post-hoc validate pass. cfo and
+    # free_cash_flow stay `None` -- a negative operating quarter is a real,
+    # legitimate business outcome, not an error signal.
+    "cfo_discrete": MetricDef(
+        "cfo_discrete", ("cfo",), "quarterly", None, False, "capital_cash",
+        extreme_informative=False,
+        computed_separately=True,
+
+        display_name='Cash from operations (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=True, group='Capital & Cash',
+        description=(
+            'Cash from operations for this quarter alone -- filed directly where the company '
+            'tags it that way, derived by subtracting the prior cumulative filed figure where '
+            'it tags year-to-date instead (see the derived-cell marker in the Financials table).'
+        ),
+    ),
+    "capex_discrete": MetricDef(
+        "capex_discrete", ("capex",), "quarterly", (0.0, float("inf")), False, "capital_cash",
+        extreme_informative=False,
+        computed_separately=True,
+
+        display_name='Capital expenditure (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=None, group='Capital & Cash',
+        description=(
+            'Capital expenditure for this quarter alone -- filed directly or derived by '
+            'subtraction, same discipline as cfo_discrete.'
+        ),
+    ),
+    "sbc_discrete": MetricDef(
+        "sbc_discrete", ("sbc",), "quarterly", (0.0, float("inf")), False, "capital_cash",
+        extreme_informative=False,
+        computed_separately=True,
+
+        display_name='Stock-based compensation (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=False, group='Capital & Cash',
+        description=(
+            'Stock-based compensation for this quarter alone -- filed directly or derived by '
+            'subtraction, same discipline as cfo_discrete.'
+        ),
+    ),
+    "dep_amort_discrete": MetricDef(
+        "dep_amort_discrete", ("dep_amort",), "quarterly", (0.0, float("inf")), False, "capital_cash",
+        extreme_informative=False,
+        computed_separately=True,
+
+        display_name='Depreciation and amortization (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=None, group='Capital & Cash',
+        description=(
+            'Depreciation and amortization for this quarter alone -- filed directly or derived '
+            'by subtraction, same discipline as cfo_discrete.'
+        ),
+    ),
+    "free_cash_flow_discrete": MetricDef(
+        "free_cash_flow_discrete", ("cfo", "capex"), "quarterly", None, False, "capital_cash",
+        extreme_informative=False,
+        computed_separately=True,
+
+        display_name='Free cash flow (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=True, group='Capital & Cash',
+        description='cfo_discrete minus capex_discrete -- free cash flow for this quarter alone.',
+    ),
+    # --- Discrete fiscal quarters, income statement (SPEC-008 D12, approved
+    # 2026-08-08) -- same mechanism as the cash-flow block above, extended
+    # to close the specific gap D12 found: Q4 has no discrete filed fact
+    # anywhere in this project's corpus, for any company, in any year --
+    # only the 10-K's ANNUAL cumulative figure exists. `group='Income
+    # Statement'` is a new group (added to `_valid_groups` below) -- none
+    # of the seven existing groups fit a raw income-statement dollar level;
+    # forcing these under e.g. 'Margins' or 'Growth' would misfile them
+    # next to ratio/rate metrics they aren't. The Metrics page's own
+    # grouping (`_group_metrics`) already derives tabs from whatever groups
+    # exist in the registry -- confirmed live once already (SPEC-008 AC5:
+    # a throwaway metric under a brand-new category produced an eighth tab
+    # with zero page-file changes) -- so this needs no dashboard change.
+    "revenue_discrete": MetricDef(
+        "revenue_discrete", ("revenue",), "quarterly", (0.0, float("inf")), False, "income_statement",
+        extreme_informative=False,
+        computed_separately=True,
+
+        display_name='Revenue (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=True, group='Income Statement',
+        description='Revenue for this quarter alone -- filed directly, or derived by subtracting the prior '
+        'cumulative filed figure where the company tags year-to-date instead (Q4, every company: there is no '
+        'discrete Q4 10-Q, only the FY 10-K).',
+    ),
+    "cogs_discrete": MetricDef(
+        "cogs_discrete", ("cogs",), "quarterly", (0.0, float("inf")), False, "income_statement",
+        extreme_informative=False,
+        computed_separately=True,
+
+        display_name='Cost of goods sold (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=None, group='Income Statement',
+        description='Cost of goods sold for this quarter alone -- filed directly or derived by subtraction, '
+        'same discipline as revenue_discrete.',
+    ),
+    "gross_profit_discrete": MetricDef(
+        "gross_profit_discrete", ("gross_profit",), "quarterly", None, False, "income_statement",
+        extreme_informative=False,
+        computed_separately=True,
+
+        display_name='Gross profit (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=True, group='Income Statement',
+        description='Gross profit for this quarter alone -- filed directly or derived by subtraction. No '
+        'plausibility floor: a quarter genuinely can run below cost.',
+    ),
+    "rnd_expense_discrete": MetricDef(
+        "rnd_expense_discrete", ("rnd_expense",), "quarterly", (0.0, float("inf")), False, "income_statement",
+        extreme_informative=False,
+        computed_separately=True,
+
+        display_name='Research and development (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=None, group='Income Statement',
+        description='R&D expense for this quarter alone -- filed directly or derived by subtraction, same '
+        'discipline as revenue_discrete.',
+    ),
+    "sga_expense_discrete": MetricDef(
+        "sga_expense_discrete", ("sga_expense",), "quarterly", (0.0, float("inf")), False, "income_statement",
+        extreme_informative=False,
+        computed_separately=True,
+
+        display_name='SG&A (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=False, group='Income Statement',
+        description='SG&A expense for this quarter alone -- filed directly or derived by subtraction, same '
+        'discipline as revenue_discrete.',
+    ),
+    "operating_income_discrete": MetricDef(
+        "operating_income_discrete", ("operating_income",), "quarterly", None, False, "income_statement",
+        extreme_informative=False,
+        computed_separately=True,
+
+        display_name='Operating income (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=True, group='Income Statement',
+        description='Operating income for this quarter alone -- filed directly or derived by subtraction. No '
+        'plausibility floor: an operating loss is a real, legitimate result.',
+    ),
+    "interest_expense_discrete": MetricDef(
+        "interest_expense_discrete", ("interest_expense",), "quarterly", (0.0, float("inf")), False, "income_statement",
+        extreme_informative=False,
+        computed_separately=True,
+
+        display_name='Interest expense (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=None, group='Income Statement',
+        description='Interest expense for this quarter alone -- filed directly or derived by subtraction, same '
+        'discipline as revenue_discrete.',
+    ),
+    "pretax_income_discrete": MetricDef(
+        "pretax_income_discrete", ("pretax_income",), "quarterly", None, False, "income_statement",
+        extreme_informative=False,
+        computed_separately=True,
+
+        display_name='Pre-tax income (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=True, group='Income Statement',
+        description='Pre-tax income for this quarter alone -- filed directly or derived by subtraction. No '
+        'plausibility floor: a pre-tax loss is a real, legitimate result.',
+    ),
+    "tax_expense_discrete": MetricDef(
+        "tax_expense_discrete", ("tax_expense",), "quarterly", None, False, "income_statement",
+        extreme_informative=False,
+        computed_separately=True,
+
+        display_name='Income tax expense (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=None, group='Income Statement',
+        description='Income tax expense for this quarter alone -- filed directly or derived by subtraction. No '
+        'plausibility floor: a tax BENEFIT (negative expense) in a loss quarter is real, not an error.',
+    ),
+    "net_income_discrete": MetricDef(
+        "net_income_discrete", ("net_income",), "quarterly", None, False, "income_statement",
+        extreme_informative=False,
+        computed_separately=True,
+
+        display_name='Net income (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=True, group='Income Statement',
+        description='Net income for this quarter alone -- filed directly or derived by subtraction. No '
+        'plausibility floor: a net loss is a real, legitimate result.',
     ),
     "fcf_margin": MetricDef(
         "fcf_margin", ("cfo", "capex", "revenue"), "both", (-2.0, 1.0), False, "capital_cash"
@@ -823,6 +1052,7 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         display_name='Beneish M-score', unit='ratio', precision=2,
         higher_is_better=False, group='Quality',
         description='Composite earnings-manipulation index; above -1.78 is the conventional flag threshold.',
+        flag_threshold=-1.78,
     ),
     # All 8 components: headline=False -- an analyst reads these as
     # beneish_m_score's inputs, not as findings in their own right. Only the
@@ -903,7 +1133,7 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         # The one Beneish index computed from a single period -- no t-1 comparison.
         "beneish_tata", ("net_income", "cfo", "total_assets"), "annual", (-2.0, 2.0), False, "quality",
         headline=False,
-    
+
         display_name='Beneish TATA', unit='ratio', precision=2,
         higher_is_better=False, group='Quality',
         description='Total accruals to total assets -- a Beneish M-score component.',
@@ -919,7 +1149,10 @@ def _validate_metric_display_metadata() -> None:
     a dashboard module happens to import it first -- the invariant must hold
     regardless of import order."""
     _valid_units = {"percent", "usd", "usd_per_share", "days", "ratio", "times"}
-    _valid_groups = {"Growth", "Margins", "Returns", "Capital & Cash", "Working Capital", "Solvency", "Quality"}
+    _valid_groups = {
+        "Growth", "Margins", "Returns", "Capital & Cash", "Working Capital", "Solvency", "Quality",
+        "Income Statement",
+    }
     for _name, _mdef in METRIC_REGISTRY.items():
         if not _mdef.display_name:
             raise RuntimeError(f"Metric {_name!r} has no display_name (SPEC-008 R1)")
@@ -959,6 +1192,16 @@ DUPONT_RECONCILIATION_TOLERANCE: float = 0.01
 GROSS_PROFIT_CROSSCHECK_TOLERANCE: float = 0.01
 DEBT_RECONCILIATION_TOLERANCE: float = 0.01
 ALIAS_AGREEMENT_TOLERANCE: float = 0.01
+# SPEC-008 C4 (approved 2026-08-08): unlike the other reconciliation
+# tolerances above (all relative, business-meaningful gaps), Q1+Q2+Q3+Q4
+# discrete = filed FY is an algebraic identity -- it telescopes exactly by
+# construction whenever every input is drawn from one consistent vintage
+# (metrics._resolve_discrete_quarter_metrics's docstring has the proof). A
+# tiny ABSOLUTE dollar tolerance, not a relative one: any nonzero gap beyond
+# float noise means either a real derivation bug or a restated endpoint that
+# hasn't propagated to every quarter that depends on it -- exactly the
+# failure mode this check exists to catch.
+DISCRETE_QUARTER_SUM_TOLERANCE_USD: float = 1.0
 # Raised 1% -> 2% live (R6a): the 1% floor let a near-zero Δrevenue amplify noise into
 # a range-shaped outlier. Guarding the denominator, not the output range.
 INCREMENTAL_MARGIN_MIN_REVENUE_DELTA_PCT: float = 0.02
@@ -1700,8 +1943,16 @@ BRIEF_PREDICTIVE_TERMS: tuple[str, ...] = (
 
 # R3: prompt file identity, versioned per the same convention as SPEC-006
 # (a prompt change is a new version file, never an edit to an existing one).
+#
+# v2 (SPEC-008 review D6, found live): added a constraint requiring the model
+# to copy a cited item's own number formatting verbatim rather than
+# recomputing it (Amazon's brief showed "51.82%", Micron's showed the same
+# metric as a raw ratio "0.8456" one page over). This bumps input_hash for
+# every filing, so the next generate-briefs run will treat every filing as
+# uncached and re-call the LLM at real cost -- NOT run without approval; see
+# ARCHITECTURE.md's decision log and SPEC-008's changelog for this entry.
 BRIEF_GENERATOR_PROMPT_NAME: str = "filing_brief"
-BRIEF_GENERATOR_PROMPT_VERSION: str = "v1"
+BRIEF_GENERATOR_PROMPT_VERSION: str = "v2"
 
 # R5: the adversarial verifier pass has its OWN version, independent of the
 # generator's prompt_version -- R1: "a change to the verifier can change

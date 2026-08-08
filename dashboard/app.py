@@ -29,6 +29,11 @@ if not components.require_auth():
 # R4a: one control, everywhere -- rendered exactly once, here.
 components.sidebar_company_selector()
 
+# Found live (C4 rebuild): a bare `streamlit` on PATH silently resolved to a
+# different install than this project's `.venv` -- always visible so that
+# stops being a guess.
+components.environment_caption()
+
 pages = st.navigation(
     [
         # Every page module exposes a function named `render` (consistent,

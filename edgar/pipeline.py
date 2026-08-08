@@ -209,6 +209,11 @@ def cmd_compute_metrics(args: argparse.Namespace) -> None:
     conn = db.get_connection()
     try:
         results = metrics.compute_metrics(conn, tickers=tickers, metric_names=metric_names)
+        # SPEC-008 C4: discrete-quarter metrics (cfo_discrete, ...) are a
+        # separate pass -- their own (period_start, period_end) is synthetic,
+        # not one of the periods the generic loop above discovers from real
+        # fact durations (see compute_discrete_quarter_metrics's docstring).
+        results += metrics.compute_discrete_quarter_metrics(conn, tickers=tickers, metric_names=metric_names)
         computed = [r for r in results if r["value"] is not None]
         nulls = [r for r in results if r["value"] is None]
         print(f"{len(results)} metric row(s) written/updated: {len(computed)} computed, {len(nulls)} NULL.")

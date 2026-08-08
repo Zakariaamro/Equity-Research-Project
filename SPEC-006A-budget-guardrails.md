@@ -197,3 +197,12 @@ The specific failure that caused this incident should announce itself if it recu
   invisible refusals get misdiagnosed as bugs.
 - Record the incident honestly in `ARCHITECTURE.md`, including that the original cap was
   correct and still insufficient. That is the instructive part.
+- L3, L6, and L7 all assume a synchronous run: cost is known, per call, as soon as that
+  call completes, which is what lets a limit stop the run **before** the next call goes out.
+  The Anthropic Batches API was investigated for section analysis (ARCHITECTURE.md decision
+  log #64) and rejected at this project's current scale, in part because it breaks that
+  assumption — per-request cost is invisible until the whole batch reaches
+  `processing_status: "ended"`, so L3/L7 would degrade from a live circuit breaker to a
+  pre-submission estimate gate. Revisit only if annual section-analysis spend approaches
+  ≈$12/year (see decision #64 for the reasoning); until then this is a closed question, not
+  an open one waiting for someone to notice the 50% discount.

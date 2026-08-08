@@ -147,6 +147,24 @@ def test_extreme_skips_compounding_level_metrics():
     assert non_informative <= set(config.METRIC_REGISTRY)
     for name in non_informative:
         assert config.METRIC_REGISTRY[name].extreme_informative is False
+
+
+def test_extreme_statement_uses_display_name_and_registry_formatting(conn):
+    # SPEC-008 review D5 (found live): statements used to embed the raw
+    # snake_case identifier and an unformatted ratio, e.g. "gross_margin of
+    # 0.8456 is the highest in 21 quarters." -- the registry has carried
+    # display_name/unit/precision for every metric since SPEC-008 v1.1; this
+    # pins that observations.py actually reads it.
+    values = [0.40, 0.41, 0.42, 0.43, 0.90]
+    for i, v in enumerate(values):
+        year = 2020 + i
+        _insert_filing(conn, f"accgm{year}", AMZN_CIK, "10-K", f"{year}-12-31", year, "FY")
+        _insert_metric(conn, AMZN_CIK, f"{year}-01-01", f"{year}-12-31", "gross_margin", v)
+    obs = observations._rule_metric_multi_year_extreme(conn, AMZN_CIK)
+    statement = next(o.statement for o in obs if o.subject == "gross_margin")
+    assert "gross_margin" not in statement
+    assert "Gross margin" in statement
+    assert "90.0%" in statement  # a percentage, not the raw ratio 0.9
     # Spot-check a ratio metric stays informative.
     assert config.METRIC_REGISTRY["gross_margin"].extreme_informative is True
 

@@ -20,6 +20,14 @@ dependencies = [
     # native charts don't expose.
     "streamlit>=1.51",
     "plotly>=5.24",
+    # SPEC-006: the real Anthropic client (edgar/llm.py's _RealAnthropicClient,
+    # imported lazily so it's only required when an actual API call is made).
+    # Found missing from this file entirely on the first real run since the
+    # dashboard build -- previously present in whichever environment executed
+    # SPEC-006/007's paid runs, but never declared here, so a fresh venv
+    # (this one included) had no way to know it was needed until `import
+    # anthropic` failed at call time.
+    "anthropic>=0.40",
 ]
 
 [project.optional-dependencies]

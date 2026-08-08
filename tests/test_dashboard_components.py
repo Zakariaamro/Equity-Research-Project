@@ -1,0 +1,581 @@
+"""SPEC-008 review, post-D1: rendering-path tests for components.py's
+narrative renderers. The unit test on `format.escape_markdown_currency`
+proves the helper works in isolation; it does not prove any given render
+function actually calls it -- drop the call from `brief_sentence` and that
+test still passes. These run the real function through `AppTest` (headless
+Streamlit) and assert on what actually reaches a markdown-parsed element:
+no bare '$' should survive, since an unescaped pair is what Streamlit's
+markdown renders as LaTeX math-mode delimiters (SPEC-008 review D1)."""
+
+from __future__ import annotations
+
+from streamlit.testing.v1 import AppTest
+
+from dashboard import format as fmt_module
+
+
+def _rendered_texts(at: AppTest) -> list[str]:
+    return [m.value for m in at.markdown] + [c.value for c in at.caption]
+
+
+def _assert_no_bare_dollar(texts: list[str]) -> None:
+    for text in texts:
+        assert "$" not in text.replace(r"\$", ""), f"unescaped '$' reached Streamlit: {text!r}"
+
+
+def test_brief_sentence_escapes_currency_through_the_real_render_path():
+    def script(sentence):
+        from dashboard import components
+
+        components.brief_sentence(sentence)
+
+    sentence = {
+        "sentence_type": "restatement",
+        "text": "Amazon secured a $35.0 billion equity commitment and a $20.0 billion financing facility.",
+        "sources": [
+            {"severity": "high", "text": "The note discloses $1.0 billion and $2.0 billion separately."},
+        ],
+    }
+    at = AppTest.from_function(script, kwargs={"sentence": sentence})
+    at.run()
+    texts = _rendered_texts(at)
+    assert any("35.0 billion" in t and "20.0 billion" in t for t in texts)
+    _assert_no_bare_dollar(texts)
+
+
+def test_brief_sentence_with_zero_sources_has_no_caret_at_all():
+    # SPEC-008 C2 v3 (2026-08-04 -- ARCHITECTURE.md decision log has the
+    # full sequence: v1's visible count line, v2's raw-HTML caret rejected
+    # after failing live twice, this v3 native-Streamlit caret): a sentence
+    # with NO sources renders as a single, un-columned line with no popover
+    # at all -- its absence, next to every other sentence's caret, is what
+    # makes it conspicuous.
+    def script(sentence):
+        from dashboard import components
+
+        components.brief_sentence(sentence)
+
+    sentence = {"sentence_type": "restatement", "text": "A sentence with no sources.", "sources": []}
+    at = AppTest.from_function(script, kwargs={"sentence": sentence})
+    at.run()
+    markdown_values = [m.value for m in at.markdown]
+    assert any(v == "A sentence with no sources." for v in markdown_values)
+    assert not list(at.columns)
+    assert not at.get("popover")
+
+
+def test_brief_sentence_with_sources_renders_a_popover_caret_carrying_the_count():
+    def script(sentence):
+        from dashboard import components
+
+        components.brief_sentence(sentence)
+
+    sentence = {
+        "sentence_type": "juxtaposition",
+        "text": "A sentence with three sources.",
+        "sources": [
+            {"severity": "high", "text": "source one"},
+            {"severity": "medium", "text": "source two"},
+            {"severity": "low", "text": "source three"},
+        ],
+    }
+    at = AppTest.from_function(script, kwargs={"sentence": sentence})
+    at.run()
+    assert any(m.value == "A sentence with three sources." for m in at.markdown)
+    popovers = at.get("popover")
+    assert len(popovers) == 1
+    # Confirmed live: st.popover already renders its own disclosure
+    # chevron -- an explicit label doubled it up. The label stays empty;
+    # the widget's own indicator is the entire visible caret.
+    assert popovers[0].proto.popover.label == ""
+    assert popovers[0].proto.popover.help == "3 sources"  # the count, a hover tooltip, not a visible line
+    caption_values = [c.value for c in popovers[0].caption]
+    assert any("source one" in c for c in caption_values)
+    assert any("source two" in c for c in caption_values)
+    assert any("source three" in c for c in caption_values)
+
+
+def test_brief_sentence_display_drops_the_sentence_type_prefix():
+    # SPEC-008 C2: [restatement]/[juxtaposition]/[grouping] is display-only
+    # scaffolding, dropped here -- sentence_type itself stays in the
+    # database unchanged (SPEC-007 R4 dispatches verification on it;
+    # ROADMAP-V2 measures the type distribution from it).
+    def script(sentence):
+        from dashboard import components
+
+        components.brief_sentence(sentence)
+
+    sentence = {"sentence_type": "restatement", "text": "Plain sentence text.", "sources": []}
+    at = AppTest.from_function(script, kwargs={"sentence": sentence})
+    at.run()
+    markdown_values = [m.value for m in at.markdown]
+    assert any(v == "Plain sentence text." for v in markdown_values)
+    assert not any("[restatement]" in v for v in markdown_values)
+
+
+def test_finding_item_escapes_currency_through_the_real_render_path():
+    def script(finding):
+        from dashboard import components
+
+        components.finding_item(finding)
+
+    finding = {
+        "severity": "high",
+        "category": "liquidity",
+        "headline": "Two commitments disclosed: $425 million and $20 million.",
+        "detail": "Detail also cites $1 million and $2 million.",
+        "quote": "The quote itself references $3 million and $4 million in damages.",
+    }
+    at = AppTest.from_function(script, kwargs={"finding": finding})
+    at.run()
+    texts = _rendered_texts(at)
+    assert any("425 million" in t and "20 million" in t for t in texts)
+    _assert_no_bare_dollar(texts)
+
+
+def test_observation_item_escapes_currency_through_the_real_render_path():
+    def script(obs):
+        from dashboard import components
+
+        components.observation_item(obs)
+
+    obs = {
+        "severity": "medium",
+        "statement": "Inventory rose $100 million while revenue fell $50 million.",
+    }
+    at = AppTest.from_function(script, kwargs={"obs": obs})
+    at.run()
+    texts = _rendered_texts(at)
+    assert any("100 million" in t and "50 million" in t for t in texts)
+    _assert_no_bare_dollar(texts)
+
+
+def test_null_metric_reason_is_reachable_in_full():
+    # SPEC-008 review D3: `st.metric`'s value string is truncated to the
+    # tile's column width -- a NULL reason rendered there (satisfying AC9's
+    # letter) was unreachable in practice. The full reason must appear
+    # somewhere in the rendered output, untruncated.
+    def script(label, null_reason):
+        from dashboard import components
+
+        components.null_metric_tile(label, null_reason)
+
+    long_reason = "no data computed for this company/period because the underlying XBRL concept was never tagged in any filing on record"
+    at = AppTest.from_function(script, kwargs={"label": "Free cash flow ($m)", "null_reason": long_reason})
+    at.run()
+    all_text = [m.value for m in at.metric] + [c.value for c in at.caption]
+    assert any(long_reason in t for t in all_text)
+
+
+def test_null_metric_tile_caption_does_not_repeat_not_available():
+    # Reported live: value read "Not available", caption read "Not
+    # available -- capex missing" -- the caption repeated a fact the
+    # metric's own value already stated. The caption should carry only the
+    # reason.
+    def script(label, null_reason):
+        from dashboard import components
+
+        components.null_metric_tile(label, null_reason)
+
+    at = AppTest.from_function(script, kwargs={"label": "Capex to revenue", "null_reason": "capex missing"})
+    at.run()
+    assert at.metric[0].value == "Not available"
+    captions = [c.value for c in at.caption]
+    assert "capex missing" in captions
+    assert not any("Not available" in c for c in captions)
+
+
+def test_null_metric_reason_is_reachable_when_the_row_exists_with_a_null_value():
+    # SPEC-008 review D3, second null path (found live, second review pass):
+    # `metric_tile`'s `latest is None` branch (a row was never computed at
+    # all) was fixed first, but Micron's actual tiles hit a DIFFERENT
+    # branch -- a row EXISTS with `value=None` and a `null_reason`.
+    # `format_metric_value` used to fold that into one string straight into
+    # `st.metric`, truncated exactly like the other path. This test covers
+    # the row-exists case the first D3 test did not.
+    def script(metric_def, latest):
+        from dashboard import components
+
+        components.metric_tile(metric_def, latest)
+
+    from edgar import config
+
+    mdef = config.METRIC_REGISTRY["roic"]
+    long_reason = "cfo missing because the debt-tag resolution gap leaves this quarter's cash flow statement unresolved"
+    latest = {"value": None, "null_reason": long_reason, "period_end": "2026-05-28"}
+    at = AppTest.from_function(script, kwargs={"metric_def": mdef, "latest": latest})
+    at.run()
+    all_text = [m.value for m in at.metric] + [c.value for c in at.caption]
+    assert any(long_reason in t for t in all_text)
+    assert any(m.value == fmt_module.NOT_AVAILABLE for m in at.metric)
+
+
+def test_beneish_m_score_tile_shows_its_flag_threshold():
+    # SPEC-008 review D7: a bare "-2.75" means nothing without the
+    # conventional threshold it is measured against.
+    def script(metric_def, latest):
+        from dashboard import components
+
+        components.metric_tile(metric_def, latest)
+
+    from edgar import config
+
+    mdef = config.METRIC_REGISTRY["beneish_m_score"]
+    latest = {"value": -2.61, "period_end": "2026-02-06", "null_reason": None}
+    at = AppTest.from_function(script, kwargs={"metric_def": mdef, "latest": latest})
+    at.run()
+    captions = [c.value for c in at.caption]
+    assert any("-1.78" in c for c in captions)
+
+
+def test_metric_tile_omits_threshold_caption_when_none_is_set():
+    def script(metric_def, latest):
+        from dashboard import components
+
+        components.metric_tile(metric_def, latest)
+
+    from edgar import config
+
+    mdef = config.METRIC_REGISTRY["gross_margin"]
+    assert mdef.flag_threshold is None
+    latest = {"value": 0.42, "period_end": "2026-02-06", "null_reason": None}
+    at = AppTest.from_function(script, kwargs={"metric_def": mdef, "latest": latest})
+    at.run()
+    captions = [c.value for c in at.caption]
+    assert not any("threshold" in c.lower() for c in captions)
+
+
+def test_metric_tile_bolds_the_caption_when_its_period_differs_from_the_anchor():
+    # SPEC-008 review D8: Micron's cash row showed an annual-basis tile
+    # nine months older than its quarterly-basis neighbours, labelled
+    # correctly but at the same type size and weight -- easy to misread as
+    # comparable. Weight (bold), not colour, marks the mismatch.
+    def script(metric_def, latest, anchor_period_end):
+        from dashboard import components
+
+        components.metric_tile(metric_def, latest, anchor_period_end=anchor_period_end)
+
+    from edgar import config
+
+    mdef = config.METRIC_REGISTRY["free_cash_flow"]
+    latest = {"value": -18_171_000_000, "period_end": "2025-08-28", "null_reason": None}
+    at = AppTest.from_function(
+        script, kwargs={"metric_def": mdef, "latest": latest, "anchor_period_end": "2026-05-28"}
+    )
+    at.run()
+    captions = [c.value for c in at.caption]
+    assert any(c.startswith("**") and "different period" in c for c in captions)
+
+
+def test_observation_ids_cited_in_brief_extracts_observation_refs_only():
+    # SPEC-008 review D10: the same observation must not appear verbatim in
+    # both "The brief" and "What changed?" -- this is the set the caller
+    # (overview.py) excludes from "What changed?". Finding sources are a
+    # different kind and must not leak into this set. Uses the shape
+    # data.get_brief_sentences actually returns: resolved `sources`, each
+    # carrying `kind` ("observation" | "finding") and the full `row`.
+    from dashboard import components
+
+    sentences = [
+        {
+            "sources": [
+                {"kind": "observation", "row": {"id": 1}},
+                {"kind": "finding", "row": {"id": 99}},
+            ]
+        },
+        {"sources": [{"kind": "observation", "row": {"id": 2}}]},
+        {"sources": []},
+    ]
+    assert components.observation_ids_cited_in_brief(sentences) == {1, 2}
+
+
+def test_metric_tile_caption_is_plain_when_its_period_matches_the_anchor():
+    def script(metric_def, latest, anchor_period_end):
+        from dashboard import components
+
+        components.metric_tile(metric_def, latest, anchor_period_end=anchor_period_end)
+
+    from edgar import config
+
+    mdef = config.METRIC_REGISTRY["free_cash_flow"]
+    latest = {"value": -18_171_000_000, "period_end": "2026-05-28", "null_reason": None}
+    at = AppTest.from_function(
+        script, kwargs={"metric_def": mdef, "latest": latest, "anchor_period_end": "2026-05-28"}
+    )
+    at.run()
+    captions = [c.value for c in at.caption]
+    assert not any("different period" in c for c in captions)
+
+
+# --- environment visibility ---
+
+
+def test_environment_caption_shows_the_running_streamlit_version(monkeypatch):
+    import streamlit as st
+
+    monkeypatch.setattr(st, "__version__", "1.60.0")
+
+    def script():
+        from dashboard import components
+
+        components.environment_caption()
+
+    at = AppTest.from_function(script)
+    at.run()
+    assert at.exception == []
+    captions = [c.value for c in at.sidebar.caption]
+    assert any("1.60.0" in c for c in captions)
+    assert not at.sidebar.warning
+
+
+def test_environment_caption_warns_below_this_projects_declared_floor(monkeypatch):
+    # SPEC-008 review (found live, C4 rebuild): a bare `streamlit` on PATH
+    # resolved to Anaconda's 1.51.0, not this project's `.venv` -- exactly
+    # this project's declared floor, which is why the check compares
+    # against the floor rather than against whatever `.venv` happens to
+    # have installed.
+    import streamlit as st
+
+    monkeypatch.setattr(st, "__version__", "1.40.0")
+
+    def script():
+        from dashboard import components
+
+        components.environment_caption()
+
+    at = AppTest.from_function(script)
+    at.run()
+    assert at.exception == []
+    warnings = [w.value for w in at.sidebar.warning]
+    assert any("1.40.0" in w and "below" in w for w in warnings)
+
+
+# --- C5: shared sub-tab bar ---
+
+
+def test_sub_tab_bar_renders_options_horizontally_and_defaults_to_the_first():
+    def script():
+        from dashboard import components
+
+        selected = components.sub_tab_bar("demo", "Category", ["Alpha", "Beta", "Gamma"])
+        import streamlit as st
+
+        st.write(f"selected: {selected}")
+
+    at = AppTest.from_function(script)
+    at.run()
+    radios = [r for r in at.radio if r.key == "sub_tab__demo"]
+    assert len(radios) == 1
+    assert radios[0].options == ["Alpha", "Beta", "Gamma"]
+    assert any(m.value == "selected: Alpha" for m in at.markdown)
+
+
+def test_sub_tab_bar_selection_survives_an_unrelated_rerun():
+    # SPEC-008 C5: sub-tab selection must survive company switching the way
+    # the sidebar company selector already survives page switching (R4a).
+    # Simulated here as a full rerun triggered by a DIFFERENT widget --
+    # exactly what a sidebar multiselect change looks like from this
+    # widget's point of view.
+    def script():
+        from dashboard import components
+
+        components.sub_tab_bar("demo", "Category", ["Alpha", "Beta", "Gamma"])
+        import streamlit as st
+
+        st.checkbox("unrelated", key="unrelated_widget")
+
+    at = AppTest.from_function(script)
+    at.run()
+    at.radio(key="sub_tab__demo").set_value("Gamma").run()
+    assert at.radio(key="sub_tab__demo").value == "Gamma"
+    at.checkbox(key="unrelated_widget").set_value(True).run()
+    assert at.radio(key="sub_tab__demo").value == "Gamma"
+
+
+def test_sub_tab_bar_keys_are_namespaced_so_two_bars_do_not_collide():
+    def script():
+        from dashboard import components
+
+        components.sub_tab_bar("page_a", "Category", ["X", "Y"])
+        components.sub_tab_bar("page_b", "Statement", ["P", "Q"])
+
+    at = AppTest.from_function(script)
+    at.run()
+    assert at.exception == []
+    keys = {r.key for r in at.radio}
+    assert "sub_tab__page_a" in keys
+    assert "sub_tab__page_b" in keys
+
+
+# --- C4: the multi-period statement table ---
+
+
+def _col(period_end: str) -> str:
+    """The dataframe's column header is `fmt.format_date`'s output, not the
+    raw ISO period_end string -- matches what `statement_table` actually
+    builds its columns from."""
+    return fmt_module.format_date(period_end)
+
+
+def _table_fixture(with_growth: bool = True, with_fallback: bool = False):
+    periods = [{"period_end": "2025-03-31"}, {"period_end": "2025-06-30"}]
+    rows = [
+        {
+            "label": "Revenue",
+            "canonical": "revenue",
+            "cells": [
+                {"period_end": "2025-03-31", "value": 100_000_000, "growth_pct": None, "is_derived_quarter": False},
+                {
+                    "period_end": "2025-06-30", "value": 150_000_000,
+                    "growth_pct": 0.5 if with_growth else None, "is_derived_quarter": with_fallback,
+                },
+            ],
+        },
+    ]
+    return rows, periods
+
+
+def test_statement_table_renders_growth_as_a_separate_row_beneath_the_value():
+    def script(rows, periods):
+        from dashboard import components
+
+        components.statement_table(rows, periods, show_growth=True, key="t")
+
+    rows, periods = _table_fixture(with_growth=True)
+    at = AppTest.from_function(script, kwargs={"rows": rows, "periods": periods})
+    at.run()
+    assert at.exception == []
+    df = at.dataframe[0].value
+    assert df.iloc[0][_col("2025-06-30")] == "150"  # the filed value itself, unmarked (R1: rendered in millions)
+    # SPEC-008 C4 constraint 1: a separate row, directly beneath its line
+    # item, carries the derived figure -- load-bearing, not decorative
+    # (renamed from the old caption-based mechanism, same requirement).
+    assert df.iloc[1]["Line item"].strip().endswith("Growth %")
+    assert df.iloc[1][_col("2025-06-30")] == "+50.0%"
+    captions = [c.value for c in at.caption]
+    assert any("derived by this project, not filed" in c for c in captions)
+
+
+def test_statement_table_renders_n_slash_m_for_a_flagged_growth_cell():
+    # SPEC-008-batch-1 item 2 (D14): data.py's growth_not_meaningful flag
+    # renders as "n/m", not the raw (misleading) percentage, and not blank
+    # (blank means "nothing to compare", a different case).
+    def script(rows, periods):
+        from dashboard import components
+
+        rows[0]["cells"][1]["growth_not_meaningful"] = "near_zero_base"
+        components.statement_table(rows, periods, show_growth=True, key="t")
+
+    rows, periods = _table_fixture(with_growth=True)
+    at = AppTest.from_function(script, kwargs={"rows": rows, "periods": periods})
+    at.run()
+    assert at.exception == []
+    df = at.dataframe[0].value
+    assert df.iloc[1][_col("2025-06-30")] == "n/m"
+
+
+def test_statement_table_omits_growth_when_toggle_is_off():
+    def script(rows, periods):
+        from dashboard import components
+
+        components.statement_table(rows, periods, show_growth=False, key="t")
+
+    rows, periods = _table_fixture(with_growth=True)
+    at = AppTest.from_function(script, kwargs={"rows": rows, "periods": periods})
+    at.run()
+    df = at.dataframe[0].value
+    assert len(df) == 1  # no growth sub-row at all
+    captions = [c.value for c in at.caption]
+    assert not any("%" in c for c in captions)
+
+
+def test_statement_table_marks_derived_quarter_cells_and_adds_a_footnote():
+    def script(rows, periods):
+        from dashboard import components
+
+        components.statement_table(rows, periods, show_growth=True, key="t")
+
+    rows, periods = _table_fixture(with_growth=False, with_fallback=True)
+    at = AppTest.from_function(script, kwargs={"rows": rows, "periods": periods})
+    at.run()
+    df = at.dataframe[0].value
+    assert "†" in df.iloc[0][_col("2025-06-30")]
+    captions = [c.value for c in at.caption]
+    assert any("derived" in c and "subtracts the prior quarter" in c for c in captions)
+
+
+def test_statement_table_blank_cell_marks_with_default_gap_cause():
+    def script(rows, periods):
+        from dashboard import components
+
+        rows[0]["cells"][1]["value"] = None
+        components.statement_table(rows, periods, show_growth=True, key="t")
+
+    rows, periods = _table_fixture()
+    at = AppTest.from_function(script, kwargs={"rows": rows, "periods": periods})
+    at.run()
+    df = at.dataframe[0].value
+    assert df.iloc[0][_col("2025-06-30")] == "—"  # cell has no blank_cause -- defaults to "gap", the bare marker
+    captions = [c.value for c in at.caption]
+    assert any(c.startswith("— not tagged") for c in captions)
+
+
+def test_statement_table_split_blank_cause_gets_a_distinct_marker_and_footnote():
+    def script(rows, periods):
+        from dashboard import components
+
+        rows[0]["cells"][0]["value"] = None
+        rows[0]["cells"][0]["blank_cause"] = "split"
+        rows[0]["cells"][0]["blank_reason"] = "this period's figure is in the other row instead"
+        components.statement_table(rows, periods, show_growth=False, key="t")
+
+    rows, periods = _table_fixture()
+    at = AppTest.from_function(script, kwargs={"rows": rows, "periods": periods})
+    at.run()
+    assert at.exception == []
+    df = at.dataframe[0].value
+    assert df.iloc[0][_col("2025-03-31")] == "— °"
+    captions = [c.value for c in at.caption]
+    assert any(c.startswith("° ") for c in captions)
+    assert not any(c.startswith("— not tagged") for c in captions)  # no plain "gap" cell in this fixture
+
+
+def test_statement_table_shows_all_periods_with_no_windowing_or_checkbox():
+    # Live review, C4: the "show full history" checkbox and its hidden
+    # default window were removed -- every period renders, always, no
+    # widget deciding otherwise.
+    periods = [{"period_end": f"2020-{m:02d}-15"} for m in range(1, 13)]  # far more than the old default of 8
+    rows = [
+        {
+            "label": "Revenue",
+            "canonical": "revenue",
+            "cells": [
+                {"period_end": p["period_end"], "value": i * 1_000_000, "growth_pct": None, "is_derived_quarter": False}
+                for i, p in enumerate(periods)
+            ],
+        },
+    ]
+
+    def script(rows, periods):
+        from dashboard import components
+
+        components.statement_table(rows, periods, show_growth=False, key="t")
+
+    at = AppTest.from_function(script, kwargs={"rows": rows, "periods": periods})
+    at.run()
+    assert at.exception == []
+    df = at.dataframe[0].value
+    assert list(df.columns)[1:] == [_col(p["period_end"]) for p in periods]
+    assert not at.checkbox
+
+
+def test_statement_table_empty_when_no_rows():
+    def script():
+        from dashboard import components
+
+        components.statement_table([], [{"period_end": "2025-03-31"}], show_growth=False, key="t")
+
+    at = AppTest.from_function(script)
+    at.run()
+    assert at.exception == []
+    assert any(i.value for i in at.info)

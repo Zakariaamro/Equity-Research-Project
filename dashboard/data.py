@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import statistics
 from pathlib import Path
 
 import streamlit as st
@@ -89,14 +90,23 @@ def get_companies(db_path: Path = DEFAULT_DB_PATH) -> list[dict]:
 def get_anchor_filing(cik: str, db_path: Path = DEFAULT_DB_PATH) -> dict | None:
     """The Overview page's header filing: the latest 10-K or 10-Q, NEVER an
     8-K (SPEC-008 v1.1) -- an 8-K has no sections, metrics, findings, or
-    brief, and a page built around those cannot be "about" one."""
+    brief, and a page built around those cannot be "about" one.
+
+    SPEC-008 review D2 (found live): this query used to select only
+    `filings` columns, with the caller (`overview.py`) patching in `ticker`
+    by hand afterward -- `company_name` was never patched in anywhere, so
+    every Overview header rendered "(MU)"/"(AMZN)" with an empty name before
+    the ticker. Joined to `companies` here, like `get_filing`/
+    `get_all_filings` already do, so the caller doesn't need to patch
+    anything in."""
     return _one(
         db_path,
         """
-        SELECT accession_no, form_type, filing_date, period_end, fiscal_year, fiscal_period, cik
-        FROM filings
-        WHERE cik = ? AND form_type IN (?, ?)
-        ORDER BY filing_date DESC, accession_no DESC LIMIT 1
+        SELECT f.accession_no, f.form_type, f.filing_date, f.period_end, f.fiscal_year, f.fiscal_period, f.cik,
+               c.ticker, c.name AS company_name
+        FROM filings f JOIN companies c ON c.cik = f.cik
+        WHERE f.cik = ? AND f.form_type IN (?, ?)
+        ORDER BY f.filing_date DESC, f.accession_no DESC LIMIT 1
         """,
         (cik, config.TENK_FORM_TYPE, config.TENQ_FORM_TYPE),
     )
@@ -151,9 +161,12 @@ def get_filing(accession_no: str, db_path: Path = DEFAULT_DB_PATH) -> dict | Non
 
 def get_brief_sentences(accession_no: str, db_path: Path = DEFAULT_DB_PATH) -> list[dict]:
     """Every kept sentence of a filing's most recent brief, each carrying
-    its own resolved sources (for adjacent-display, never behind a click --
-    binding, SPEC-007 Residual Risk) and `max_source_severity` (0=high,
-    1=medium, 2=low) for the top-6 ranking (SPEC-008 R3)."""
+    its own resolved sources (SPEC-007 Residual Risk's binding mitigation,
+    amended by SPEC-008 C2 -- 2026-07-31: sources now collapse behind a
+    click, but this resolution is still what makes the always-visible
+    source count possible, since the count is computed from these same
+    resolved sources) and `max_source_severity` (0=high, 1=medium, 2=low)
+    for the top-6 ranking (SPEC-008 R3)."""
     brief_row = _one(
         db_path, "SELECT id FROM briefs WHERE accession_no = ? ORDER BY id DESC LIMIT 1", (accession_no,)
     )
@@ -359,37 +372,71 @@ def get_filing_detail(accession_no: str, db_path: Path = DEFAULT_DB_PATH) -> dic
 # R4: "Curated lines, not full GAAP presentation." Every entry is an
 # EXISTING canonical input already in config.CONCEPT_REGISTRY -- no new
 # concepts, no new database columns (Constraints).
-INCOME_STATEMENT_LINES: tuple[tuple[str, str], ...] = (
-    ("revenue", "Revenue"),
-    ("cogs", "Cost of goods sold"),
-    ("gross_profit", "Gross profit"),
-    ("rnd_expense", "Research and development"),
-    ("sga_expense", "Selling, general and administrative"),
-    ("operating_income", "Operating income"),
-    ("interest_expense", "Interest expense"),
-    ("pretax_income", "Pre-tax income"),
-    ("tax_expense", "Income tax expense"),
-    ("net_income", "Net income"),
+#
+# Each entry is (canonical, label, fallback_canonical, fallback_label).
+# `fallback_canonical`/`fallback_label` are None for the common case (no
+# fallback). Where set (SPEC-008 review, PP&E follow-up, found live): the
+# PRIMARY canonical is a narrower fact than the fallback (e.g. `ppe_net`
+# excludes finance-lease ROU assets; `ppe_and_lease_net` includes them) --
+# never the same fact under a different name, so the fallback is never
+# added as an alias of the primary in CONCEPT_REGISTRY (that would be the
+# alias-purity violation ARCHITECTURE.md §2.1 warns against, the same one
+# already refused for Micron's combined debt tag). When the fallback
+# resolves, the row's `label` becomes `fallback_label`, not the primary
+# label with a parenthetical note -- a reader scanning the row must see a
+# label that accurately names the number next to it, not one that has to
+# be read alongside a note to avoid being misled.
+# SPEC-008 D12 (approved 2026-08-08): every duration-based line declares a
+# `_discrete` fallback_canonical -- Q4 has no discrete filed fact anywhere
+# in this project's corpus, for any company, in any year (only the 10-K's
+# ANNUAL cumulative figure exists; there is no "Q4 10-Q"). `fallback_label
+# == label` on every one, exactly the cash-flow pattern (SPEC-008 C4):
+# merges into ONE row, filed where tagged directly (Q1/Q2/Q3, usually),
+# derived by subtraction where not (Q4, always).
+INCOME_STATEMENT_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
+    ("revenue", "Revenue", "revenue_discrete", "Revenue"),
+    ("cogs", "Cost of goods sold", "cogs_discrete", "Cost of goods sold"),
+    ("gross_profit", "Gross profit", "gross_profit_discrete", "Gross profit"),
+    ("rnd_expense", "Research and development", "rnd_expense_discrete", "Research and development"),
+    (
+        "sga_expense", "Selling, general and administrative",
+        "sga_expense_discrete", "Selling, general and administrative",
+    ),
+    ("operating_income", "Operating income", "operating_income_discrete", "Operating income"),
+    ("interest_expense", "Interest expense", "interest_expense_discrete", "Interest expense"),
+    ("pretax_income", "Pre-tax income", "pretax_income_discrete", "Pre-tax income"),
+    ("tax_expense", "Income tax expense", "tax_expense_discrete", "Income tax expense"),
+    ("net_income", "Net income", "net_income_discrete", "Net income"),
 )
-BALANCE_SHEET_LINES: tuple[tuple[str, str], ...] = (
-    ("cash", "Cash and cash equivalents"),
-    ("short_term_investments", "Short-term investments"),
-    ("receivables", "Accounts receivable"),
-    ("inventory", "Inventory"),
-    ("current_assets", "Total current assets"),
-    ("ppe_net", "Property, plant and equipment, net"),
-    ("total_assets", "Total assets"),
-    ("payables", "Accounts payable"),
-    ("current_liabilities", "Total current liabilities"),
-    ("debt_noncurrent", "Long-term debt"),
-    ("equity", "Total stockholders' equity"),
+BALANCE_SHEET_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
+    ("cash", "Cash and cash equivalents", None, None),
+    ("short_term_investments", "Short-term investments", None, None),
+    ("receivables", "Accounts receivable", None, None),
+    ("inventory", "Inventory", None, None),
+    ("current_assets", "Total current assets", None, None),
+    (
+        "ppe_net", "Property, plant and equipment, net",
+        "ppe_and_lease_net", "Property, plant and equipment and finance-lease ROU assets, net",
+    ),
+    ("total_assets", "Total assets", None, None),
+    ("payables", "Accounts payable", None, None),
+    ("current_liabilities", "Total current liabilities", None, None),
+    ("debt_noncurrent", "Long-term debt", None, None),
+    ("equity", "Total stockholders' equity", None, None),
 )
-CASH_FLOW_LINES: tuple[tuple[str, str], ...] = (
-    ("cfo", "Cash from operations"),
-    ("capex", "Capital expenditure"),
-    ("free_cash_flow", "Free cash flow"),
-    ("sbc", "Stock-based compensation"),
-    ("dep_amort", "Depreciation and amortization"),
+CASH_FLOW_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
+    # SPEC-008 C4 (approved 2026-08-08): `fallback_label == label` on every
+    # one of these is what tells `_resolve_line_across_periods` to MERGE
+    # into one row instead of splitting into two (ppe_net's own fallback,
+    # below in BALANCE_SHEET_LINES, has a genuinely different label and
+    # keeps the two-row behaviour) -- these are the SAME accounting
+    # concept, filed directly or derived by subtraction, never two
+    # different things worth showing side by side.
+    ("cfo", "Cash from operations", "cfo_discrete", "Cash from operations"),
+    ("capex", "Capital expenditure", "capex_discrete", "Capital expenditure"),
+    ("free_cash_flow", "Free cash flow", "free_cash_flow_discrete", "Free cash flow"),
+    ("sbc", "Stock-based compensation", "sbc_discrete", "Stock-based compensation"),
+    ("dep_amort", "Depreciation and amortization", "dep_amort_discrete", "Depreciation and amortization"),
 )
 
 
@@ -404,36 +451,503 @@ def get_statement_period_ends(cik: str, db_path: Path = DEFAULT_DB_PATH) -> list
     )
 
 
-def get_statement_line_values(
-    cik: str, period_end: str, lines: tuple[tuple[str, str], ...], db_path: Path = DEFAULT_DB_PATH
-) -> list[dict]:
-    """One curated statement's lines for one period. `free_cash_flow` and
-    other computed metrics resolve from `metrics`; raw canonical inputs
-    (revenue, cogs, ...) resolve from `xbrl_facts` directly via
-    CONCEPT_REGISTRY's alias list -- both are "already held" data (R4), just
-    in different tables."""
-    out = []
-    for canonical, label in lines:
-        value = None
-        if canonical in config.METRIC_REGISTRY:
+def concept_never_tagged(cik: str, canonical: str, db_path: Path = DEFAULT_DB_PATH) -> bool:
+    """Whether `canonical`'s CONCEPT_REGISTRY aliases have no row within
+    this company's ANALYZED window -- distinguishes "this specific period
+    has a gap" from "this company simply does not use this XBRL concept"
+    (SPEC-008 review, debt-line follow-up, found live: Micron has never
+    tagged `LongTermDebtNoncurrent` anywhere in the analyzed history --
+    100% of periods, not one).
+
+    Scoped to `period_end >= MIN(metrics.period_end)` for this company, not
+    all of SEC history -- found live, a naive "any row, ever" check was a
+    false negative here: Micron DID tag `LongTermDebtNoncurrent` in
+    2012-2013, years before this project's analyzed window begins, which
+    made the concept look "tagged at some point" when it has never once
+    been tagged in any period this dashboard actually shows.
+
+    Only meaningful for CONCEPT_REGISTRY (raw `xbrl_facts`) entries; a
+    METRIC_REGISTRY entry, an unrecognised name, or a company with no
+    `metrics` rows at all (no established analyzed window to scope
+    against) returns False (not "structurally absent" -- just not this
+    function's concern)."""
+    if canonical not in config.CONCEPT_REGISTRY:
+        return False
+    earliest = _one(db_path, "SELECT MIN(period_end) AS earliest FROM metrics WHERE cik = ?", (cik,))
+    if earliest is None or earliest["earliest"] is None:
+        return False
+    aliases = config.CONCEPT_REGISTRY[canonical].aliases
+    placeholders = ",".join("?" for _ in aliases)
+    row = _one(
+        db_path,
+        f"SELECT 1 AS present FROM xbrl_facts WHERE cik = ? AND concept IN ({placeholders}) "
+        "AND period_end >= ? LIMIT 1",
+        (cik, *aliases, earliest["earliest"]),
+    )
+    return row is None
+
+
+# Concepts with an actual written diagnosis to point to -- the pointer is
+# included only here, never invented generically for a structurally-absent
+# concept that has no such note (SPEC-008 review, debt-line follow-up).
+_STRUCTURAL_ABSENCE_DIAGNOSIS: dict[str, str] = {
+    "debt_noncurrent": "see the standing debt-tag diagnosis in SPEC-008",
+}
+
+
+def get_statement_line_null_reason(
+    cik: str, canonical: str, ticker: str, db_path: Path = DEFAULT_DB_PATH
+) -> str:
+    """The reason shown for a statement line with no value. Distinguishes a
+    genuine period-specific gap (AMZN's gross profit/R&D at some periods --
+    "not tagged for this period" is accurate for those) from a company
+    that has never tagged the concept at all across the analyzed history
+    (Micron's `debt_noncurrent` -- accurate would say so, not imply this
+    one period is the exception). This decides nothing about which concept
+    would be a safe fallback to DISPLAY instead -- it is a change to the
+    reason string only."""
+    if concept_never_tagged(cik, canonical, db_path):
+        base = f"{ticker} has not tagged this concept in any filing on record"
+        pointer = _STRUCTURAL_ABSENCE_DIAGNOSIS.get(canonical)
+        return f"{base} -- {pointer}" if pointer else base
+    return "not tagged for this period"
+
+
+def _resolve_statement_line_value(
+    cik: str, canonical: str, period_start: str | None, period_end: str, db_path: Path
+) -> float | None:
+    """Resolve ONE canonical input's value for an exact period -- the
+    single-canonical logic `get_statement_line_values` uses for both a
+    line's primary canonical and, when the primary is absent, its
+    fallback. `free_cash_flow` and other computed metrics resolve from
+    `metrics`; raw canonical inputs (revenue, cogs, ...) resolve from
+    `xbrl_facts` directly via CONCEPT_REGISTRY's alias list.
+
+    Duration (non-instant) concepts require an EXACT (period_start,
+    period_end) match (SPEC-008 review D11, found live: a 10-Q routinely
+    tags a duration concept MORE THAN ONCE for the same period_end -- the
+    three-month quarter and the nine-month year-to-date cumulative --
+    sharing a filed_date, with no principled way to prefer one by
+    period_end alone). Instant (balance-sheet, as-of-a-date) concepts have
+    no period_start at all and are queried by period_end alone."""
+    if canonical in config.METRIC_REGISTRY:
+        row = _one(
+            db_path,
+            "SELECT value FROM metrics WHERE cik = ? AND name = ? AND period_start = ? AND period_end = ? "
+            "AND calc_version = ?",
+            (cik, canonical, period_start, period_end, config.CALC_VERSION),
+        )
+        return row["value"] if row else None
+    if canonical in config.CONCEPT_REGISTRY:
+        concept_def = config.CONCEPT_REGISTRY[canonical]
+        aliases = concept_def.aliases
+        placeholders = ",".join("?" for _ in aliases)
+        if concept_def.instant:
             row = _one(
                 db_path,
-                "SELECT value FROM metrics WHERE cik = ? AND name = ? AND period_end = ? AND calc_version = ?",
-                (cik, canonical, period_end, config.CALC_VERSION),
-            )
-            value = row["value"] if row else None
-        elif canonical in config.CONCEPT_REGISTRY:
-            aliases = config.CONCEPT_REGISTRY[canonical].aliases
-            placeholders = ",".join("?" for _ in aliases)
-            row = _one(
-                db_path,
-                f"SELECT value FROM xbrl_facts WHERE cik = ? AND concept IN ({placeholders}) AND period_end = ? "
-                "ORDER BY filed_date DESC LIMIT 1",
+                f"SELECT value FROM xbrl_facts WHERE cik = ? AND concept IN ({placeholders}) "
+                "AND period_end = ? ORDER BY filed_date DESC LIMIT 1",
                 (cik, *aliases, period_end),
             )
-            value = row["value"] if row else None
-        out.append({"canonical": canonical, "label": label, "value": value})
+        else:
+            row = _one(
+                db_path,
+                f"SELECT value FROM xbrl_facts WHERE cik = ? AND concept IN ({placeholders}) "
+                "AND period_start = ? AND period_end = ? ORDER BY filed_date DESC LIMIT 1",
+                (cik, *aliases, period_start, period_end),
+            )
+        return row["value"] if row else None
+    return None
+
+
+def get_statement_line_values(
+    cik: str, period_start: str | None, period_end: str,
+    lines: tuple[tuple[str, str, str | None, str | None], ...],
+    db_path: Path = DEFAULT_DB_PATH,
+) -> list[dict]:
+    """One curated statement's lines for one period.
+
+    Each line tries its primary canonical first; if that resolves to
+    nothing AND a `fallback_canonical` is declared, tries the fallback --
+    same exact-period-match discipline, never a guess among candidates.
+    When the fallback resolves, the row's `label` is `fallback_label`, NOT
+    the primary label (SPEC-008 review, PP&E follow-up: a label must
+    accurately name the number next to it -- "Property, plant and
+    equipment, net: 397,463" would pair a pure-PP&E label with a figure
+    that also includes finance-lease ROU assets, misleading a reader
+    scanning the row without reading a note)."""
+    out = []
+    for canonical, label, fallback_canonical, fallback_label in lines:
+        value = _resolve_statement_line_value(cik, canonical, period_start, period_end, db_path)
+        used_label = label
+        if value is None and fallback_canonical is not None:
+            value = _resolve_statement_line_value(cik, fallback_canonical, period_start, period_end, db_path)
+            if value is not None:
+                used_label = fallback_label
+        out.append({"canonical": canonical, "label": used_label, "value": value})
     return out
+
+
+def get_period_duration_class(period_start: str | None, period_end: str) -> str:
+    """Public wrapper around `_classify_duration` for display callers
+    outside this module (SPEC-008 review D11 -- financials.py needs to
+    state each duration-based statement's own period length, not just its
+    end date). The private helper stays private for its original purpose
+    (basis filtering inside this module); this is a deliberate, separate
+    exposure."""
+    return _classify_duration(period_start, period_end)
+
+
+def get_cash_flow_period(
+    cik: str, quarterly_period_start: str, period_end: str, db_path: Path = DEFAULT_DB_PATH
+) -> tuple[str, str]:
+    """SPEC-008 review D11 follow-up (found live, confirmed against the
+    real corpus): a 10-Q's cash-flow statement is routinely tagged
+    year-to-date only, not incrementally per quarter -- confirmed for
+    Micron and NVIDIA, where most non-Q1 quarters have NO three-month cash-
+    flow facts tagged at all (Q1 always matches, since a fiscal year's
+    first quarter's three-month and year-to-date figures are the same
+    number). The exact-match fix in `get_statement_line_values` is correct
+    to refuse a guess when it can't tell which duration a caller wants --
+    but for the cash-flow section specifically, forcing the selector's
+    quarterly period_start when the filing itself never tagged that
+    duration turns a real, differently-shaped fact into "not tagged for
+    this period," which reads as a data gap rather than what it is: the
+    right number, at a different, itself-unambiguous duration.
+
+    Uses `cfo` as the representative concept -- one 10-Q's cash-flow
+    statement covers a single consistent duration across every line item
+    in it, so what's true for `cfo` is true for the whole section. Returns
+    `(period_start_to_use, note)`: the quarterly `period_start` unchanged
+    with an empty note when it already has data (the common, correct
+    case); otherwise, the ONE other period_start actually tagged for this
+    period_end, with an explicit note -- never a guess among multiple
+    candidates, matching `get_statement_line_values`'s own refusal to pick
+    an arbitrary one."""
+    aliases = config.CONCEPT_REGISTRY["cfo"].aliases
+    placeholders = ",".join("?" for _ in aliases)
+    quarterly_match = _one(
+        db_path,
+        f"SELECT 1 AS present FROM xbrl_facts WHERE cik = ? AND concept IN ({placeholders}) "
+        "AND period_start = ? AND period_end = ?",
+        (cik, *aliases, quarterly_period_start, period_end),
+    )
+    if quarterly_match is not None:
+        return quarterly_period_start, ""
+    candidates = _run(
+        db_path,
+        f"SELECT DISTINCT period_start FROM xbrl_facts WHERE cik = ? AND concept IN ({placeholders}) "
+        "AND period_end = ? AND period_start IS NOT NULL",
+        (cik, *aliases, period_end),
+    )
+    if len(candidates) == 1:
+        return candidates[0]["period_start"], "not tagged separately for this quarter -- showing the year-to-date figure instead"
+    return quarterly_period_start, ""
+
+
+# --- C4: the multi-period statement table ---
+
+
+def get_statement_periods(cik: str, basis: str, db_path: Path = DEFAULT_DB_PATH) -> list[dict]:
+    """Every distinct (period_start, period_end) for this company at this
+    basis, OLDEST TO NEWEST -- C4's columns, left to right. Filters
+    `get_statement_period_ends` (all periods with metrics computed, newest
+    first, the period-selector's own list) by duration class, the same
+    `_CLASSES_FOR_BASIS` mapping `get_metric_series` already uses, then
+    reverses it -- a table reads oldest-to-newest; a selector dropdown
+    reads newest-first. One source of periods, two orderings for two
+    different UIs, not two queries."""
+    all_periods = get_statement_period_ends(cik, db_path)
+    allowed_classes = _CLASSES_FOR_BASIS[basis]
+    filtered = [p for p in all_periods if _classify_duration(p["period_start"], p["period_end"]) in allowed_classes]
+    return list(reversed(filtered))
+
+
+def _growth_pct(prior_value: float, value: float) -> float | None:
+    if prior_value == 0:
+        return None
+    return (value - prior_value) / abs(prior_value)
+
+
+# SPEC-008-batch-1 item 2 (D14, approved 2026-08-08): a growth percentage is
+# mathematically defined but analytically meaningless in two cases -- the
+# base's sign differs from the new value's (a move from profit to loss
+# cannot be expressed as a percentage change of the old figure), or the
+# base is a small fraction of this LINE's own typical size (Micron's real
+# free cash flow moving from $72M to $3,022M prints "+4097.2%", which
+# conveys nothing and crowds the column; the $72M quarter was itself real,
+# just atypically small for this line).
+#
+# Threshold: 10% of the row's own median absolute value across every
+# period currently in `cells` -- a property of THIS line, THIS company,
+# not a global constant, matching the review's own phrasing ("relative to
+# the line's own typical magnitude"). Chosen empirically, not picked
+# blind: the review's own cited example (MU free cash flow, $72M base) has
+# a ratio of 72M / 786M (MU's real FCF median) = 0.092 -- a 5% threshold
+# would MISS it; 10% is the smallest round number that catches it. Checked
+# against the real corpus at three candidate thresholds before choosing:
+#
+#   5%  -> 55 cells flip from a number to n/m (misses the review's own example)
+#   10% -> 72 cells flip (catches it; chosen)
+#   15% -> 79 cells flip (7 more than 10%, diminishing returns)
+#
+# Of the 72 cells at 10%: 49 are sign-crossing (independent of the
+# threshold), 23 are near-zero-base, 0 are exactly zero (a zero base
+# already yields no growth_pct at all -- see `_growth_pct` -- so there is
+# nothing to "flip" for that case; it was already blank before this item,
+# still blank after). Per company: AMZN 23, NVDA 15, MU 34.
+_GROWTH_NEAR_ZERO_BASE_FRACTION = 0.10
+
+
+def _classify_growth(prior_value: float, value: float, typical_magnitude: float | None) -> tuple[float | None, str | None]:
+    """Returns (growth_pct, not_meaningful_reason). `growth_pct` is the raw
+    computed value (still attached even when flagged -- the number itself
+    isn't wrong, just not worth presenting as a rate); `not_meaningful_reason`
+    is None when the growth IS meaningful, else one of "zero_base",
+    "sign_crossing", "near_zero_base" -- the caller (components.py) renders
+    "n/m" for any non-None reason, never the raw percentage."""
+    growth_pct = _growth_pct(prior_value, value)
+    if prior_value == 0:
+        return growth_pct, "zero_base"
+    if (prior_value > 0) != (value > 0) and value != 0:
+        return growth_pct, "sign_crossing"
+    if typical_magnitude and abs(prior_value) < _GROWTH_NEAR_ZERO_BASE_FRACTION * typical_magnitude:
+        return growth_pct, "near_zero_base"
+    return growth_pct, None
+
+
+def _classify_blank_cell(
+    other_label: str | None, other_value: float | None, gap_reason_fn,
+) -> tuple[str, str]:
+    """SPEC-008 C4 constraint 4: a blank cell means one of two different
+    things, and the table must say which -- the single-period Summary tab
+    already distinguished this; the multi-period table dropped the
+    distinction entirely until this pass restored it. `other_value` is this
+    SAME period's value in the paired primary/fallback row for this line,
+    or None if no such pairing applies to this canonical at all (or the
+    pairing is a MERGED single row, which by construction has no blank
+    cells left to explain this way -- see `_resolve_line_across_periods`).
+
+    A third cause this function used to classify -- "not computed at this
+    fallback DURATION" -- is gone, not merely unreachable: the cash-flow
+    duration-fallback mechanism (`is_duration_fallback`, the old † marker)
+    was retired for this table (SPEC-008 C4, approved 2026-08-08) in favour
+    of deriving the true discrete quarter via `fallback_canonical` merged
+    into one row (`is_derived_quarter`, the new † marker) -- there is no
+    longer a case where a cell is blank BECAUSE of a duration mismatch;
+    either the discrete value was found (filed or derived) or it wasn't,
+    which is a plain gap."""
+    if other_value is not None:
+        return "split", f"this period's figure is in the '{other_label}' row instead -- a presentation split, not a gap"
+    return "gap", gap_reason_fn()
+
+
+def _annotate_blanks(
+    cells: list[dict], other_cells: list[dict] | None, other_label: str | None, gap_reason_fn,
+) -> None:
+    """Attaches `blank_cause`/`blank_reason` to every None-valued cell, in
+    place. `other_cells` is the paired primary/fallback row's cells (same
+    columns, same order), or None when this line has no fallback pairing
+    at all (or the pairing was merged into one row already)."""
+    for i, cell in enumerate(cells):
+        if cell["value"] is not None:
+            continue
+        other_value = other_cells[i]["value"] if other_cells is not None else None
+        cause, reason = _classify_blank_cell(other_label, other_value, gap_reason_fn)
+        cell["blank_cause"] = cause
+        cell["blank_reason"] = reason
+
+
+def _resolve_line_across_periods(
+    cik: str,
+    canonical: str,
+    label: str,
+    fallback_canonical: str | None,
+    fallback_label: str | None,
+    effective_periods: list[tuple[str | None, str]],
+    ticker: str,
+    db_path: Path,
+) -> list[dict]:
+    """One line item's row(s) across every column. `effective_periods` is
+    `(period_start, period_end)` per column -- every statement's own
+    nominal period boundaries, uniformly (SPEC-008 C4, approved
+    2026-08-08: cash flow used to substitute a possibly-wrong-duration
+    period_start here, `is_duration_fallback` marking when it did; that
+    mechanism is retired in favour of resolving the true discrete figure
+    directly, filed or derived, below -- `get_cash_flow_period` itself is
+    unchanged and still serves the Summary tab, which still needs to state
+    a single period's own duration in words).
+
+    THREE resolution patterns share this one mechanism (SPEC-008 C4 item
+    3, approved 2026-08-08: reuse or unify, never invent a third).
+    `fallback_label == label` is what distinguishes them -- inferred from
+    the caller's own data, not a separate flag a caller could forget to
+    set:
+
+    - No fallback at all (`fallback_canonical is None`): every other
+      line item. One row, ordinary blanks.
+    - Fallback with a DIFFERENT label (`ppe_net` -> `ppe_and_lease_net`):
+      the concept itself changed, so the label must too -- SPEC-008 C4
+      constraint 3, TWO rows when the fallback is used anywhere in the
+      displayed range (primary-labelled, populated only where primary
+      resolved; fallback-labelled, populated only where the fallback
+      did), never one row whose meaning changes between columns.
+    - Fallback with the SAME label (every cash-flow line's `_discrete`
+      pair): the SAME accounting concept, sourced two ways for
+      continuity -- filed directly (AMZN) or derived by subtraction
+      (MU, NVDA). MERGED into ONE row: each cell takes the primary value
+      if filed, else the fallback value, with `is_derived_quarter`
+      marking which cells used it (the new † marker, replacing the old
+      duration-fallback one it retired).
+
+    SPEC-008 C4 constraint 2, the REAL rule: growth% is only valid between
+    two cells covering the SAME duration. For the merged case this is now
+    true by construction -- every cell is the TRUE discrete quarter,
+    whichever way it was obtained -- so growth is no longer suppressed for
+    these lines the way it always was under the old duration-fallback
+    proxy."""
+    merge_fallback = fallback_canonical is not None and fallback_label == label
+
+    primary_cells: list[dict] = []
+    fallback_cells: list[dict] = []
+    fallback_used = False
+    for period_start, period_end in effective_periods:
+        primary_value = _resolve_statement_line_value(cik, canonical, period_start, period_end, db_path)
+        fallback_value = None
+        if primary_value is None and fallback_canonical is not None:
+            fallback_value = _resolve_statement_line_value(cik, fallback_canonical, period_start, period_end, db_path)
+            if fallback_value is not None:
+                fallback_used = True
+        primary_cells.append({"period_end": period_end, "value": primary_value})
+        fallback_cells.append({"period_end": period_end, "value": fallback_value})
+
+    # SPEC-008 C4 constraint 4: the "never tagged at all" vs. "not tagged
+    # for this period" distinction (`get_statement_line_null_reason`)
+    # depends only on (cik, canonical, ticker), never on which period a
+    # given blank cell is -- computed at most once per row, not once per
+    # blank cell, and only if a blank cell actually needs it (a row with no
+    # plain gaps -- e.g. every blank is a split-row complement -- never
+    # pays for the query at all).
+    _gap_reason_cache: list[str] = []
+
+    def _gap_reason() -> str:
+        if not _gap_reason_cache:
+            _gap_reason_cache.append(get_statement_line_null_reason(cik, canonical, ticker, db_path))
+        return _gap_reason_cache[0]
+
+    if merge_fallback:
+        merged_cells = []
+        for p_cell, f_cell in zip(primary_cells, fallback_cells):
+            is_derived = p_cell["value"] is None and f_cell["value"] is not None
+            merged_cells.append(
+                {
+                    "period_end": p_cell["period_end"],
+                    "value": f_cell["value"] if is_derived else p_cell["value"],
+                    "is_derived_quarter": is_derived,
+                }
+            )
+        _annotate_blanks(merged_cells, None, None, _gap_reason)
+        return [_finalize_statement_row(label, canonical, merged_cells)]
+
+    primary_used = any(c["value"] is not None for c in primary_cells)
+    rows = []
+    if primary_used or not fallback_used:
+        # Always show the primary row unless the fallback is what's
+        # actually carrying every populated cell -- a line with NO data at
+        # all anywhere (neither primary nor fallback resolves) still shows
+        # its normal, single row of blanks, same as any other "not tagged"
+        # line; only a fallback-only line drops the permanently-empty
+        # primary row.
+        _annotate_blanks(primary_cells, fallback_cells if fallback_used else None, fallback_label, _gap_reason)
+        rows.append(_finalize_statement_row(label, canonical, primary_cells))
+    if fallback_used:
+        _annotate_blanks(fallback_cells, primary_cells, label, _gap_reason)
+        rows.append(_finalize_statement_row(fallback_label, canonical, fallback_cells))
+    return rows
+
+
+def _finalize_statement_row(label: str, canonical: str, cells: list[dict]) -> dict:
+    """Attaches each cell's growth_pct -- R8: derived here, in the data
+    layer, never computed inline in a page. `growth_pct` is None whenever
+    there is no valid prior cell to compare against (no immediately
+    preceding cell, or either side missing a value) -- SPEC-008 C4
+    constraint 2's real rule is that growth is only valid between two
+    cells of the SAME duration, which every cell in `cells` now IS by
+    construction (the true discrete quarter, filed or derived; see
+    `_resolve_line_across_periods`'s docstring). The old duration-fallback
+    proxy that used to also gate this is gone with the mechanism it was
+    guarding against.
+
+    SPEC-008-batch-1 item 2 (D14): also attaches `growth_not_meaningful`
+    (`_classify_growth`) -- a zero or sign-crossing base, or a base under
+    10% of this row's own typical (median) magnitude. `growth_pct` stays
+    populated even when flagged; the reason is what tells the caller to
+    render "n/m" instead of the number, not the absence of a number."""
+    typical_magnitude = None
+    row_values = [cell["value"] for cell in cells if cell["value"] is not None]
+    if row_values:
+        typical_magnitude = statistics.median(abs(v) for v in row_values)
+
+    prior: dict | None = None
+    for cell in cells:
+        growth_pct = None
+        not_meaningful = None
+        if prior is not None and prior["value"] is not None and cell["value"] is not None:
+            growth_pct, not_meaningful = _classify_growth(prior["value"], cell["value"], typical_magnitude)
+        cell["growth_pct"] = growth_pct
+        cell["growth_not_meaningful"] = not_meaningful
+        prior = cell
+    return {"label": label, "canonical": canonical, "cells": cells}
+
+
+def _statement_table(
+    cik: str,
+    lines: tuple[tuple[str, str, str | None, str | None], ...],
+    periods: list[dict],
+    ticker: str,
+    db_path: Path,
+) -> list[dict]:
+    # SPEC-008 C4 (approved 2026-08-08): cash flow no longer needs its own
+    # branch here. It used to substitute `get_cash_flow_period`'s (possibly
+    # wrong-duration) period_start for the whole column; now every line
+    # resolves at its column's own TRUE discrete period_start uniformly,
+    # same as every other statement -- filed directly (AMZN) or via
+    # `fallback_canonical` to a `_discrete` metric (MU, NVDA), inside
+    # `_resolve_line_across_periods` itself. `get_cash_flow_period` is
+    # unchanged and still used by the Summary tab.
+    effective_periods = [(p["period_start"], p["period_end"]) for p in periods]
+
+    rows: list[dict] = []
+    for canonical, label, fallback_canonical, fallback_label in lines:
+        rows.extend(
+            _resolve_line_across_periods(
+                cik, canonical, label, fallback_canonical, fallback_label, effective_periods, ticker, db_path
+            )
+        )
+    return rows
+
+
+def get_income_statement_table(
+    cik: str, periods: list[dict], ticker: str, db_path: Path = DEFAULT_DB_PATH
+) -> list[dict]:
+    return _statement_table(cik, INCOME_STATEMENT_LINES, periods, ticker, db_path=db_path)
+
+
+def get_balance_sheet_table(
+    cik: str, periods: list[dict], ticker: str, db_path: Path = DEFAULT_DB_PATH
+) -> list[dict]:
+    return _statement_table(cik, BALANCE_SHEET_LINES, periods, ticker, db_path=db_path)
+
+
+def get_cash_flow_table(cik: str, periods: list[dict], ticker: str, db_path: Path = DEFAULT_DB_PATH) -> list[dict]:
+    """SPEC-008 C4 (approved 2026-08-08): every cash-flow line declares a
+    `_discrete` `fallback_canonical` in `CASH_FLOW_LINES` -- filed directly
+    where the company tags the true quarter (AMZN), derived by subtraction
+    where it tags year-to-date instead (MU, NVDA; `edgar.metrics.
+    compute_discrete_quarter_metrics`). `is_derived_quarter` marks which
+    cells used the derived path, replacing the old duration-fallback
+    marker this table used to show instead of the true quarterly figure."""
+    return _statement_table(cik, CASH_FLOW_LINES, periods, ticker, db_path=db_path)
 
 
 def get_as_filed_sections(cik: str, db_path: Path = DEFAULT_DB_PATH) -> list[dict]:

@@ -7,7 +7,7 @@ import json
 import pytest
 
 from edgar import config, db, metrics, validate, xbrl
-from tests.conftest import FIXTURES_DIR, insert_fixture_filings
+from tests.conftest import FIXTURES_DIR, backfill_fiscal_labels, insert_fixture_filings
 
 AMZN_CIK = "0001018724"
 NVDA_CIK = "0001045810"
@@ -108,6 +108,134 @@ def test_debt_reconciliation_unregistered_period_still_hard_fails(conn):
     report = validate.run_validate(conn, tickers=["MU"])
     assert ("0000723125", "2012-08-30") not in config.DEBT_RECONCILIATION_EXCEPTIONS
     assert any(v["period_end"] == "2012-08-30" for v in report.debt_reconciliation_violations)
+
+
+def _ingest_and_compute_discrete(conn, tickers: list[str]) -> None:
+    cik_by_ticker = {"AMZN": AMZN_CIK, "NVDA": NVDA_CIK, "MU": MU_CIK}
+    ciks = [cik_by_ticker[t] for t in tickers]
+    insert_fixture_filings(conn, ciks=ciks)
+    for cik in ciks:
+        xbrl.ingest_company(conn, FakeXbrlClient(FIXTURES_BY_CIK[cik]), cik)
+        backfill_fiscal_labels(conn, cik, FIXTURES_BY_CIK[cik])
+    metrics.compute_discrete_quarter_metrics(conn, tickers=tickers)
+
+
+def test_discrete_quarter_sum_back_passes_on_real_nvda_data(conn):
+    # NVDA's fixture has one complete fiscal year (FY2026) -- the only
+    # combination this check can evaluate at all (category 12's own logic
+    # skips incomplete fiscal years, not a violation on its own).
+    _ingest_and_compute_discrete(conn, ["NVDA"])
+    report = validate.run_validate(conn, tickers=["NVDA"])
+    assert report.discrete_quarter_sum_violations == []
+
+
+def test_discrete_quarter_sum_back_detects_a_stale_fy_figure(conn):
+    # Simulates exactly the failure mode this check exists for: a
+    # restatement lands in xbrl_facts (the FY figure changes) after
+    # compute-metrics last ran, so the STORED discrete quarters (still the
+    # old vintage) no longer sum to the CURRENT filed FY figure.
+    _ingest_and_compute_discrete(conn, ["NVDA"])
+    conn.execute(
+        "UPDATE xbrl_facts SET value = value * 1.1 WHERE cik = ? AND concept = ? AND period_end = ? AND period_start = ?",
+        (NVDA_CIK, "NetCashProvidedByUsedInOperatingActivities", "2026-01-25", "2025-01-27"),
+    )
+    conn.commit()
+
+    report = validate.run_validate(conn, tickers=["NVDA"])
+
+    violations = [v for v in report.discrete_quarter_sum_violations if v["canonical"] == "cfo"]
+    assert violations
+    assert violations[0]["fy_period_end"] == "2026-01-25"
+    assert violations[0]["diff"] > config.DISCRETE_QUARTER_SUM_TOLERANCE_USD
+
+
+def test_discrete_quarter_sum_back_exception_reported_not_hard_failed(conn, monkeypatch):
+    _ingest_and_compute_discrete(conn, ["NVDA"])
+    conn.execute(
+        "UPDATE xbrl_facts SET value = value * 1.1 WHERE cik = ? AND concept = ? AND period_end = ? AND period_start = ?",
+        (NVDA_CIK, "NetCashProvidedByUsedInOperatingActivities", "2026-01-25", "2025-01-27"),
+    )
+    conn.commit()
+    monkeypatch.setattr(
+        config,
+        "DISCRETE_QUARTER_SUM_EXCEPTIONS",
+        {
+            (NVDA_CIK, "cfo", "2026-01-25"): config.DiscreteQuarterSumException(
+                cik=NVDA_CIK, canonical="cfo", fy_period_end="2026-01-25", reason="test exception",
+            )
+        },
+    )
+
+    report = validate.run_validate(conn, tickers=["NVDA"])
+
+    assert report.discrete_quarter_sum_violations == []
+    exceptions = report.discrete_quarter_sum_exceptions
+    assert any(f["fy_period_end"] == "2026-01-25" and f["reason"] == "test exception" for f in exceptions)
+
+
+def test_discrete_quarter_sum_back_skips_an_incomplete_fiscal_year(conn):
+    # MU's fixture has no FY2026 10-K yet -- Q4-discrete doesn't exist, so
+    # there is nothing to sum-check for that fiscal year, and it must not
+    # be reported as a violation.
+    _ingest_and_compute_discrete(conn, ["MU"])
+    report = validate.run_validate(conn, tickers=["MU"])
+    assert report.discrete_quarter_sum_violations == []
+
+
+def _seed_amzn_fiscal_year_revenue(conn):
+    """SPEC-008 D12 (approved 2026-08-08): a clean, synthetic, single-
+    fiscal-year AMZN-shaped revenue cycle -- the trimmed companyfacts
+    fixtures don't carry a complete cycle for any income-statement
+    concept, so this inserts facts directly (mirrors test_metrics.py's own
+    version of this helper). Q1=100M, Q2 YTD=220M, Q3 YTD=360M, FY=500M --
+    hand-computed discrete quarters: 100/120/140/140, summing to 500."""
+    concept = "RevenueFromContractWithCustomerExcludingAssessedTax"
+    for accession_no, form_type, period_end, fiscal_period in (
+        ("acc-q1", "10-Q", "2025-03-31", "Q1"),
+        ("acc-q2", "10-Q", "2025-06-30", "Q2"),
+        ("acc-q3", "10-Q", "2025-09-30", "Q3"),
+        ("acc-fy", "10-K", "2025-12-31", "FY"),
+    ):
+        conn.execute(
+            "INSERT INTO filings (accession_no, cik, form_type, filing_date, period_end, fiscal_year, "
+            "fiscal_period, discovered_at, status) VALUES (?, ?, ?, ?, ?, 2025, ?, ?, 'sectioned')",
+            (accession_no, AMZN_CIK, form_type, period_end, period_end, fiscal_period, f"{period_end}T00:00:00"),
+        )
+    for period_start, period_end, value, duration_days, accession_no in (
+        ("2025-01-01", "2025-03-31", 100_000_000, 90, "acc-q1"),
+        ("2025-01-01", "2025-06-30", 220_000_000, 181, "acc-q2"),
+        ("2025-01-01", "2025-09-30", 360_000_000, 273, "acc-q3"),
+        ("2025-01-01", "2025-12-31", 500_000_000, 365, "acc-fy"),
+    ):
+        conn.execute(
+            "INSERT INTO xbrl_facts (cik, taxonomy, concept, unit, period_start, period_end, value, "
+            "accession_no, filed_date, duration_days) VALUES (?, 'us-gaap', ?, 'USD', ?, ?, ?, ?, ?, ?)",
+            (AMZN_CIK, concept, period_start, period_end, value, accession_no, period_end, duration_days),
+        )
+    conn.commit()
+
+
+def test_discrete_quarter_sum_back_covers_income_statement_lines_too(conn):
+    # D12: the same sum-back mechanism built for cash flow (_DISCRETE_
+    # QUARTER_CANONICALS is now shared, not cash-flow-specific) -- passes
+    # clean on correct data, and catches a corrupted FY figure for an
+    # income-statement line exactly as it already does for cfo.
+    _seed_amzn_fiscal_year_revenue(conn)
+    metrics.compute_discrete_quarter_metrics(conn, tickers=["AMZN"])
+    report = validate.run_validate(conn, tickers=["AMZN"])
+    assert report.discrete_quarter_sum_violations == []
+
+    conn.execute(
+        "UPDATE xbrl_facts SET value = 999_000_000 WHERE cik = ? AND period_start = '2025-01-01' "
+        "AND period_end = '2025-12-31'",
+        (AMZN_CIK,),
+    )
+    conn.commit()
+
+    report = validate.run_validate(conn, tickers=["AMZN"])
+    violations = [v for v in report.discrete_quarter_sum_violations if v["canonical"] == "revenue"]
+    assert violations
+    assert violations[0]["fy_period_end"] == "2025-12-31"
 
 
 def test_gross_profit_crosscheck_detects_corruption(conn):

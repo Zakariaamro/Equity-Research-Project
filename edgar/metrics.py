@@ -166,6 +166,27 @@ def _resolve(
     return None, None
 
 
+def _resolve_at_end(
+    facts_by_concept: dict[str, dict[tuple[str | None, str], Fact]],
+    canonical: str,
+    end: str,
+    wanted_cls: str,
+) -> tuple[float | None, str | None, str | None]:
+    """Find a fact for `canonical` ending at `end` whose OWN duration
+    classifies as `wanted_cls`, without knowing its period_start in advance
+    -- unlike `_resolve`, which requires an exact (period_start, period_end)
+    key. Used to discover a fiscal quarter's own start (SPEC-008 C4:
+    `_fiscal_year_start` finds Q1's period_start this way, since Q1's start
+    IS the fiscal year's start, whether the company tags cumulatively or
+    not). Returns (value, alias, period_start)."""
+    ci = config.CONCEPT_REGISTRY[canonical]
+    for alias in ci.aliases:
+        for (start, fact_end), fact in facts_by_concept.get(alias, {}).items():
+            if fact_end == end and start is not None and _classify_duration(fact.duration_days) == wanted_cls:
+                return fact.value, alias, start
+    return None, None, None
+
+
 def _resolve_gross_profit(
     facts_by_concept: dict, start: str, end: str
 ) -> tuple[float | None, str, dict[str, float]]:
@@ -965,6 +986,289 @@ def _compute_beneish_m_score(facts, periods_by_class, start, end, cls) -> Metric
     return MetricResult(score, inputs_used, formula, None)
 
 
+# --- discrete fiscal quarters (SPEC-008 C4 2026-08-08, generalized to the
+# income statement for D12 2026-08-08) ---
+#
+# Two distinct problems, same fix. Some companies (Micron, NVIDIA) tag
+# cash-flow-statement concepts cumulatively -- a Q2 10-Q's "cash from
+# operations" is six months, not three, growing to nine months at Q3,
+# resetting at the next fiscal year. Separately, EVERY company's Q4 is
+# missing on the income statement, for a structural reason, not a tagging
+# quirk: there is no "Q4 10-Q" -- the fourth quarter is only ever reported
+# via the 10-K, which tags the ANNUAL cumulative figure, never a discrete
+# 3-month Q4 one (confirmed against real data: AMZN's Q1/Q2/Q3 income-
+# statement lines carry a redundant discrete tag alongside their
+# cumulative one in the same filing; Q4/FY never does, for any company).
+# Both are the same shape of problem -- a real filed number for the wrong
+# window, or no window at all -- and the same derivation solves both:
+# derive the discrete quarter by subtraction wherever it isn't filed
+# directly: Q2 = 6mo - Q1, Q3 = 9mo - 6mo, Q4 = FY - 9mo. Q1 needs no
+# subtraction -- its own filed figure already covers exactly one quarter,
+# since a fiscal year's Q1 period_start IS the fiscal year's own start.
+#
+# Balance sheet is deliberately untouched: instant (as-of-a-date) facts
+# have no duration to mismatch and nothing to subtract.
+#
+# A SEPARATE pass from `compute_metrics`'s generic per-period loop below,
+# not folded into it: every other metric is computed at (period_start,
+# period_end) pairs that already exist as real fact durations
+# (`periods_by_class`, built from what's actually in `xbrl_facts`). A
+# discrete quarter's own (period_start, period_end) is SYNTHETIC when the
+# company tags cumulatively -- Q2's true 3-month window doesn't exist as
+# any single filed fact, by definition of the problem being solved. It has
+# to be constructed from the fiscal calendar (`filings.fiscal_year`/
+# `fiscal_period`, SEC's own dei:DocumentFiscalYearFocus/PeriodFocus tags),
+# never from a fixed MMDD calendar assumption -- Micron's fiscal year-end
+# floats (confirmed: 2025-08-28, not a fixed date), so `config.Company.
+# fiscal_year_end` (a nominal MMDD, unused anywhere else in this codebase)
+# cannot anchor this; the authoritative source is what SEC says THIS filing
+# covers, not a calendar guess.
+#
+# Restatement handling: both subtraction endpoints are resolved through the
+# SAME `_load_facts`/`_resolve` machinery every other metric in this file
+# uses, which already implements this project's one restatement policy
+# (SPEC-004 R4, `_load_facts`'s own docstring: "latest filed_date wins per
+# period"). Both endpoints are drawn from the same vintage by construction
+# -- a second, bespoke restatement policy was deliberately NOT invented for
+# this one case. The residual risk (one endpoint restated, its neighbour
+# not yet re-filed) is caught downstream, not here: `validate`'s discrete-
+# quarter sum-back check (edgar/validate.py) re-derives the same numbers
+# fresh from `xbrl_facts` and compares their sum to the filed FY figure,
+# which is an algebraic identity that only fails to tie exactly when the
+# inputs are inconsistent -- see that check's docstring for the proof.
+#
+# Plausibility: METRIC_REGISTRY's existing `plausible_range` is checked
+# HERE, at compute time, not left to a post-hoc `validate` pass -- an
+# implausible subtraction result (e.g. a restated endpoint producing
+# negative capex, which cannot legitimately happen) becomes a null with a
+# reason, never a written, later-displayed figure.
+
+_DISCRETE_QUARTER_CANONICALS: tuple[str, ...] = (
+    # Cash flow (SPEC-008 C4, approved 2026-08-08).
+    "cfo", "capex", "sbc", "dep_amort",
+    # Income statement (SPEC-008 D12, approved 2026-08-08): Q4 has no
+    # discrete filed fact anywhere in this project's corpus, for any
+    # company, in any year -- only the FY 10-K's cumulative figure exists.
+    # Q1/Q2/Q3 are typically ALREADY tagged at the true discrete duration
+    # directly (unlike cash flow's MU/NVDA problem, confirmed against real
+    # AMZN data: revenue's Q2/Q3 facts exist as BOTH a discrete tag and a
+    # redundant cumulative one in the same filing) -- their own `_discrete`
+    # rows mostly just reconfirm the filed figure by subtraction, which is
+    # harmless and needed anyway so the sum-back check has all four
+    # quarters to check against.
+    "revenue", "cogs", "gross_profit", "rnd_expense", "sga_expense",
+    "operating_income", "interest_expense", "pretax_income", "tax_expense", "net_income",
+)
+_PRIOR_FISCAL_PERIOD: dict[str, str] = {"Q2": "Q1", "Q3": "Q2", "FY": "Q3"}
+
+
+def _fiscal_quarter_map(conn: sqlite3.Connection, cik: str) -> dict[tuple[int, str], str]:
+    """(fiscal_year, fiscal_period) -> period_end, from `filings` -- the
+    authoritative SEC-declared fiscal calendar, not date arithmetic."""
+    rows = conn.execute(
+        "SELECT DISTINCT fiscal_year, fiscal_period, period_end FROM filings "
+        "WHERE cik = ? AND fiscal_period IS NOT NULL AND form_type IN (?, ?)",
+        (cik, config.TENQ_FORM_TYPE, config.TENK_FORM_TYPE),
+    ).fetchall()
+    return {(row["fiscal_year"], row["fiscal_period"]): row["period_end"] for row in rows}
+
+
+def _fiscal_year_start(
+    facts_by_concept: dict, quarter_map: dict[tuple[int, str], str], fiscal_year: int, canonical: str
+) -> str | None:
+    """FY start = THIS canonical's own Q1 fact's period_start.
+
+    Deliberately not a shared "representative concept" borrowed across
+    every line (an earlier version used `cfo` for this, reasoning that one
+    filing's cash-flow statement shares a single duration across every
+    line in it) -- generalizing to the income statement (SPEC-008 D12,
+    approved 2026-08-08) removed that justification: nothing guarantees a
+    company tags `revenue`'s Q1 the same day as `cfo`'s. Each canonical
+    resolving its OWN Q1 anchor is strictly more correct and costs nothing
+    extra -- if a line's own Q1 isn't tagged, that line's derivation fails
+    closed for that fiscal year rather than silently borrowing a different
+    line's window."""
+    q1_end = quarter_map.get((fiscal_year, "Q1"))
+    if q1_end is None:
+        return None
+    _value, _alias, start = _resolve_at_end(facts_by_concept, canonical, q1_end, "quarterly")
+    return start
+
+
+def _compute_one_discrete_quarter(
+    canonical: str, facts_by_concept: dict, fy_start: str | None, this_end: str, prior_end: str | None
+) -> MetricResult:
+    """One (canonical, fiscal year, fiscal quarter)'s discrete value.
+    `prior_end` is None for Q1 (no subtraction -- the filed figure already
+    IS the discrete quarter)."""
+    if prior_end is None:
+        value, alias, _start = _resolve_at_end(facts_by_concept, canonical, this_end, "quarterly")
+        inputs_used: dict[str, float] = {}
+        _record(inputs_used, alias, value)
+        formula = f"{alias or canonical} (Q1, already discrete)"
+        if value is None:
+            return MetricResult(None, inputs_used, formula, "Q1 not tagged at the quarterly duration")
+        return MetricResult(value, inputs_used, formula, None)
+
+    if fy_start is None:
+        return MetricResult(None, {}, "", "fiscal year start not resolvable (Q1 not tagged at the quarterly duration)")
+
+    this_value, this_alias = _resolve(canonical, facts_by_concept, fy_start, this_end)
+    prior_value, prior_alias = _resolve(canonical, facts_by_concept, fy_start, prior_end)
+    inputs_used = {}
+    _record(inputs_used, this_alias, this_value, suffix="_ytd_this")
+    _record(inputs_used, prior_alias, prior_value, suffix="_ytd_prior")
+    formula = f"{this_alias or canonical}(YTD to {this_end}) - {prior_alias or canonical}(YTD to {prior_end})"
+    if this_value is None:
+        return MetricResult(None, inputs_used, formula, f"cumulative figure through {this_end} not tagged")
+    if prior_value is None:
+        return MetricResult(None, inputs_used, formula, f"cumulative figure through {prior_end} not tagged")
+    return MetricResult(this_value - prior_value, inputs_used, formula, None)
+
+
+def _discrete_quarter_period_start(
+    canonical: str, facts_by_concept: dict, fy_start: str | None, prior_end: str | None
+) -> str | None:
+    """The DISCRETE quarter's own period_start for storage -- distinct from
+    `fy_start`, which is the CUMULATIVE fact's period_start used to look up
+    subtraction inputs. Q1's discrete start is fy_start itself (trivially,
+    since Q1 IS the fiscal year's first quarter). Q2/Q3/Q4's discrete start
+    is the immediately prior REAL filed quarter's period_end + 1 day --
+    plain date arithmetic off an actual filed date, not a calendar
+    assumption, so it is correct regardless of when the fiscal year floats
+    to."""
+    if prior_end is None:
+        return fy_start
+    return (date.fromisoformat(prior_end) + timedelta(days=1)).isoformat()
+
+
+def _refused_computed_separately(facts, periods_by_class, start, end, cls) -> MetricResult:
+    """`COMPUTE_FUNCS` placeholder for `computed_separately` metrics
+    (discrete-quarter metrics). Must never actually run -- `compute_metrics`
+    skips these by the `computed_separately` flag before ever calling a
+    compute function, same as the generic loop skips no other metric today.
+    Raises rather than silently computing a value at the wrong period if
+    that skip is ever accidentally removed."""
+    raise RuntimeError(
+        "a computed_separately metric reached the generic per-period loop -- "
+        "its own compute_discrete_quarter_metrics pass should have handled it, "
+        "and compute_metrics should have skipped it"
+    )
+
+
+def compute_discrete_quarter_metrics(
+    conn: sqlite3.Connection, tickers: list[str] | None = None, metric_names: list[str] | None = None
+) -> list[dict]:
+    """Compute every `computed_separately` discrete-quarter metric for every
+    fiscal quarter on record. Idempotent, same as `compute_metrics`; call
+    both from the pipeline's `compute-metrics` command."""
+    companies = [c for c in config.WATCHLIST if tickers is None or c.ticker in tickers]
+    written: list[dict] = []
+    null_count = 0
+    computed_count = 0
+    for company in companies:
+        facts_by_concept = _load_facts(conn, company.cik)
+        quarter_map = _fiscal_quarter_map(conn, company.cik)
+        fiscal_years = sorted({fy for (fy, _fp) in quarter_map})
+
+        # canonical -> fiscal_year -> fiscal_period -> (value, period_start, period_end)
+        # -- kept in memory this pass so free_cash_flow_discrete can compose
+        # cfo_discrete/capex_discrete without a DB round-trip.
+        resolved: dict[str, dict[tuple[int, str], tuple[float | None, str, str]]] = {}
+
+        for canonical in _DISCRETE_QUARTER_CANONICALS:
+            name = f"{canonical}_discrete"
+            if metric_names is not None and name not in metric_names:
+                continue
+            mdef = config.METRIC_REGISTRY[name]
+            resolved[canonical] = {}
+            for fy in fiscal_years:
+                fy_start = _fiscal_year_start(facts_by_concept, quarter_map, fy, canonical)
+                for fp in ("Q1", "Q2", "Q3", "FY"):
+                    end = quarter_map.get((fy, fp))
+                    if end is None:
+                        continue
+                    prior_fp = _PRIOR_FISCAL_PERIOD.get(fp)
+                    prior_end = quarter_map.get((fy, prior_fp)) if prior_fp else None
+                    if fp != "Q1" and prior_fp is not None and prior_end is None:
+                        result = MetricResult(None, {}, "", f"prior fiscal quarter ({prior_fp}) not filed yet")
+                    else:
+                        result = _compute_one_discrete_quarter(
+                            canonical, facts_by_concept, fy_start, end, prior_end if fp != "Q1" else None
+                        )
+
+                    value = result.value
+                    if value is not None and mdef.plausible_range is not None:
+                        lo, hi = mdef.plausible_range
+                        if not (lo <= value <= hi):
+                            result = MetricResult(
+                                None, result.inputs_used, result.formula,
+                                f"implausible: {value:,.0f} outside [{lo}, {hi}] "
+                                "-- likely a restated endpoint the subtraction hasn't caught up with",
+                            )
+                            value = None
+
+                    period_start = _discrete_quarter_period_start(
+                        canonical, facts_by_concept, fy_start, prior_end if fp != "Q1" else None
+                    )
+                    if period_start is None:
+                        continue  # can't establish the window at all -- no row to write
+
+                    resolved[canonical][(fy, fp)] = (value, period_start, end)
+                    if value is None:
+                        inputs_json = json.dumps({**result.inputs_used, "_null_reason": result.null_reason}, sort_keys=True)
+                        null_count += 1
+                    else:
+                        inputs_json = json.dumps(result.inputs_used, sort_keys=True)
+                        computed_count += 1
+                    changed = _write_metric(
+                        conn, company.cik, period_start, end, name, value, result.formula, inputs_json
+                    )
+                    if changed:
+                        written.append(
+                            {"ticker": company.ticker, "name": name, "period_end": end, "class": "quarterly",
+                             "value": value, "null_reason": result.null_reason}
+                        )
+
+        # free_cash_flow_discrete = cfo_discrete - capex_discrete, purely
+        # local arithmetic on values already resolved above -- no new
+        # cross-filing subtraction, same composition free_cash_flow itself
+        # already uses for its own (non-discrete) inputs.
+        if metric_names is None or "free_cash_flow_discrete" in metric_names:
+            for key in set(resolved.get("cfo", {})) & set(resolved.get("capex", {})):
+                cfo_value, period_start, end = resolved["cfo"][key]
+                capex_value, capex_start, _capex_end = resolved["capex"][key]
+                if period_start != capex_start:
+                    continue  # D11 discipline: refuse unless both windows genuinely agree
+                formula = "cfo_discrete - capex_discrete"
+                if cfo_value is None or capex_value is None:
+                    value, null_reason = None, "cfo_discrete or capex_discrete unavailable"
+                    null_count += 1
+                else:
+                    value, null_reason = cfo_value - capex_value, None
+                    computed_count += 1
+                inputs_used = {}
+                if cfo_value is not None:
+                    inputs_used["cfo_discrete"] = cfo_value
+                if capex_value is not None:
+                    inputs_used["capex_discrete"] = capex_value
+                inputs_json = json.dumps(
+                    {**inputs_used, "_null_reason": null_reason} if value is None else inputs_used, sort_keys=True
+                )
+                changed = _write_metric(
+                    conn, company.cik, period_start, end, "free_cash_flow_discrete", value, formula, inputs_json
+                )
+                if changed:
+                    written.append(
+                        {"ticker": company.ticker, "name": "free_cash_flow_discrete", "period_end": end,
+                         "class": "quarterly", "value": value, "null_reason": null_reason}
+                    )
+
+    conn.commit()
+    logger.info("compute_discrete_quarter_metrics: %d computed, %d NULL", computed_count, null_count)
+    return written
+
+
 # --- registry dispatch ---
 
 COMPUTE_FUNCS: dict[str, Callable] = {
@@ -1013,6 +1317,22 @@ COMPUTE_FUNCS: dict[str, Callable] = {
     "beneish_sgai": _compute_beneish_sgai,
     "beneish_lvgi": _compute_beneish_lvgi,
     "beneish_tata": _compute_beneish_tata,
+    # computed_separately -- see _refused_computed_separately's own docstring.
+    "cfo_discrete": _refused_computed_separately,
+    "capex_discrete": _refused_computed_separately,
+    "sbc_discrete": _refused_computed_separately,
+    "dep_amort_discrete": _refused_computed_separately,
+    "free_cash_flow_discrete": _refused_computed_separately,
+    "revenue_discrete": _refused_computed_separately,
+    "cogs_discrete": _refused_computed_separately,
+    "gross_profit_discrete": _refused_computed_separately,
+    "rnd_expense_discrete": _refused_computed_separately,
+    "sga_expense_discrete": _refused_computed_separately,
+    "operating_income_discrete": _refused_computed_separately,
+    "interest_expense_discrete": _refused_computed_separately,
+    "pretax_income_discrete": _refused_computed_separately,
+    "tax_expense_discrete": _refused_computed_separately,
+    "net_income_discrete": _refused_computed_separately,
 }
 
 assert set(COMPUTE_FUNCS) == set(config.METRIC_REGISTRY), (
@@ -1085,6 +1405,8 @@ def compute_metrics(
         for name, mdef in config.METRIC_REGISTRY.items():
             if metric_names is not None and name not in metric_names:
                 continue
+            if mdef.computed_separately:
+                continue  # SPEC-008 C4: handled by compute_discrete_quarter_metrics instead
             fn = COMPUTE_FUNCS[name]
             for cls in _classes_for_basis(mdef.basis):
                 for start, end in sorted(periods_by_class.get(cls, set())):

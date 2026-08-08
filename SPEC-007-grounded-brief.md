@@ -391,6 +391,20 @@ The second mitigation is presentational and **binding on the dashboard spec**: e
 sentence displays its sources adjacent to it, never behind a click. If both automated layers
 miss something, a reader checks it in seconds.
 
+**Amended 2026-07-31 (SPEC-008 C2, ARCHITECTURE.md decision log #55, mechanism superseded
+same day by #56 — read both as a sequence, not a contradiction):** sources now collapse
+behind a small inline caret at the end of each sentence, opening them in place. The caret
+appears ONLY when a sentence has sources — a sentence with none has no caret at all, and
+that absence, next to every grounded sentence around it, is what a reader now notices
+without clicking anything. This mitigation's actual requirement was never "the source text
+itself must always be on screen" — it was "a reader can tell whether a sentence is
+checkable, and check it in seconds, without friction discouraging them from doing so." The
+caret's presence or absence is what carries that now (decision #55 first tried an explicit,
+always-visible count line instead; found too heavy at real scale and superseded by the
+caret, without reversing the amendment itself). The argument for and against the original
+amendment is recorded in full at decision log #55, since this is a change to a requirement
+this section itself called binding, not a dashboard-side implementation detail.
+
 Record this table in `ARCHITECTURE.md`.
 
 ---

@@ -69,6 +69,29 @@ def _fires_on_transition(cur: bool | None, prev: bool | None) -> bool:
 # --- metric primitives ---
 
 
+def _format_metric_value_for_statement(value: float, mdef: config.MetricDef) -> str:
+    """SPEC-008 review D5 (found live): statements used to embed the raw
+    snake_case metric identifier and an unformatted ratio (e.g. 'gross_margin
+    of 0.8456') straight into the sentence -- the registry has carried
+    `display_name`/`unit`/`precision` for every metric since SPEC-008 v1.1,
+    it just was not being read here. Mirrors dashboard/format.py's per-unit
+    dispatch, duplicated rather than imported: edgar is the backend package
+    that dashboard depends on, never the reverse, matching this module's
+    existing format_fiscal_period-style convention of a small duplicated
+    helper over a cross-layer import."""
+    if mdef.unit == "percent":
+        return f"{value * 100:.{mdef.precision}f}%"
+    if mdef.unit == "times":
+        return f"{value:.{mdef.precision}f}x"
+    if mdef.unit == "days":
+        return f"{value:.{mdef.precision}f} days"
+    if mdef.unit == "usd":
+        return f"{value / 1_000_000:,.{mdef.precision}f}"
+    if mdef.unit == "usd_per_share":
+        return f"${value:.{mdef.precision}f}"
+    return f"{value:,.{mdef.precision}f}"  # ratio
+
+
 def _metric_rows(conn: sqlite3.Connection, cik: str, name: str) -> list[dict]:
     """All metrics rows for (cik, name), current calc_version, chronological.
     Each row carries its own duration class (annual/quarterly/other)."""
@@ -260,7 +283,10 @@ def _rule_metric_multi_year_extreme(conn: sqlite3.Connection, cik: str) -> list[
                 accession_no = _accession_for_row(conn, cik, row["period_end"], cls)
                 unit = "quarters" if cls == "quarterly" else "years"
                 total_periods = len(prior) + 1
-                statement = f"{name} of {row['value']:.4g} is the {direction} in {total_periods} {unit}."
+                statement = (
+                    f"{mdef.display_name} of {_format_metric_value_for_statement(row['value'], mdef)} "
+                    f"is the {direction} in {total_periods} {unit}."
+                )
                 refs = [_ref("metrics", row["id"])] + [_ref("metrics", p["id"]) for p in prior]
                 obs.append(
                     Observation(
@@ -295,8 +321,10 @@ def _rule_metric_sigma_move(conn: sqlite3.Connection, cik: str) -> list[Observat
                 continue
             accession_no = _accession_for_row(conn, cik, row["period_end"], "quarterly")
             statement = (
-                f"{name} of {row['value']:.4g} is {abs(z):.1f} standard deviations "
-                f"{'above' if z > 0 else 'below'} its trailing {len(prior)}-quarter mean of {mean:.4g}."
+                f"{mdef.display_name} of {_format_metric_value_for_statement(row['value'], mdef)} "
+                f"is {abs(z):.1f} standard deviations "
+                f"{'above' if z > 0 else 'below'} its trailing {len(prior)}-quarter mean of "
+                f"{_format_metric_value_for_statement(mean, mdef)}."
             )
             refs = [_ref("metrics", row["id"])] + [_ref("metrics", p["id"]) for p in prior]
             obs.append(
@@ -322,11 +350,15 @@ def _threshold_state(rule: config.ThresholdRule, value: float) -> bool | str:
 
 
 def _threshold_statement(rule: config.ThresholdRule, value: float) -> str:
+    mdef = config.METRIC_REGISTRY[rule.metric]
+    formatted_value = _format_metric_value_for_statement(value, mdef)
     if rule.comparator == "above":
-        return f"{rule.metric} of {value:.4g} crossed above the {rule.value:.4g} screening threshold."
+        formatted_threshold = _format_metric_value_for_statement(rule.value, mdef)
+        return f"{mdef.display_name} of {formatted_value} crossed above the {formatted_threshold} screening threshold."
     if rule.comparator == "below":
-        return f"{rule.metric} of {value:.4g} crossed below the {rule.value:.4g} threshold."
-    return f"{rule.metric} crossed zero to {value:.4g}."
+        formatted_threshold = _format_metric_value_for_statement(rule.value, mdef)
+        return f"{mdef.display_name} of {formatted_value} crossed below the {formatted_threshold} threshold."
+    return f"{mdef.display_name} crossed zero to {formatted_value}."
 
 
 def _rule_metric_threshold_cross(conn: sqlite3.Connection, cik: str) -> list[Observation]:
@@ -378,9 +410,14 @@ def _divergence_state(
 
 
 def _divergence_statement(rule: config.DivergenceRule, row: dict) -> str:
+    mdef = config.METRIC_REGISTRY[rule.metric]
+    formatted_value = _format_metric_value_for_statement(row["value"], mdef)
     if rule.shape == "above":
-        return f"{rule.metric} of {row['value']:.4g} is above the {rule.value:.4g} divergence threshold."
-    return f"{rule.metric} of {row['value']:.4g} fell more than {rule.value:.0%} year over year."
+        formatted_threshold = _format_metric_value_for_statement(rule.value, mdef)
+        return f"{mdef.display_name} of {formatted_value} is above the {formatted_threshold} divergence threshold."
+    # rule.value here is a generic YoY decline threshold (e.g. 0.10 == "10%"),
+    # not itself a value in the metric's own unit -- stays a plain percent.
+    return f"{mdef.display_name} of {formatted_value} fell more than {rule.value:.0%} year over year."
 
 
 def _rule_metric_divergence(conn: sqlite3.Connection, cik: str) -> list[Observation]:
@@ -622,9 +659,11 @@ def _rule_metric_stopped_computing(conn: sqlite3.Connection, cik: str) -> list[O
         if prior is None or prior["value"] is None:
             continue
         accession_no = _accession_for_row(conn, cik, row["period_end"], cls)
+        mdef = config.METRIC_REGISTRY[row["name"]]
         statement = (
-            f"{row['name']} stopped computing for {row['period_end']} "
-            f"(last computed value {prior['value']:.4g} for the same fiscal period one year earlier)."
+            f"{mdef.display_name} stopped computing for {row['period_end']} "
+            f"(last computed value {_format_metric_value_for_statement(prior['value'], mdef)} "
+            f"for the same fiscal period one year earlier)."
         )
         refs = [_ref("metrics", row["id"]), _ref("metrics", prior["id"])]
         obs.append(

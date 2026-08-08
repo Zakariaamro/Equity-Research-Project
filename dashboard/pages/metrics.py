@@ -15,6 +15,13 @@ from edgar import config
 
 
 def _group_metrics() -> dict[str, list[str]]:
+    """Category -> metric names, in the order each category FIRST appears
+    while walking `METRIC_REGISTRY` -- never a hardcoded category list
+    (SPEC-008 C6/AC5: a metric added under a new category must appear with
+    no page-file changes; a hardcoded list of category names would
+    silently drop it instead of failing loudly). `dict.setdefault` here
+    means `groups`' own key order already IS registry order -- nothing
+    else needs to track or re-derive it."""
     groups: dict[str, list[str]] = {}
     for name, mdef in config.METRIC_REGISTRY.items():
         groups.setdefault(mdef.group, []).append(name)
@@ -39,8 +46,12 @@ def _render_metric(name: str, tickers: list[str], cik_by_ticker: dict[str, str],
                 components.empty_state(f"No data for {metric_def.display_name} ({t}).")
                 continue
             for row in rows:
+                # usd_per_share values carry a literal '$' (format_usd_per_share
+                # is not itself escaped -- see its docstring); this is the one
+                # place outside components.py's safe wrappers where a
+                # formatted value reaches st.write, so it is escaped here.
                 value_str = fmt.format_metric_value(row["value"], metric_def, row["null_reason"])
-                st.write(f"{fmt.format_period_label(row['period_end'], basis)}: {value_str}")
+                st.write(fmt.escape_markdown_currency(f"{fmt.format_period_label(row['period_end'], basis)}: {value_str}"))
             csv_lines = ["period_end,value"] + [f"{r['period_end']},{r['value'] if r['value'] is not None else ''}" for r in rows]
             st.download_button(
                 f"Download {metric_def.display_name} ({t}) CSV",
@@ -62,12 +73,12 @@ def render() -> None:
         help="Absolute is honest about size; indexed (to 100 at the first period) makes trajectories comparable.",
     )
 
+    # C6: sub-tabs by category, derived from METRIC_REGISTRY itself (never
+    # a hardcoded category list -- see _group_metrics) -- both the set of
+    # tabs and their labels come from the registry, not retyped here.
     groups = _group_metrics()
-    group_order = ["Growth", "Margins", "Returns", "Capital & Cash", "Working Capital", "Solvency", "Quality"]
-    for group in group_order:
-        names = groups.get(group, [])
-        if not names:
-            continue
-        st.header(group)
-        for name in names:
-            _render_metric(name, selected_tickers, cik_by_ticker, basis_choice, scale_choice)
+    category = components.sub_tab_bar("metrics_category", "Category", list(groups.keys()))
+
+    st.header(category)
+    for name in groups[category]:
+        _render_metric(name, selected_tickers, cik_by_ticker, basis_choice, scale_choice)

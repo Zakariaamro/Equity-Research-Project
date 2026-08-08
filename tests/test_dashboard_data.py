@@ -88,6 +88,18 @@ def _insert_metric(db_path, cik, name, period_start, period_end, value, formula=
     conn.close()
 
 
+def _insert_xbrl_fact(db_path, cik, concept, period_end, value, period_start=None, accession_no="acc-fact"):
+    conn = db.get_connection(db_path)
+    conn.execute(
+        "INSERT INTO xbrl_facts (cik, taxonomy, concept, unit, period_start, period_end, value, "
+        "accession_no, filed_date) VALUES (?, 'us-gaap', ?, 'USD', ?, ?, ?, ?, ?) "
+        "ON CONFLICT(cik, concept, unit, period_start, period_end, accession_no) DO UPDATE SET value = excluded.value",
+        (cik, concept, period_start, period_end, value, accession_no, "2026-06-25"),
+    )
+    conn.commit()
+    conn.close()
+
+
 def _insert_brief(db_path, accession_no, cik, sentences):
     conn = db.get_connection(db_path)
     cur = conn.execute(
@@ -122,6 +134,17 @@ def test_get_anchor_filing_prefers_10k_10q_never_8k(db_path):
     anchor = data.get_anchor_filing(AMZN_CIK, db_path)
     assert anchor["accession_no"] == "acc-10q"
     assert anchor["form_type"] == "10-Q"
+
+
+def test_get_anchor_filing_includes_ticker_and_company_name(db_path):
+    # SPEC-008 review D2 (found live): this query used to select only
+    # `filings` columns, so every Overview header rendered "(MU)" with an
+    # empty company name -- the caller patched `ticker` in by hand and
+    # never patched `company_name` in at all.
+    _insert_filing(db_path, "acc-10k", form_type="10-K", filing_date="2026-02-06")
+    anchor = data.get_anchor_filing(AMZN_CIK, db_path)
+    assert anchor["ticker"] == "AMZN"
+    assert anchor["company_name"]  # non-empty -- a real seeded company name, not patched in by the caller
 
 
 def test_get_more_recent_8k_found_when_same_day_or_later(db_path):
@@ -291,3 +314,614 @@ def test_cache_invalidates_when_db_mtime_changes(db_path):
     os.utime(db_path, (bumped, bumped))
     companies_after = data.get_companies(db_path)
     assert len(companies_after) == 4
+
+
+# --- statement line values (SPEC-008 review D11) ---
+
+
+def test_statement_line_values_picks_the_exact_duration_not_an_arbitrary_tie_break(db_path):
+    # Found live: Micron's revenue at period_end=2026-05-28 has BOTH a
+    # three-month row (period_start 2026-02-27, value 41,456M) and a
+    # nine-month year-to-date cumulative row (period_start 2025-08-29,
+    # value 78,959M) sharing the same period_end and filed_date -- a query
+    # by period_end alone has no principled way to prefer one. The caller
+    # must get back exactly the row matching the period_start it selected.
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "RevenueFromContractWithCustomerExcludingAssessedTax", "2026-05-28",
+        78_959_000_000, period_start="2025-08-29",
+    )
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "RevenueFromContractWithCustomerExcludingAssessedTax", "2026-05-28",
+        41_456_000_000, period_start="2026-02-27", accession_no="acc-fact-2",
+    )
+    quarterly = data.get_statement_line_values(
+        AMZN_CIK, "2026-02-27", "2026-05-28", (("revenue", "Revenue", None, None),), db_path
+    )
+    assert quarterly[0]["value"] == 41_456_000_000
+    nine_month = data.get_statement_line_values(
+        AMZN_CIK, "2025-08-29", "2026-05-28", (("revenue", "Revenue", None, None),), db_path
+    )
+    assert nine_month[0]["value"] == 78_959_000_000
+
+
+def test_statement_line_values_instant_concepts_ignore_period_start(db_path):
+    # A balance-sheet (instant) concept has no period_start at all -- must
+    # still resolve by period_end regardless of what period_start the
+    # caller's selected duration-based period happens to carry.
+    _insert_xbrl_fact(db_path, AMZN_CIK, "CashAndCashEquivalentsAtCarryingValue", "2026-05-28", 24_995_000_000)
+    rows = data.get_statement_line_values(
+        AMZN_CIK, "2026-02-27", "2026-05-28", (("cash", "Cash and cash equivalents", None, None),), db_path
+    )
+    assert rows[0]["value"] == 24_995_000_000
+
+
+def test_statement_line_values_renders_both_instant_and_duration_facts_for_one_period(db_path):
+    # Reported live against AMZN's Mar 31 2026 period: an instant fact
+    # (long-term debt) and two 89-day duration facts (cash from operations,
+    # stock-based compensation) all genuinely tagged for the same
+    # period_end, in the same statement pass. A regression that force-
+    # filters period_start onto instant concepts too (which have no
+    # period_start in xbrl_facts at all) would silently drop the instant
+    # line specifically, while duration lines whose period_start happens to
+    # match would still work -- exactly the asymmetric failure reported.
+    _insert_xbrl_fact(db_path, AMZN_CIK, "LongTermDebtNoncurrent", "2026-03-31", 119_074_000_000)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "NetCashProvidedByUsedInOperatingActivities", "2026-03-31",
+        26_032_000_000, period_start="2026-01-01",
+    )
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "ShareBasedCompensation", "2026-03-31",
+        4_032_000_000, period_start="2026-01-01", accession_no="acc-fact-2",
+    )
+    balance_sheet = data.get_statement_line_values(
+        AMZN_CIK, "2026-01-01", "2026-03-31", (("debt_noncurrent", "Long-term debt", None, None),), db_path
+    )
+    cash_flow = data.get_statement_line_values(
+        AMZN_CIK, "2026-01-01", "2026-03-31",
+        (("cfo", "Cash from operations", None, None), ("sbc", "Stock-based compensation", None, None)), db_path
+    )
+    assert balance_sheet[0]["value"] == 119_074_000_000
+    assert cash_flow[0]["value"] == 26_032_000_000
+    assert cash_flow[1]["value"] == 4_032_000_000
+
+
+def test_statement_line_values_metric_registry_branch_also_matches_exact_period(db_path):
+    _insert_metric(db_path, AMZN_CIK, "free_cash_flow", "2026-02-27", "2026-05-28", -1_234_000_000.0)
+    rows = data.get_statement_line_values(
+        AMZN_CIK, "2026-02-27", "2026-05-28", (("free_cash_flow", "Free cash flow", None, None),), db_path
+    )
+    assert rows[0]["value"] == -1_234_000_000.0
+    # A different period_start for the same period_end must not match.
+    rows_wrong_period = data.get_statement_line_values(
+        AMZN_CIK, "2025-08-29", "2026-05-28", (("free_cash_flow", "Free cash flow", None, None),), db_path
+    )
+    assert rows_wrong_period[0]["value"] is None
+
+
+def test_get_period_duration_class_matches_three_month_and_nine_month_bands():
+    assert data.get_period_duration_class("2026-02-27", "2026-05-28") == "quarterly"
+    assert data.get_period_duration_class("2025-08-29", "2026-05-28") == "three-quarter"
+
+
+def test_cash_flow_period_uses_the_quarterly_period_when_it_has_data(db_path):
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "NetCashProvidedByUsedInOperatingActivities", "2026-05-28",
+        1_000_000_000, period_start="2026-02-27",
+    )
+    period_start, note = data.get_cash_flow_period(AMZN_CIK, "2026-02-27", "2026-05-28", db_path)
+    assert period_start == "2026-02-27"
+    assert note == ""
+
+
+def test_cash_flow_period_falls_back_to_the_one_unambiguous_alternative(db_path):
+    # Confirmed live against the real corpus: Micron's/NVIDIA's non-Q1
+    # quarters routinely have no three-month cash-flow facts at all, only
+    # the year-to-date cumulative for the same period_end.
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "NetCashProvidedByUsedInOperatingActivities", "2026-05-28",
+        3_000_000_000, period_start="2025-08-29",
+    )
+    period_start, note = data.get_cash_flow_period(AMZN_CIK, "2026-02-27", "2026-05-28", db_path)
+    assert period_start == "2025-08-29"
+    assert "year-to-date" in note
+
+
+def test_cash_flow_period_refuses_to_guess_among_multiple_candidates(db_path):
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "NetCashProvidedByUsedInOperatingActivities", "2026-05-28",
+        3_000_000_000, period_start="2025-08-29",
+    )
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "NetCashProvidedByUsedInOperatingActivities", "2026-05-28",
+        1_500_000_000, period_start="2025-11-28", accession_no="acc-fact-2",
+    )
+    period_start, note = data.get_cash_flow_period(AMZN_CIK, "2026-02-27", "2026-05-28", db_path)
+    assert period_start == "2026-02-27"  # unchanged -- no principled way to prefer one candidate
+    assert note == ""
+
+
+# --- statement-line fallback (SPEC-008 review, PP&E follow-up) ---
+
+
+def test_statement_line_uses_the_primary_label_when_the_primary_resolves(db_path):
+    _insert_xbrl_fact(db_path, AMZN_CIK, "PropertyPlantAndEquipmentNet", "2026-03-31", 200_000_000_000)
+    lines = (
+        (
+            "ppe_net", "Property, plant and equipment, net",
+            "ppe_and_lease_net", "Property, plant and equipment and finance-lease ROU assets, net",
+        ),
+    )
+    rows = data.get_statement_line_values(AMZN_CIK, "2026-01-01", "2026-03-31", lines, db_path)
+    assert rows[0]["value"] == 200_000_000_000
+    assert rows[0]["label"] == "Property, plant and equipment, net"
+
+
+def test_statement_line_falls_back_and_relabels_when_the_primary_is_absent(db_path):
+    # Confirmed live: Amazon tags
+    # PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulated
+    # DepreciationAndAmortization (397.46B at 2026-03-31), never
+    # PropertyPlantAndEquipmentNet. Showing the fallback value under the
+    # PRIMARY label would pair a broader number with a narrower name --
+    # the label itself must change to name what the number actually is.
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK,
+        "PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulatedDepreciationAndAmortization",
+        "2026-03-31", 397_460_000_000,
+    )
+    lines = (
+        (
+            "ppe_net", "Property, plant and equipment, net",
+            "ppe_and_lease_net", "Property, plant and equipment and finance-lease ROU assets, net",
+        ),
+    )
+    rows = data.get_statement_line_values(AMZN_CIK, "2026-01-01", "2026-03-31", lines, db_path)
+    assert rows[0]["value"] == 397_460_000_000
+    assert rows[0]["label"] == "Property, plant and equipment and finance-lease ROU assets, net"
+    assert rows[0]["label"] != "Property, plant and equipment, net"
+
+
+def test_statement_line_stays_not_tagged_when_neither_primary_nor_fallback_resolve(db_path):
+    lines = (
+        (
+            "ppe_net", "Property, plant and equipment, net",
+            "ppe_and_lease_net", "Property, plant and equipment and finance-lease ROU assets, net",
+        ),
+    )
+    rows = data.get_statement_line_values(AMZN_CIK, "2026-01-01", "2026-03-31", lines, db_path)
+    assert rows[0]["value"] is None
+    assert rows[0]["label"] == "Property, plant and equipment, net"  # the primary label, not the fallback's
+
+
+def test_statement_line_without_a_fallback_is_unaffected(db_path):
+    rows = data.get_statement_line_values(
+        AMZN_CIK, "2026-01-01", "2026-03-31", (("cash", "Cash and cash equivalents", None, None),), db_path
+    )
+    assert rows[0]["value"] is None
+    assert rows[0]["label"] == "Cash and cash equivalents"
+
+
+# --- structurally-absent concepts (SPEC-008 review, debt-line follow-up) ---
+
+
+def _establish_analyzed_window(db_path, cik, earliest_period_end="2020-12-31"):
+    # concept_never_tagged scopes its check to period_end >= the earliest
+    # `metrics` period_end for this company -- needs at least one metrics
+    # row to establish that window, same as the real corpus always has.
+    _insert_metric(db_path, cik, "gross_margin", "2020-01-01", earliest_period_end, 0.5)
+
+
+def test_concept_never_tagged_true_when_no_row_exists_within_the_analyzed_window(db_path):
+    _establish_analyzed_window(db_path, AMZN_CIK)
+    assert data.concept_never_tagged(AMZN_CIK, "debt_noncurrent", db_path) is True
+
+
+def test_concept_never_tagged_false_when_a_row_exists_within_the_window(db_path):
+    _establish_analyzed_window(db_path, AMZN_CIK)
+    _insert_xbrl_fact(db_path, AMZN_CIK, "LongTermDebtNoncurrent", "2026-03-31", 119_074_000_000)
+    assert data.concept_never_tagged(AMZN_CIK, "debt_noncurrent", db_path) is False
+
+
+def test_concept_never_tagged_ignores_facts_from_before_the_analyzed_window(db_path):
+    # Found live: Micron DID tag LongTermDebtNoncurrent in 2012-2013, years
+    # before this project's analyzed window begins -- a naive "any row,
+    # ever" check was a false negative, since it has never once been
+    # tagged in any period this dashboard actually shows.
+    _establish_analyzed_window(db_path, AMZN_CIK, earliest_period_end="2020-12-31")
+    _insert_xbrl_fact(db_path, AMZN_CIK, "LongTermDebtNoncurrent", "2013-05-30", 3_267_000_000)
+    assert data.concept_never_tagged(AMZN_CIK, "debt_noncurrent", db_path) is True
+
+
+def test_concept_never_tagged_false_for_a_company_with_no_metrics_rows_at_all(db_path):
+    # No established analyzed window -- not "structurally absent", just
+    # not this function's concern (docstring's stated behavior).
+    assert data.concept_never_tagged(AMZN_CIK, "debt_noncurrent", db_path) is False
+
+
+def test_null_reason_distinguishes_structural_absence_from_a_period_gap(db_path):
+    _establish_analyzed_window(db_path, AMZN_CIK)
+
+    # No debt_noncurrent row for this company at all -- structural absence,
+    # with the pointer to the written diagnosis.
+    reason = data.get_statement_line_null_reason(AMZN_CIK, "debt_noncurrent", "AMZN", db_path)
+    assert "has not tagged this concept in any filing on record" in reason
+    assert "debt-tag diagnosis" in reason
+
+    # A concept with no written diagnosis still gets the honest structural
+    # phrasing, just without inventing a pointer that doesn't exist.
+    reason_no_pointer = data.get_statement_line_null_reason(AMZN_CIK, "cash", "AMZN", db_path)
+    assert "has not tagged this concept in any filing on record" in reason_no_pointer
+    assert "diagnosis" not in reason_no_pointer
+
+    # A row EXISTS for some other period within the window -- a genuine
+    # period-specific gap, not a structural absence, gets the original
+    # phrasing.
+    _insert_xbrl_fact(db_path, AMZN_CIK, "LongTermDebtNoncurrent", "2025-03-31", 100_000_000_000)
+    reason_period_gap = data.get_statement_line_null_reason(AMZN_CIK, "debt_noncurrent", "AMZN", db_path)
+    assert reason_period_gap == "not tagged for this period"
+
+
+# --- C4: the multi-period statement table ---
+
+
+def test_get_statement_periods_orders_oldest_to_newest_and_filters_by_basis(db_path):
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2024-01-01", "2024-12-31", 0.5)  # annual
+    quarterly = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    assert [p["period_end"] for p in quarterly] == ["2025-03-31", "2025-06-30"]  # oldest first
+    annual = data.get_statement_periods(AMZN_CIK, "annual", db_path)
+    assert [p["period_end"] for p in annual] == ["2024-12-31"]
+
+
+def test_growth_pct_computes_period_over_period_change():
+    assert data._growth_pct(100.0, 110.0) == pytest.approx(0.10)
+    assert data._growth_pct(100.0, 90.0) == pytest.approx(-0.10)
+
+
+def test_growth_pct_returns_none_for_zero_prior():
+    assert data._growth_pct(0.0, 50.0) is None
+
+
+# --- SPEC-008-batch-1 item 2 (D14, approved 2026-08-08): n/m classification ---
+
+
+def test_classify_growth_flags_zero_base():
+    growth_pct, reason = data._classify_growth(0.0, 50.0, typical_magnitude=1000.0)
+    assert growth_pct is None  # division by zero -- no number to attach, same as before
+    assert reason == "zero_base"
+
+
+def test_classify_growth_flags_sign_crossing():
+    growth_pct, reason = data._classify_growth(72.0, -113.0, typical_magnitude=1000.0)
+    assert growth_pct is not None  # mathematically defined
+    assert reason == "sign_crossing"
+
+
+def test_classify_growth_does_not_flag_a_clean_move_to_exactly_zero():
+    # value == 0 is a clean -100%, meaningful -- not the same as the sign
+    # flipping, which is what makes a percentage change undefined in
+    # direction.
+    growth_pct, reason = data._classify_growth(100.0, 0.0, typical_magnitude=1000.0)
+    assert growth_pct == pytest.approx(-1.0)
+    assert reason is None
+
+
+def test_classify_growth_flags_near_zero_base_reproducing_the_real_micron_example():
+    # MU's real free cash flow: $72M base, typical (median) magnitude
+    # $786M -- ratio 0.092, which the review's own example (+4097.2%) is
+    # built from. A 5% threshold would miss this; the chosen 10% catches it.
+    growth_pct, reason = data._classify_growth(72_000_000.0, 3_022_000_000.0, typical_magnitude=786_000_000.0)
+    assert growth_pct == pytest.approx(40.97222222222222)
+    assert reason == "near_zero_base"
+
+
+def test_classify_growth_does_not_flag_a_base_comfortably_above_the_threshold():
+    growth_pct, reason = data._classify_growth(200_000_000.0, 220_000_000.0, typical_magnitude=786_000_000.0)
+    assert reason is None
+
+
+def test_classify_growth_treats_missing_typical_magnitude_as_never_near_zero():
+    # A single-value row (nothing to compute a median from) can still hit
+    # zero-base/sign-crossing, but never the near-zero-base check, which
+    # needs a real reference point.
+    growth_pct, reason = data._classify_growth(1.0, 100.0, typical_magnitude=None)
+    assert reason is None
+
+
+def test_cash_flow_table_renders_not_meaningful_flag_for_a_near_zero_base(db_path):
+    # Reproduces the review's own cited case end to end, through the real
+    # table-building path (not just the classifier in isolation): a run of
+    # cumulative cfo/capex facts shaped so free_cash_flow's derived
+    # discrete quarter has a tiny base relative to its own history.
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-07-01", "2025-09-30", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "free_cash_flow", "2025-01-01", "2025-03-31", 800_000_000)
+    _insert_metric(db_path, AMZN_CIK, "free_cash_flow", "2025-04-01", "2025-06-30", 72_000_000)
+    _insert_metric(db_path, AMZN_CIK, "free_cash_flow", "2025-07-01", "2025-09-30", 3_022_000_000)
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
+    fcf_row = next(r for r in rows if r["canonical"] == "free_cash_flow")
+    q3_cell = next(c for c in fcf_row["cells"] if c["period_end"] == "2025-09-30")
+    assert q3_cell["growth_not_meaningful"] == "near_zero_base"
+
+
+def test_income_statement_table_computes_growth_between_adjacent_periods(db_path):
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "RevenueFromContractWithCustomerExcludingAssessedTax", "2025-03-31",
+        100_000_000, period_start="2025-01-01",
+    )
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "RevenueFromContractWithCustomerExcludingAssessedTax", "2025-06-30",
+        150_000_000, period_start="2025-04-01", accession_no="acc-fact-2",
+    )
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_income_statement_table(AMZN_CIK, periods, "AMZN", db_path)
+    revenue_row = next(r for r in rows if r["canonical"] == "revenue")
+    assert revenue_row["cells"][0]["growth_pct"] is None  # no prior cell to compare against
+    assert revenue_row["cells"][1]["growth_pct"] == pytest.approx(0.5)
+
+
+def test_income_statement_table_derives_q4_when_only_the_fy_figure_is_filed(db_path):
+    # SPEC-008 D12 (approved 2026-08-08): the income statement gets the
+    # SAME merge-fallback treatment cash flow already has -- Q4 has no
+    # discrete filed fact anywhere (only the FY 10-K's annual figure), so
+    # revenue_discrete (metrics.compute_discrete_quarter_metrics's own
+    # output, not exercised here) supplies the derived quarter.
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-07-01", "2025-09-30", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-10-01", "2025-12-31", 0.5)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "RevenueFromContractWithCustomerExcludingAssessedTax", "2025-09-30",
+        360_000_000, period_start="2025-07-01",
+    )
+    # No direct Q4 fact at all -- only the derived discrete metric exists,
+    # as metrics.py would have already computed and stored it.
+    _insert_metric(db_path, AMZN_CIK, "revenue_discrete", "2025-10-01", "2025-12-31", 140_000_000)
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_income_statement_table(AMZN_CIK, periods, "AMZN", db_path)
+    revenue_row = next(r for r in rows if r["canonical"] == "revenue")
+    q4_cell = next(c for c in revenue_row["cells"] if c["period_end"] == "2025-12-31")
+    assert q4_cell["value"] == 140_000_000
+    assert q4_cell["is_derived_quarter"] is True
+
+
+def test_income_statement_table_q4_blank_when_no_discrete_metric_computed_yet(db_path):
+    # Same setup, but revenue_discrete hasn't been computed -- a genuine
+    # blank (gap), never a silently wrong or estimated figure.
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-07-01", "2025-09-30", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-10-01", "2025-12-31", 0.5)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "RevenueFromContractWithCustomerExcludingAssessedTax", "2025-09-30",
+        360_000_000, period_start="2025-07-01",
+    )
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_income_statement_table(AMZN_CIK, periods, "AMZN", db_path)
+    revenue_row = next(r for r in rows if r["canonical"] == "revenue")
+    q4_cell = next(c for c in revenue_row["cells"] if c["period_end"] == "2025-12-31")
+    assert q4_cell["value"] is None
+    assert q4_cell["blank_cause"] == "gap"
+
+
+def test_balance_sheet_table_never_marks_a_cell_derived(db_path):
+    # D12 is explicit: the balance sheet is unaffected. BALANCE_SHEET_LINES
+    # declares no fallback_canonical for any line other than PP&E's
+    # genuinely-different-concept split, which is never "derived" (it's a
+    # different FILED concept, not a subtraction) -- confirms nothing here
+    # accidentally inherited the income-statement/cash-flow treatment.
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_xbrl_fact(db_path, AMZN_CIK, "CashAndCashEquivalentsAtCarryingValue", "2025-03-31", 1_000_000)
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_balance_sheet_table(AMZN_CIK, periods, "AMZN", db_path)
+    for row in rows:
+        for cell in row["cells"]:
+            assert "is_derived_quarter" not in cell
+
+
+def test_cash_flow_table_blank_when_not_tagged_discretely_and_no_discrete_metric_computed(db_path):
+    # Period 1: cfo tagged directly at the true quarterly duration. Period
+    # 2: cfo only tagged year-to-date, and no cfo_discrete metric row
+    # exists yet (metrics.compute_discrete_quarter_metrics hasn't run in
+    # this fixture) -- SPEC-008 C4 (approved 2026-08-08): the table no
+    # longer substitutes the wrong-duration filed figure the way it used
+    # to (the old is_duration_fallback/† mechanism); a genuine blank
+    # instead, never a mismatched-duration number.
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "NetCashProvidedByUsedInOperatingActivities", "2025-03-31",
+        10_000_000, period_start="2025-01-01",
+    )
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "NetCashProvidedByUsedInOperatingActivities", "2025-06-30",
+        25_000_000, period_start="2025-01-01", accession_no="acc-fact-2",  # YTD, not quarterly, for this period_end
+    )
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
+    cfo_row = next(r for r in rows if r["canonical"] == "cfo")
+    assert cfo_row["cells"][1]["value"] is None
+    assert cfo_row["cells"][1]["blank_cause"] == "gap"
+    assert cfo_row["cells"][1]["growth_pct"] is None
+
+
+def test_cash_flow_table_uses_the_derived_discrete_metric_when_it_exists(db_path):
+    # Same setup as above, but cfo_discrete (metrics.
+    # compute_discrete_quarter_metrics's own output) has already been
+    # computed and stored at the true quarterly period -- the table shows
+    # it, marks the cell derived, and growth% now populates since both
+    # cells are genuinely the same (three-month) duration.
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "NetCashProvidedByUsedInOperatingActivities", "2025-03-31",
+        10_000_000, period_start="2025-01-01",
+    )
+    _insert_metric(db_path, AMZN_CIK, "cfo_discrete", "2025-04-01", "2025-06-30", 15_000_000)
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
+    cfo_row = next(r for r in rows if r["canonical"] == "cfo")
+    assert cfo_row["cells"][1]["value"] == 15_000_000
+    assert cfo_row["cells"][1]["is_derived_quarter"] is True
+    assert cfo_row["cells"][1]["growth_pct"] == pytest.approx(0.5)
+
+
+def test_cash_flow_table_computes_growth_between_two_true_quarterly_cells(db_path):
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "NetCashProvidedByUsedInOperatingActivities", "2025-03-31",
+        10_000_000, period_start="2025-01-01",
+    )
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "NetCashProvidedByUsedInOperatingActivities", "2025-06-30",
+        15_000_000, period_start="2025-04-01", accession_no="acc-fact-2",  # its OWN quarterly period_start
+    )
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
+    cfo_row = next(r for r in rows if r["canonical"] == "cfo")
+    assert cfo_row["cells"][1]["is_derived_quarter"] is False
+    assert cfo_row["cells"][1]["growth_pct"] == pytest.approx(0.5)
+
+
+def test_balance_sheet_table_splits_ppe_row_when_fallback_used_in_at_least_one_column(db_path):
+    # MU's real pattern: pure ppe_net early, only the combined ROU-inclusive
+    # tag from some point on.
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2020-01-01", "2020-03-31", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2021-01-01", "2021-03-31", 0.5)
+    _insert_xbrl_fact(db_path, AMZN_CIK, "PropertyPlantAndEquipmentNet", "2020-03-31", 50_000_000_000)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK,
+        "PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulatedDepreciationAndAmortization",
+        "2021-03-31", 80_000_000_000,
+    )
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_balance_sheet_table(AMZN_CIK, periods, "AMZN", db_path)
+    ppe_rows = [r for r in rows if r["canonical"] == "ppe_net"]
+    assert len(ppe_rows) == 2
+    assert ppe_rows[0]["label"] == "Property, plant and equipment, net"
+    assert ppe_rows[0]["cells"][0]["value"] == 50_000_000_000
+    assert ppe_rows[0]["cells"][1]["value"] is None
+    assert ppe_rows[1]["label"] == "Property, plant and equipment and finance-lease ROU assets, net"
+    assert ppe_rows[1]["cells"][0]["value"] is None
+    assert ppe_rows[1]["cells"][1]["value"] == 80_000_000_000
+
+
+def test_balance_sheet_table_single_row_when_fallback_never_used(db_path):
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2020-01-01", "2020-03-31", 0.5)
+    _insert_xbrl_fact(db_path, AMZN_CIK, "PropertyPlantAndEquipmentNet", "2020-03-31", 50_000_000_000)
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_balance_sheet_table(AMZN_CIK, periods, "AMZN", db_path)
+    ppe_rows = [r for r in rows if r["canonical"] == "ppe_net"]
+    assert len(ppe_rows) == 1
+    assert ppe_rows[0]["label"] == "Property, plant and equipment, net"
+
+
+def test_balance_sheet_table_omits_the_primary_row_when_only_the_fallback_is_ever_used(db_path):
+    # AMZN's real pattern, generalised: if the primary canonical NEVER
+    # resolves anywhere in the displayed range, showing its row anyway
+    # would be a permanently empty "Property, plant and equipment, net"
+    # row on every table -- SPEC-008 C4 constraint 3.
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2020-01-01", "2020-03-31", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2021-01-01", "2021-03-31", 0.5)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK,
+        "PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulatedDepreciationAndAmortization",
+        "2020-03-31", 70_000_000_000,
+    )
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK,
+        "PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulatedDepreciationAndAmortization",
+        "2021-03-31", 80_000_000_000, accession_no="acc-fact-2",
+    )
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_balance_sheet_table(AMZN_CIK, periods, "AMZN", db_path)
+    ppe_rows = [r for r in rows if r["canonical"] == "ppe_net"]
+    assert len(ppe_rows) == 1
+    assert ppe_rows[0]["label"] == "Property, plant and equipment and finance-lease ROU assets, net"
+
+
+def test_statement_table_row_with_no_data_at_all_still_shows_a_single_blank_row(db_path):
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2020-01-01", "2020-03-31", 0.5)
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_balance_sheet_table(AMZN_CIK, periods, "AMZN", db_path)
+    ppe_rows = [r for r in rows if r["canonical"] == "ppe_net"]
+    assert len(ppe_rows) == 1
+    assert ppe_rows[0]["cells"][0]["value"] is None
+
+
+# --- SPEC-008 C4 constraint 4: a blank cell states which of three things it means ---
+
+
+def test_blank_cell_cause_is_split_when_the_paired_row_carries_this_period(db_path):
+    # The exact fixture from test_balance_sheet_table_splits_ppe_row_...:
+    # MU's real pattern, pure ppe_net early, only the combined ROU-inclusive
+    # tag from some point on -- each row's blank half is the OTHER row's
+    # populated half, not a genuine gap.
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2020-01-01", "2020-03-31", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2021-01-01", "2021-03-31", 0.5)
+    _insert_xbrl_fact(db_path, AMZN_CIK, "PropertyPlantAndEquipmentNet", "2020-03-31", 50_000_000_000)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK,
+        "PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulatedDepreciationAndAmortization",
+        "2021-03-31", 80_000_000_000,
+    )
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_balance_sheet_table(AMZN_CIK, periods, "AMZN", db_path)
+    ppe_rows = [r for r in rows if r["canonical"] == "ppe_net"]
+    primary_row = ppe_rows[0]
+    fallback_row = ppe_rows[1]
+    assert primary_row["cells"][1]["blank_cause"] == "split"
+    assert "finance-lease ROU assets" in primary_row["cells"][1]["blank_reason"]
+    assert fallback_row["cells"][0]["blank_cause"] == "split"
+    assert "Property, plant and equipment, net" in fallback_row["cells"][0]["blank_reason"]
+
+
+def test_blank_cell_cause_is_gap_when_the_concept_is_tagged_elsewhere_but_not_this_period(db_path):
+    # A genuine period-specific gap, not a split-row pairing (no fallback
+    # concept ever used here) and not structural absence (the concept IS
+    # tagged, just in the other period).
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2020-01-01", "2020-03-31", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2021-01-01", "2021-03-31", 0.5)
+    _insert_xbrl_fact(db_path, AMZN_CIK, "PropertyPlantAndEquipmentNet", "2021-03-31", 50_000_000_000)
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_balance_sheet_table(AMZN_CIK, periods, "AMZN", db_path)
+    ppe_row = next(r for r in rows if r["canonical"] == "ppe_net")
+    assert ppe_row["cells"][0]["value"] is None
+    assert ppe_row["cells"][0]["blank_cause"] == "gap"
+    assert ppe_row["cells"][0]["blank_reason"] == "not tagged for this period"
+    assert ppe_row["cells"][1]["value"] == 50_000_000_000
+
+
+def test_blank_cell_cause_is_gap_for_a_cash_flow_metric_neither_filed_nor_derived(db_path):
+    # free_cash_flow (a METRIC_REGISTRY entry) resolved directly at
+    # period 1's true quarterly duration; for period 2, neither
+    # free_cash_flow itself nor its derived fallback (free_cash_flow_
+    # discrete) has been computed -- SPEC-008 C4 (approved 2026-08-08): a
+    # plain gap. The old "duration" cause this scenario used to produce is
+    # retired along with the mechanism (is_duration_fallback) that
+    # explained it.
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "free_cash_flow", "2025-01-01", "2025-03-31", 5_000_000)
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
+    fcf_row = next(r for r in rows if r["canonical"] == "free_cash_flow")
+    assert fcf_row["cells"][1]["value"] is None
+    assert fcf_row["cells"][1]["blank_cause"] == "gap"
+
+
+def test_free_cash_flow_discrete_fallback_resolves_when_free_cash_flow_itself_is_absent(db_path):
+    # Mirrors cfo's own fallback test above, for free_cash_flow_discrete
+    # specifically (a METRIC_REGISTRY entry, unlike cfo/capex which are
+    # raw CONCEPT_REGISTRY facts) -- confirms the SAME merge mechanism
+    # handles a METRIC_REGISTRY primary too, not just raw concepts.
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "free_cash_flow", "2025-01-01", "2025-03-31", 5_000_000)
+    _insert_metric(db_path, AMZN_CIK, "free_cash_flow_discrete", "2025-04-01", "2025-06-30", 8_000_000)
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
+    fcf_row = next(r for r in rows if r["canonical"] == "free_cash_flow")
+    assert fcf_row["cells"][1]["value"] == 8_000_000
+    assert fcf_row["cells"][1]["is_derived_quarter"] is True

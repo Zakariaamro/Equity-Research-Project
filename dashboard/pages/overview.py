@@ -18,7 +18,6 @@ def _render_company(ticker: str, cik: str) -> None:
     if anchor is None:
         components.empty_state(f"No 10-K or 10-Q on file yet for {ticker}.")
         return
-    anchor["ticker"] = ticker
     more_recent_8k = data.get_more_recent_8k(cik, anchor["filing_date"])
     components.filing_header(anchor, more_recent_8k)
 
@@ -28,6 +27,8 @@ def _render_company(ticker: str, cik: str) -> None:
 
     st.markdown("### What changed?")
     observations = data.get_top_observations(anchor["accession_no"])
+    already_in_brief = components.observation_ids_cited_in_brief(sentences)
+    observations = [o for o in observations if o["id"] not in already_in_brief]
     components.observations_section(observations)
 
     st.markdown("### Is the business getting better or worse?")
@@ -46,7 +47,7 @@ def _render_company(ticker: str, cik: str) -> None:
         metric_def = config.METRIC_REGISTRY[name]
         with col:
             latest = data.get_latest_metric(cik, name, metric_def.basis)
-            components.metric_tile(metric_def, latest)
+            components.metric_tile(metric_def, latest, anchor_period_end=anchor["period_end"])
 
     st.markdown("### Should I be suspicious?")
     cols = st.columns(len(_SUSPICION_METRICS))
@@ -54,7 +55,7 @@ def _render_company(ticker: str, cik: str) -> None:
         metric_def = config.METRIC_REGISTRY[name]
         with col:
             latest = data.get_latest_metric(cik, name, metric_def.basis)
-            components.metric_tile(metric_def, latest)
+            components.metric_tile(metric_def, latest, anchor_period_end=anchor["period_end"])
     red_flags = data.get_red_flag_findings(anchor["accession_no"])
     components.red_flag_section(red_flags)
 

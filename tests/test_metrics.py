@@ -12,7 +12,7 @@ import json
 import pytest
 
 from edgar import config, db, metrics, xbrl
-from tests.conftest import FIXTURES_DIR, insert_fixture_filings
+from tests.conftest import FIXTURES_DIR, backfill_fiscal_labels, insert_fixture_filings
 
 AMZN_CIK = "0001018724"
 NVDA_CIK = "0001045810"
@@ -56,6 +56,7 @@ def _ingest(conn, cik: str) -> None:
     # (SPEC-005 change 9) to have any known accessions to update.
     insert_fixture_filings(conn, ciks=[cik])
     xbrl.ingest_company(conn, FakeXbrlClient(FIXTURES_BY_CIK[cik]), cik)
+    backfill_fiscal_labels(conn, cik, FIXTURES_BY_CIK[cik])
 
 
 def _ingest_all(conn) -> None:
@@ -422,3 +423,232 @@ def test_compute_metrics_idempotent(conn):
 
     assert count_after_second == count_after_first
     assert second_written == []
+
+
+# --- SPEC-008 C4 (approved 2026-08-08): discrete fiscal quarters ---
+
+
+def test_discrete_quarter_generic_loop_never_computes_it(conn):
+    # computed_separately metrics must be skipped by compute_metrics's own
+    # generic per-period loop -- if COMPUTE_FUNCS's guard is ever reached
+    # (the skip removed by accident), it raises rather than silently
+    # writing a value at the wrong (cumulative) period_start.
+    _ingest(conn, MU_CIK)
+    metrics.compute_metrics(conn, tickers=["MU"])
+    rows = _metric_rows(conn, MU_CIK, "cfo_discrete")
+    assert rows == []  # compute_metrics alone writes nothing for it
+
+
+def test_discrete_quarter_q1_is_the_filed_figure_directly_no_subtraction(conn):
+    _ingest(conn, MU_CIK)
+    metrics.compute_discrete_quarter_metrics(conn, tickers=["MU"])
+    rows = _metric_rows(conn, MU_CIK, "cfo_discrete")
+    q1 = next(r for r in rows if r["period_end"] == "2025-11-27")
+    assert q1["value"] == 8_411_000_000.0
+    assert "already discrete" in q1["formula"]
+
+
+def test_discrete_quarter_q2_q3_derived_by_subtraction_matches_hand_computed(conn):
+    # MU's real cumulative pattern: Q1=8,411M, Q2 YTD=20,314M, Q3 YTD=45,702M
+    # -- discrete Q2 = 20,314 - 8,411 = 11,903M, discrete Q3 = 45,702 -
+    # 20,314 = 25,388M. Confirmed by hand before writing this test.
+    _ingest(conn, MU_CIK)
+    metrics.compute_discrete_quarter_metrics(conn, tickers=["MU"])
+    rows = {r["period_end"]: r for r in _metric_rows(conn, MU_CIK, "cfo_discrete")}
+    assert rows["2026-02-26"]["value"] == pytest.approx(11_903_000_000.0)
+    assert rows["2026-05-28"]["value"] == pytest.approx(25_388_000_000.0)
+
+
+def test_discrete_quarter_period_start_is_the_real_filed_date_not_a_calendar_guess(conn):
+    # MU's fiscal year floats (2025-08-29, not any fixed MMDD) -- the
+    # discrete quarter's own period_start must come from the actual prior
+    # filed period_end + 1 day, never a `config.Company.fiscal_year_end`
+    # calendar assumption.
+    _ingest(conn, MU_CIK)
+    metrics.compute_discrete_quarter_metrics(conn, tickers=["MU"])
+    rows = {r["period_end"]: r for r in conn.execute(
+        "SELECT period_start, period_end, value FROM metrics WHERE cik = ? AND name = 'cfo_discrete'", (MU_CIK,)
+    ).fetchall()}
+    assert rows["2025-11-27"]["period_start"] == "2025-08-29"  # Q1: fiscal year's own start
+    assert rows["2026-02-26"]["period_start"] == "2025-11-28"  # Q2: the day after Q1 actually ended
+    assert rows["2026-05-28"]["period_start"] == "2026-02-27"  # Q3: the day after Q2 actually ended
+
+
+def test_discrete_quarter_fails_closed_when_the_fy_figure_is_not_filed_yet(conn):
+    # MU's fixture has no FY2026 10-K yet (the fiscal year is still in
+    # progress) -- Q4-discrete must be absent (null with a reason), never
+    # estimated.
+    _ingest(conn, MU_CIK)
+    metrics.compute_discrete_quarter_metrics(conn, tickers=["MU"])
+    rows = conn.execute(
+        "SELECT value, inputs_json FROM metrics WHERE cik = ? AND name = 'cfo_discrete' AND period_end = ?",
+        (MU_CIK, "2026-08-28"),  # would be the Q4/FY end, if it were filed
+    ).fetchall()
+    assert rows == []  # not even a null row -- the fiscal quarter itself doesn't exist in `filings` yet
+
+
+def test_discrete_quarter_full_cycle_sums_to_the_filed_fy_figure(conn):
+    # NVDA's FY2026 fixture is complete: Q1=27,414M, Q2 YTD=42,779M, Q3
+    # YTD=66,530M, FY=102,718M -- confirmed by hand: discrete quarters are
+    # 27,414 / 15,365 / 23,751 / 36,188, summing to exactly 102,718.
+    _ingest(conn, NVDA_CIK)
+    metrics.compute_discrete_quarter_metrics(conn, tickers=["NVDA"])
+    rows = {r["period_end"]: r["value"] for r in _metric_rows(conn, NVDA_CIK, "cfo_discrete")}
+    q1, q2, q3, q4 = rows["2025-04-27"], rows["2025-07-27"], rows["2025-10-26"], rows["2026-01-25"]
+    assert (q1, q2, q3, q4) == pytest.approx((27_414_000_000.0, 15_365_000_000.0, 23_751_000_000.0, 36_188_000_000.0))
+    assert q1 + q2 + q3 + q4 == pytest.approx(102_718_000_000.0)
+
+
+def test_discrete_quarter_capex_plausibility_gate_nulls_a_restated_endpoint(conn):
+    # SPEC-008 C4 item 2: subtraction can produce a negative derived capex
+    # if an endpoint was restated -- meaningless, must become a null with a
+    # reason, never a displayed figure. Simulates a restatement by
+    # corrupting Q1's filed capex UPWARD after ingest, so Q2's cumulative
+    # figure (unchanged) minus the inflated Q1 goes negative.
+    _ingest(conn, MU_CIK)
+    conn.execute(
+        "UPDATE xbrl_facts SET value = value * 100 WHERE cik = ? AND concept = ? AND period_end = ?",
+        (MU_CIK, "PaymentsToAcquirePropertyPlantAndEquipment", "2025-11-27"),
+    )
+    conn.commit()
+    metrics.compute_discrete_quarter_metrics(conn, tickers=["MU"])
+    rows = {r["period_end"]: r for r in _metric_rows(conn, MU_CIK, "capex_discrete")}
+    q2 = rows["2026-02-26"]
+    assert q2["value"] is None
+    assert "implausible" in json.loads(q2["inputs_json"])["_null_reason"]
+
+
+def test_discrete_quarter_negative_cfo_is_not_caught_by_the_plausibility_gate(conn):
+    # The opposite of the case above: cfo has NO lower bound (None), since
+    # a negative operating quarter is a legitimate business outcome, not an
+    # error signal -- simulate one and confirm it survives.
+    _ingest(conn, MU_CIK)
+    conn.execute(
+        "UPDATE xbrl_facts SET value = ? WHERE cik = ? AND concept = ? AND period_end = ?",
+        (-500_000_000.0, MU_CIK, "NetCashProvidedByUsedInOperatingActivities", "2025-11-27"),
+    )
+    conn.commit()
+    metrics.compute_discrete_quarter_metrics(conn, tickers=["MU"])
+    rows = {r["period_end"]: r for r in _metric_rows(conn, MU_CIK, "cfo_discrete")}
+    # Q2 discrete = 20,314M (unchanged YTD) - (-500M) = 20,814M -- a huge
+    # positive number, not what's being tested here; what matters is Q1
+    # itself (the negative figure, filed directly) survives as negative.
+    assert rows["2025-11-27"]["value"] == -500_000_000.0
+
+
+def test_free_cash_flow_discrete_composes_cfo_and_capex_discrete(conn):
+    _ingest(conn, MU_CIK)
+    metrics.compute_discrete_quarter_metrics(conn, tickers=["MU"])
+    cfo = {r["period_end"]: r["value"] for r in _metric_rows(conn, MU_CIK, "cfo_discrete")}
+    capex = {r["period_end"]: r["value"] for r in _metric_rows(conn, MU_CIK, "capex_discrete")}
+    fcf = {r["period_end"]: r["value"] for r in _metric_rows(conn, MU_CIK, "free_cash_flow_discrete")}
+    for end in ("2025-11-27", "2026-02-26", "2026-05-28"):
+        assert fcf[end] == pytest.approx(cfo[end] - capex[end])
+
+
+def test_discrete_quarter_metrics_idempotent(conn):
+    _ingest(conn, MU_CIK)
+    metrics.compute_discrete_quarter_metrics(conn, tickers=["MU"])
+    count_after_first = conn.execute(
+        "SELECT COUNT(*) AS n FROM metrics WHERE name LIKE '%_discrete'"
+    ).fetchone()["n"]
+    second_written = metrics.compute_discrete_quarter_metrics(conn, tickers=["MU"])
+    count_after_second = conn.execute(
+        "SELECT COUNT(*) AS n FROM metrics WHERE name LIKE '%_discrete'"
+    ).fetchone()["n"]
+    assert count_after_second == count_after_first
+    assert second_written == []
+
+
+# --- SPEC-008 D12 (approved 2026-08-08): discrete Q4 on the income statement ---
+#
+# The trimmed companyfacts fixtures don't carry a clean, complete fiscal-
+# year cycle for any income-statement concept (unlike cfo, which happened
+# to) -- real data confirms the mechanism works (verified against
+# data/app.db: AMZN's derived Q4 2024 revenue is exactly 187,792,000,000,
+# matching 637,959,000,000 FY minus 450,167,000,000 9-month YTD, both real
+# filed figures), but a fixture-driven test needs facts inserted directly
+# rather than relying on what happens to be in the trimmed JSON.
+
+
+def _insert_filing_row(conn, cik, accession_no, form_type, period_end, fiscal_year, fiscal_period):
+    conn.execute(
+        "INSERT INTO filings (accession_no, cik, form_type, filing_date, period_end, fiscal_year, "
+        "fiscal_period, discovered_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sectioned') "
+        "ON CONFLICT(accession_no) DO NOTHING",
+        (accession_no, cik, form_type, period_end, period_end, fiscal_year, fiscal_period, f"{period_end}T00:00:00"),
+    )
+
+
+def _insert_income_fact(conn, cik, concept, period_start, period_end, value, duration_days, accession_no):
+    conn.execute(
+        "INSERT INTO xbrl_facts (cik, taxonomy, concept, unit, period_start, period_end, value, "
+        "accession_no, filed_date, duration_days) VALUES (?, 'us-gaap', ?, 'USD', ?, ?, ?, ?, ?, ?)",
+        (cik, concept, period_start, period_end, value, accession_no, period_end, duration_days),
+    )
+
+
+def _seed_amzn_fiscal_year_revenue(conn):
+    """A clean, synthetic, single-fiscal-year AMZN-shaped revenue cycle --
+    Q1/Q2/Q3 cumulative-tagged (the real pattern confirmed against
+    data/app.db: AMZN double-tags discrete AND cumulative for income-
+    statement lines in the same filing), FY tagged only as the annual
+    cumulative (no discrete Q4 anywhere -- the D12 gap itself). Hand-
+    computed: Q1=100M, Q2=120M, Q3=140M, Q4=140M, summing to FY=500M."""
+    concept = "RevenueFromContractWithCustomerExcludingAssessedTax"
+    _insert_filing_row(conn, AMZN_CIK, "acc-q1", "10-Q", "2025-03-31", 2025, "Q1")
+    _insert_filing_row(conn, AMZN_CIK, "acc-q2", "10-Q", "2025-06-30", 2025, "Q2")
+    _insert_filing_row(conn, AMZN_CIK, "acc-q3", "10-Q", "2025-09-30", 2025, "Q3")
+    _insert_filing_row(conn, AMZN_CIK, "acc-fy", "10-K", "2025-12-31", 2025, "FY")
+    _insert_income_fact(conn, AMZN_CIK, concept, "2025-01-01", "2025-03-31", 100_000_000, 90, "acc-q1")
+    _insert_income_fact(conn, AMZN_CIK, concept, "2025-01-01", "2025-06-30", 220_000_000, 181, "acc-q2")
+    _insert_income_fact(conn, AMZN_CIK, concept, "2025-01-01", "2025-09-30", 360_000_000, 273, "acc-q3")
+    _insert_income_fact(conn, AMZN_CIK, concept, "2025-01-01", "2025-12-31", 500_000_000, 365, "acc-fy")
+    conn.commit()
+
+
+def test_income_statement_q4_derived_from_fy_minus_nine_month(conn):
+    _seed_amzn_fiscal_year_revenue(conn)
+    metrics.compute_discrete_quarter_metrics(conn, tickers=["AMZN"])
+    rows = {r["period_end"]: r for r in _metric_rows(conn, AMZN_CIK, "revenue_discrete")}
+    assert rows["2025-03-31"]["value"] == pytest.approx(100_000_000.0)  # Q1, direct
+    assert rows["2025-12-31"]["value"] == pytest.approx(140_000_000.0)  # Q4 = 500M - 360M
+    assert "500" in rows["2025-12-31"]["formula"] or "YTD to 2025-12-31" in rows["2025-12-31"]["formula"]
+
+
+def test_income_statement_quarters_sum_back_to_filed_fy(conn):
+    _seed_amzn_fiscal_year_revenue(conn)
+    metrics.compute_discrete_quarter_metrics(conn, tickers=["AMZN"])
+    rows = {r["period_end"]: r["value"] for r in _metric_rows(conn, AMZN_CIK, "revenue_discrete")}
+    total = rows["2025-03-31"] + rows["2025-06-30"] + rows["2025-09-30"] + rows["2025-12-31"]
+    assert total == pytest.approx(500_000_000.0)
+
+
+def test_income_statement_q4_fails_closed_when_fy_not_filed_yet(conn):
+    # Same shape as MU's real in-progress fiscal year (cash flow) -- no
+    # 10-K yet means no FY figure to subtract from, so Q4 must be absent,
+    # never estimated.
+    concept = "RevenueFromContractWithCustomerExcludingAssessedTax"
+    _insert_filing_row(conn, AMZN_CIK, "acc-q1", "10-Q", "2025-03-31", 2025, "Q1")
+    _insert_filing_row(conn, AMZN_CIK, "acc-q3", "10-Q", "2025-09-30", 2025, "Q3")
+    _insert_income_fact(conn, AMZN_CIK, concept, "2025-01-01", "2025-03-31", 100_000_000, 90, "acc-q1")
+    _insert_income_fact(conn, AMZN_CIK, concept, "2025-01-01", "2025-09-30", 360_000_000, 273, "acc-q3")
+    conn.commit()
+    metrics.compute_discrete_quarter_metrics(conn, tickers=["AMZN"])
+    rows = conn.execute(
+        "SELECT value FROM metrics WHERE cik = ? AND name = 'revenue_discrete' AND period_end = ?",
+        (AMZN_CIK, "2025-12-31"),
+    ).fetchall()
+    assert rows == []  # the fiscal quarter itself doesn't exist in `filings` -- nothing to write
+
+
+def test_balance_sheet_lines_have_no_discrete_fallback(conn):
+    # D12 is explicit: the balance sheet is unaffected -- instants need no
+    # subtraction. Confirms no BALANCE_SHEET_LINES-style canonical was
+    # accidentally swept into the discrete-quarter mechanism.
+    balance_sheet_canonicals = {
+        "cash", "short_term_investments", "receivables", "inventory", "current_assets",
+        "ppe_net", "ppe_and_lease_net", "total_assets", "payables", "current_liabilities",
+        "debt_noncurrent", "equity",
+    }
+    assert balance_sheet_canonicals.isdisjoint(metrics._DISCRETE_QUARTER_CANONICALS)

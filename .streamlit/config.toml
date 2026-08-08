@@ -1,0 +1,8 @@
+[theme]
+base = "dark"
+# SPEC-008 C4 rebuild: a heavier rule under the header row and visible row
+# separators, requested for the new st.dataframe-based statement table.
+# Structural (weight, not colour-of-data) and app-wide since this is the
+# first and only st.dataframe in the app -- not scoped per-table because
+# Streamlit's theme has no per-widget override.
+dataframeBorderColor = "#52525b"
