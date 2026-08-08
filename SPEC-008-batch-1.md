@@ -169,6 +169,84 @@ periods actually resolve. A line that is blank for all three companies isn't wor
 
 Discrete-quarter derivation applies to these exactly as it does to the existing five.
 
+### Resolution (implemented 2026-08-09)
+
+**No line is blank for all three companies — all 15 kept.** Coverage, quarterly basis, real
+corpus (`n` periods with a resolved value / periods on the statement):
+
+| Line | Section | AMZN | NVDA | MU |
+|---|---|---|---|---|
+| Change in receivables | Operating | 0/25 | 21/24 | 35/37 |
+| Change in inventory | Operating | 24/25 | 21/24 | 35/37 |
+| Change in payables | Operating | 24/25 | 21/24 | 35/37 |
+| Deferred income tax | Operating | 24/25 | 21/24 | 0/37 |
+| Other non-cash adjustments | Operating | 24/25 | 21/24 | 0/37 |
+| Acquisitions, net of cash acquired | Investing | 19/25 | 21/24 | 0/37 |
+| Purchases of investments | Investing | 24/25 | 5/24 | 12/37 |
+| Maturities/sales of investments | Investing | 24/25 | 21/24 | 24/37 |
+| Share repurchases | Financing | 13/25 | 21/24 | 34/37 |
+| Dividends paid | Financing | 0/25 | 23/24 | 23/37 |
+| Debt issued | Financing | 24/25 | 0/24 | 28/37 |
+| Debt repaid | Financing | 24/25 | 0/24 | 1/37 |
+| Finance lease principal paid | Financing | 24/25 | 0/24 | 25/37 |
+| Effect of exchange rates on cash | Reconciliation | 7/25 | 0/24 | 35/37 |
+| Net change in cash | Reconciliation | 24/25 | 21/24 | 35/37 |
+
+Every zero/near-zero cell was individually checked against the real filing data, not assumed
+to be a gap:
+
+- **AMZN receivables (0/25), dividends (0/25).** AMZN stopped separately tagging receivables
+  changes after ~2013 (predates this project's analyzed window entirely) and has never paid a
+  dividend. Both genuine facts about the company/filing, not bugs.
+- **MU deferred tax, other non-cash, acquisitions (0/37 each).** MU does not tag any of these
+  three concepts in the analyzed window (confirmed via `xbrl.ingest_company`'s own
+  `unresolved` report, not inferred from the table).
+- **NVDA debt issued, debt repaid, finance lease principal, FX effect (0/24 each).** NVDA does
+  not separately tag quarterly-duration facts for any of these four in the analyzed window.
+  Checked specifically for alternate tags before concluding this (see "aliases tried and
+  rejected" below) — genuinely absent, not a naming miss.
+
+**"Purchases of equity investments" is not its own line.** Amazon's Anthropic/OpenAI stakes
+were checked specifically (the review's own example) and have no separate "equity method
+investment" cash-flow tag — they roll into the generic "Purchases of investments" line,
+which is the best available granularity for the company the review asked about. A narrower
+line would have nothing to be narrower than for AMZN specifically.
+
+**"Beginning and ending cash" was not added as a new line.** It is the SAME instant fact the
+balance sheet's own "Cash and cash equivalents" row already carries (a period's ending cash
+IS the next period's beginning cash) — not a new duration concept to curate.
+
+**Two aliases tried and rejected**, found live via `validate` category 6 (alias agreement)
+against the real corpus, not assumed to be safe because both resolved data:
+
+- `PaymentsToAcquireAvailableForSaleSecuritiesDebt` (tried for `investment_purchases`,
+  needed for NVDA's coverage) disagrees with `PaymentsToAcquireMarketableSecurities` by
+  40-470% for Amazon, which tags both — a narrower concept (debt securities only, excluding
+  equity), not a synonym. Removed; NVDA's coverage for this line dropped from 20/24 to 5/24
+  as a direct, honest consequence.
+- `RepaymentsOfDebt` (tried for `debt_repaid`, same reason) disagrees with
+  `RepaymentsOfLongTermDebt` by 160-2400% for Amazon — a BROADER concept (evidently includes
+  short-term/commercial-paper repayments). Removed; NVDA's coverage dropped from data-bearing
+  to 0/24.
+- `CashAndCashEquivalentsPeriodIncreaseDecrease` (tried for `net_change_in_cash`) disagrees
+  with the primary (post-ASU-2016-18, restricted-cash-inclusive) tag by 5-500% for Amazon and
+  Micron. Removed; no coverage impact (the primary tag already covers both companies fully).
+
+One small (2.8-3.3%), old (2016-2017) disagreement was registered as an
+`ALIAS_AGREEMENT_EXCEPTIONS` entry instead of removed — `investment_maturities`'s two aliases,
+same Amazon tag-transition era already on record for `capex`'s own exception, not
+investigated further given that precedent.
+
+**A real bug found and fixed while investigating the alias conflicts**: the discrete-quarter
+plausibility floor (decision log #67) was nulling Q1's DIRECT pass-through of a filed fact,
+not just genuinely derived subtraction results -- Amazon really filed a negative Q1 2025
+acquisitions figure (-$48M, likely a purchase-price adjustment on a prior deal), and the gate
+was silently suppressing it because a positive-only floor is the norm for "Payments" concepts,
+not a guarantee. Fixed: the floor now only applies to `fp != "Q1"`. Regression test added
+(`test_discrete_quarter_plausibility_gate_never_applies_to_q1s_direct_pass_through`). The
+real value is now shown and documented in `RANGE_EXCEPTIONS`, per this project's own D15 rule
+(if the filing really says so, the display is correct).
+
 ---
 
 ## Item 6 — EPS and share counts on the income statement

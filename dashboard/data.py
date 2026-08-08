@@ -433,10 +433,40 @@ CASH_FLOW_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
     # concept, filed directly or derived by subtraction, never two
     # different things worth showing side by side.
     ("cfo", "Cash from operations", "cfo_discrete", "Cash from operations"),
-    ("capex", "Capital expenditure", "capex_discrete", "Capital expenditure"),
-    ("free_cash_flow", "Free cash flow", "free_cash_flow_discrete", "Free cash flow"),
     ("sbc", "Stock-based compensation", "sbc_discrete", "Stock-based compensation"),
     ("dep_amort", "Depreciation and amortization", "dep_amort_discrete", "Depreciation and amortization"),
+    # SPEC-008-batch-1 item 5 (approved 2026-08-09): the three-section
+    # statement. Ordered Operating / Investing / Financing / Reconciliation
+    # to match a real cash flow statement's own layout, not registry
+    # insertion order -- a page composing this list is free to insert
+    # subtotal rows between sections; this module only orders the lines
+    # themselves.
+    ("receivables_change", "Change in receivables", "receivables_change_discrete", "Change in receivables"),
+    ("inventory_change", "Change in inventory", "inventory_change_discrete", "Change in inventory"),
+    ("payables_change", "Change in payables", "payables_change_discrete", "Change in payables"),
+    ("deferred_tax", "Deferred income tax", "deferred_tax_discrete", "Deferred income tax"),
+    ("other_noncash", "Other non-cash adjustments", "other_noncash_discrete", "Other non-cash adjustments"),
+    ("capex", "Capital expenditure", "capex_discrete", "Capital expenditure"),
+    ("acquisitions", "Acquisitions, net of cash acquired", "acquisitions_discrete", "Acquisitions, net of cash acquired"),
+    (
+        "investment_purchases", "Purchases of investments",
+        "investment_purchases_discrete", "Purchases of investments",
+    ),
+    (
+        "investment_maturities", "Maturities/sales of investments",
+        "investment_maturities_discrete", "Maturities/sales of investments",
+    ),
+    ("buybacks", "Share repurchases", "buybacks_discrete", "Share repurchases"),
+    ("dividends_paid", "Dividends paid", "dividends_paid_discrete", "Dividends paid"),
+    ("debt_issued", "Debt issued", "debt_issued_discrete", "Debt issued"),
+    ("debt_repaid", "Debt repaid", "debt_repaid_discrete", "Debt repaid"),
+    (
+        "finance_lease_principal_paid", "Finance lease principal paid",
+        "finance_lease_principal_paid_discrete", "Finance lease principal paid",
+    ),
+    ("fx_effect_on_cash", "Effect of exchange rates on cash", "fx_effect_on_cash_discrete", "Effect of exchange rates on cash"),
+    ("net_change_in_cash", "Net change in cash", "net_change_in_cash_discrete", "Net change in cash"),
+    ("free_cash_flow", "Free cash flow", "free_cash_flow_discrete", "Free cash flow"),
 )
 
 

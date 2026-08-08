@@ -280,6 +280,98 @@ CONCEPT_REGISTRY: dict[str, ConceptInput] = {
     "capex": ConceptInput(
         ("PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets"), "USD"
     ),
+    # --- SPEC-008-batch-1 item 5 (approved 2026-08-09): the three-section
+    # cash flow statement. Every alias below confirmed present in the real
+    # companyfacts payload for at least one of the three watchlist
+    # companies before being added -- coverage counts recorded in
+    # SPEC-008-batch-1.md's item 5 resolution, not assumed. All are
+    # "Payments*"/"Proceeds*" XBRL concepts, confirmed tagged as POSITIVE
+    # magnitudes (never negative) across all three companies -- the
+    # statement's OWN presentation applies the sign, the fact itself does
+    # not -- except the "IncreaseDecrease*"/"DeferredIncomeTax*"/
+    # "EffectOfExchangeRate*" ones, confirmed genuinely bidirectional.
+    #
+    # Operating (working capital + non-cash reconciliation).
+    "receivables_change": ConceptInput(
+        ("IncreaseDecreaseInAccountsReceivable", "IncreaseDecreaseInReceivables"), "USD"
+    ),
+    "inventory_change": ConceptInput(("IncreaseDecreaseInInventories",), "USD"),
+    "payables_change": ConceptInput(
+        ("IncreaseDecreaseInAccountsPayable", "IncreaseDecreaseInAccountsPayableAndAccruedLiabilities"), "USD"
+    ),
+    "deferred_tax": ConceptInput(("DeferredIncomeTaxExpenseBenefit",), "USD"),
+    "other_noncash": ConceptInput(("OtherNoncashIncomeExpense",), "USD"),
+    # Investing.
+    "acquisitions": ConceptInput(("PaymentsToAcquireBusinessesNetOfCashAcquired",), "USD"),
+    # Amazon's Anthropic/OpenAI equity purchases were checked specifically
+    # (SPEC-008-batch-1 item 5 resolution) and found to have NO separate
+    # "equity method investment" cash-flow tag of their own -- they roll
+    # into this same generic "investments" line, which is why this
+    # canonical is not split into a narrower "equity investments" one:
+    # there is no narrower fact to split it FROM for the company the
+    # review specifically asked about.
+    # PaymentsToAcquireAvailableForSaleSecuritiesDebt tried and REMOVED,
+    # found live via R8 category 6 (alias agreement) against the real
+    # corpus: disagrees with PaymentsToAcquireMarketableSecurities by
+    # 40-470% for Amazon, which tags both -- a narrower concept (debt
+    # securities only, excluding equity) masquerading as a synonym, the
+    # exact §2.1 violation shape. NVDA's own coverage for this line
+    # regresses to 0 as a result (that alias was the only one NVDA tags
+    # recently) -- an honest gap, not fixed by conflating scopes.
+    "investment_purchases": ConceptInput(
+        (
+            "PaymentsToAcquireInvestments", "PaymentsToAcquireMarketableSecurities",
+            "PaymentsToAcquireAvailableForSaleSecurities",
+        ),
+        "USD",
+    ),
+    "investment_maturities": ConceptInput(
+        (
+            "ProceedsFromSaleMaturityAndCollectionsOfInvestments",
+            "ProceedsFromMaturitiesPrepaymentsAndCallsOfAvailableForSaleSecurities",
+            "ProceedsFromSaleAndMaturityOfMarketableSecurities",
+        ),
+        "USD",
+    ),
+    # Financing.
+    "buybacks": ConceptInput(("PaymentsForRepurchaseOfCommonStock",), "USD"),
+    "dividends_paid": ConceptInput(("PaymentsOfDividends", "PaymentsOfDividendsCommonStock"), "USD"),
+    "debt_issued": ConceptInput(("ProceedsFromIssuanceOfLongTermDebt", "ProceedsFromNotesPayable"), "USD"),
+    # RepaymentsOfDebt tried and REMOVED, found live the same way as
+    # investment_purchases above: disagrees with RepaymentsOfLongTermDebt
+    # by 160-2400% for Amazon (which tags both) -- a BROADER concept
+    # (evidently includes short-term/commercial-paper repayments
+    # RepaymentsOfLongTermDebt does not), not a synonym. NVDA's coverage
+    # for this line is 0 as a result -- NVDA does not tag long-term-debt
+    # repayment discretely in the analyzed window at all.
+    "debt_repaid": ConceptInput(("RepaymentsOfLongTermDebt",), "USD"),
+    "finance_lease_principal_paid": ConceptInput(
+        ("FinanceLeasePrincipalPayments", "RepaymentsOfFinanceLeaseObligations"), "USD"
+    ),
+    # Reconciliation. "Beginning and ending cash" deliberately not added
+    # here -- it is the SAME instant fact the balance sheet's own `cash`
+    # line already carries (a period's ending cash IS the next period's
+    # beginning cash), not a new duration concept to curate.
+    "fx_effect_on_cash": ConceptInput(
+        (
+            "EffectOfExchangeRateOnCashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+            "EffectOfExchangeRateOnCashAndCashEquivalents",
+        ),
+        "USD",
+    ),
+    # CashAndCashEquivalentsPeriodIncreaseDecrease tried and REMOVED, found
+    # live the same way: disagrees with the primary tag by 5-500% for
+    # Amazon and Micron, both of which tag it -- the primary tag is the
+    # POST-ASU-2016-18 concept (restricted cash and equivalents required
+    # in the reconciliation since 2018); this one is the pre-ASU, narrower
+    # scope that EXCLUDES restricted cash, not a synonym for the same
+    # figure under a different name.
+    "net_change_in_cash": ConceptInput(
+        (
+            "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncreaseDecreaseIncludingExchangeRateEffect",
+        ),
+        "USD",
+    ),
 }
 
 # Every raw XBRL concept name worth storing, across all canonical inputs.
@@ -313,6 +405,16 @@ ALIAS_AGREEMENT_EXCEPTIONS: dict[str, AliasAgreementException] = {
             "one period (2016-12-31). free_cash_flow computed from "
             "PaymentsToAcquireProductiveAssets was hand-verified against Amazon's "
             "archived FY2025 cash flow statement (SPEC-004 AC9); that alias is trusted."
+        ),
+    ),
+    "investment_maturities": AliasAgreementException(
+        canonical="investment_maturities",
+        reason=(
+            "Amazon's ProceedsFromSaleMaturityAndCollectionsOfInvestments -> "
+            "ProceedsFromSaleAndMaturityOfMarketableSecurities transition (~2017, the "
+            "same tag-transition era as the capex exception above) disagrees 2.8-3.3% for "
+            "two periods (2016-12-31, 2017-03-31) -- same shape as the capex case, smaller "
+            "magnitude, not investigated further given the precedent already on record."
         ),
     ),
 }
@@ -414,6 +516,24 @@ RANGE_EXCEPTIONS: dict[tuple[str, str, str, str], RangeException] = {
             "valuation-allowance release as Micron returned to marginal profitability "
             "coming out of the 2022-2023 memory downturn. A small real denominator plus a "
             "large real discrete item, not a data error."
+        ),
+    ),
+    ("acquisitions_discrete", "0001018724", "2025-01-01", "2025-03-31"): RangeException(
+        metric="acquisitions_discrete",
+        cik="0001018724",
+        period_start="2025-01-01",
+        period_end="2025-03-31",
+        reason=(
+            "Amazon genuinely filed a NEGATIVE Q1 2025 "
+            "PaymentsToAcquireBusinessesNetOfCashAcquired (-$48M) -- a real, directly "
+            "filed figure (formula \"Q1, already discrete\", not a subtraction; SPEC-008-"
+            "batch-1 item 5 found this live and fixed a related bug: the plausibility "
+            "floor was wrongly nulling Q1's direct pass-through, not just derived "
+            "subtraction results). Most likely a purchase-price adjustment or refund tied "
+            "to a prior acquisition -- common in M&A cash-flow reporting -- but the exact "
+            "cause is not confirmed against the filing text; what IS confirmed is that the "
+            "tag itself genuinely reports this value, so per this project's own D15 rule "
+            "(if the filing really says so, the display is correct) it is not suppressed."
         ),
     ),
 }
@@ -791,6 +911,137 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         display_name='Free cash flow (discrete quarter)', unit='usd', precision=0,
         higher_is_better=True, group='Capital & Cash',
         description='cfo_discrete minus capex_discrete -- free cash flow for this quarter alone.',
+    ),
+    # --- Discrete fiscal quarters, cash flow completeness (SPEC-008-batch-1
+    # item 5, approved 2026-08-09) -- the three-section statement's own new
+    # lines get the SAME discrete-quarter treatment as the original five,
+    # exactly as the item requires ("Discrete-quarter derivation applies to
+    # these exactly as it does to the existing five"). plausible_range:
+    # (0.0, inf) for every "Payments*"/"Proceeds*" line (confirmed tagged
+    # as positive magnitudes across all three companies, same convention
+    # already established for capex/sbc/dep_amort); None for the genuinely
+    # bidirectional working-capital/reconciliation lines (confirmed
+    # negative values appear in the real data for each).
+    "receivables_change_discrete": MetricDef(
+        "receivables_change_discrete", ("receivables_change",), "quarterly", None, False, "capital_cash",
+        extreme_informative=False, computed_separately=True,
+        display_name='Change in receivables (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=None, group='Capital & Cash',
+        description='Change in accounts receivable for this quarter alone -- filed directly or derived by '
+        'subtraction, same discipline as cfo_discrete.',
+    ),
+    "inventory_change_discrete": MetricDef(
+        "inventory_change_discrete", ("inventory_change",), "quarterly", None, False, "capital_cash",
+        extreme_informative=False, computed_separately=True,
+        display_name='Change in inventory (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=None, group='Capital & Cash',
+        description='Change in inventory for this quarter alone -- filed directly or derived by subtraction, '
+        'same discipline as cfo_discrete.',
+    ),
+    "payables_change_discrete": MetricDef(
+        "payables_change_discrete", ("payables_change",), "quarterly", None, False, "capital_cash",
+        extreme_informative=False, computed_separately=True,
+        display_name='Change in payables (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=None, group='Capital & Cash',
+        description='Change in accounts payable for this quarter alone -- filed directly or derived by '
+        'subtraction, same discipline as cfo_discrete.',
+    ),
+    "deferred_tax_discrete": MetricDef(
+        "deferred_tax_discrete", ("deferred_tax",), "quarterly", None, False, "capital_cash",
+        extreme_informative=False, computed_separately=True,
+        display_name='Deferred income tax (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=None, group='Capital & Cash',
+        description='Deferred income tax expense/benefit for this quarter alone -- filed directly or derived '
+        'by subtraction, same discipline as cfo_discrete.',
+    ),
+    "other_noncash_discrete": MetricDef(
+        "other_noncash_discrete", ("other_noncash",), "quarterly", None, False, "capital_cash",
+        extreme_informative=False, computed_separately=True,
+        display_name='Other non-cash adjustments (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=None, group='Capital & Cash',
+        description='Other non-cash income/expense adjustments for this quarter alone -- filed directly or '
+        'derived by subtraction, same discipline as cfo_discrete.',
+    ),
+    "acquisitions_discrete": MetricDef(
+        "acquisitions_discrete", ("acquisitions",), "quarterly", (0.0, float("inf")), False, "capital_cash",
+        extreme_informative=False, computed_separately=True,
+        display_name='Acquisitions, net of cash acquired (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=None, group='Capital & Cash',
+        description='Cash paid for acquisitions for this quarter alone -- filed directly or derived by '
+        'subtraction, same discipline as cfo_discrete.',
+    ),
+    "investment_purchases_discrete": MetricDef(
+        "investment_purchases_discrete", ("investment_purchases",), "quarterly", (0.0, float("inf")), False,
+        "capital_cash", extreme_informative=False, computed_separately=True,
+        display_name='Purchases of investments (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=None, group='Capital & Cash',
+        description='Cash paid to purchase marketable securities and other investments for this quarter alone '
+        '(includes equity-method/strategic stakes where a company does not tag them separately) -- filed '
+        'directly or derived by subtraction, same discipline as cfo_discrete.',
+    ),
+    "investment_maturities_discrete": MetricDef(
+        "investment_maturities_discrete", ("investment_maturities",), "quarterly", (0.0, float("inf")), False,
+        "capital_cash", extreme_informative=False, computed_separately=True,
+        display_name='Maturities/sales of investments (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=None, group='Capital & Cash',
+        description='Cash received from maturities and sales of investments for this quarter alone -- filed '
+        'directly or derived by subtraction, same discipline as cfo_discrete.',
+    ),
+    "buybacks_discrete": MetricDef(
+        "buybacks_discrete", ("buybacks",), "quarterly", (0.0, float("inf")), False, "capital_cash",
+        extreme_informative=False, computed_separately=True,
+        display_name='Share repurchases (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=None, group='Capital & Cash',
+        description='Cash paid to repurchase common stock for this quarter alone -- filed directly or derived '
+        'by subtraction, same discipline as cfo_discrete.',
+    ),
+    "dividends_paid_discrete": MetricDef(
+        "dividends_paid_discrete", ("dividends_paid",), "quarterly", (0.0, float("inf")), False, "capital_cash",
+        extreme_informative=False, computed_separately=True,
+        display_name='Dividends paid (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=None, group='Capital & Cash',
+        description='Cash dividends paid for this quarter alone -- filed directly or derived by subtraction, '
+        'same discipline as cfo_discrete.',
+    ),
+    "debt_issued_discrete": MetricDef(
+        "debt_issued_discrete", ("debt_issued",), "quarterly", (0.0, float("inf")), False, "capital_cash",
+        extreme_informative=False, computed_separately=True,
+        display_name='Debt issued (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=None, group='Capital & Cash',
+        description='Proceeds from long-term debt issuance for this quarter alone -- filed directly or '
+        'derived by subtraction, same discipline as cfo_discrete.',
+    ),
+    "debt_repaid_discrete": MetricDef(
+        "debt_repaid_discrete", ("debt_repaid",), "quarterly", (0.0, float("inf")), False, "capital_cash",
+        extreme_informative=False, computed_separately=True,
+        display_name='Debt repaid (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=None, group='Capital & Cash',
+        description='Cash paid to repay long-term debt for this quarter alone -- filed directly or derived by '
+        'subtraction, same discipline as cfo_discrete.',
+    ),
+    "finance_lease_principal_paid_discrete": MetricDef(
+        "finance_lease_principal_paid_discrete", ("finance_lease_principal_paid",), "quarterly",
+        (0.0, float("inf")), False, "capital_cash", extreme_informative=False, computed_separately=True,
+        display_name='Finance lease principal paid (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=None, group='Capital & Cash',
+        description='Cash paid for finance-lease principal for this quarter alone -- filed directly or '
+        'derived by subtraction, same discipline as cfo_discrete.',
+    ),
+    "fx_effect_on_cash_discrete": MetricDef(
+        "fx_effect_on_cash_discrete", ("fx_effect_on_cash",), "quarterly", None, False, "capital_cash",
+        extreme_informative=False, computed_separately=True,
+        display_name='FX effect on cash (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=None, group='Capital & Cash',
+        description='Effect of exchange rate changes on cash for this quarter alone -- filed directly or '
+        'derived by subtraction, same discipline as cfo_discrete.',
+    ),
+    "net_change_in_cash_discrete": MetricDef(
+        "net_change_in_cash_discrete", ("net_change_in_cash",), "quarterly", None, False, "capital_cash",
+        extreme_informative=False, computed_separately=True,
+        display_name='Net change in cash (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=True, group='Capital & Cash',
+        description='Net change in cash and equivalents for this quarter alone -- filed directly or derived '
+        'by subtraction, same discipline as cfo_discrete.',
     ),
     # --- Discrete fiscal quarters, income statement (SPEC-008 D12, approved
     # 2026-08-08) -- same mechanism as the cash-flow block above, extended

@@ -952,6 +952,61 @@ def test_balance_sheet_table_never_marks_a_cell_derived(db_path):
             assert "is_derived_quarter" not in cell
 
 
+# --- SPEC-008-batch-1 item 5 (approved 2026-08-09): three-section cash flow statement ---
+
+
+def test_cash_flow_lines_includes_all_three_new_sections():
+    canonicals = {line[0] for line in data.CASH_FLOW_LINES}
+    operating = {"receivables_change", "inventory_change", "payables_change", "deferred_tax", "other_noncash"}
+    investing = {"acquisitions", "investment_purchases", "investment_maturities"}
+    financing = {"buybacks", "dividends_paid", "debt_issued", "debt_repaid", "finance_lease_principal_paid"}
+    reconciliation = {"fx_effect_on_cash", "net_change_in_cash"}
+    assert operating <= canonicals
+    assert investing <= canonicals
+    assert financing <= canonicals
+    assert reconciliation <= canonicals
+
+
+def test_cash_flow_lines_new_lines_all_declare_the_merge_fallback():
+    # Same discipline as every existing cash-flow line (SPEC-008 C4 item 3):
+    # fallback_label == label, one row, filed-or-derived -- never a second
+    # resolution pattern invented for the new lines.
+    new_canonicals = {
+        "receivables_change", "inventory_change", "payables_change", "deferred_tax", "other_noncash",
+        "acquisitions", "investment_purchases", "investment_maturities",
+        "buybacks", "dividends_paid", "debt_issued", "debt_repaid", "finance_lease_principal_paid",
+        "fx_effect_on_cash", "net_change_in_cash",
+    }
+    for canonical, label, fallback_canonical, fallback_label in data.CASH_FLOW_LINES:
+        if canonical not in new_canonicals:
+            continue
+        assert fallback_canonical == f"{canonical}_discrete"
+        assert fallback_label == label
+
+
+def test_cash_flow_table_resolves_a_new_line_filed_directly(db_path):
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "PaymentsForRepurchaseOfCommonStock", "2025-03-31", 250_000_000, period_start="2025-01-01",
+    )
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
+    buybacks_row = next(r for r in rows if r["canonical"] == "buybacks")
+    assert buybacks_row["label"] == "Share repurchases"
+    assert buybacks_row["cells"][0]["value"] == 250_000_000.0
+    assert buybacks_row["cells"][0].get("is_derived_quarter") is not True
+
+
+def test_cash_flow_table_derives_a_new_line_when_only_discrete_metric_exists(db_path):
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "buybacks_discrete", "2025-01-01", "2025-03-31", 60_000_000)
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
+    buybacks_row = next(r for r in rows if r["canonical"] == "buybacks")
+    assert buybacks_row["cells"][0]["value"] == 60_000_000.0
+    assert buybacks_row["cells"][0]["is_derived_quarter"] is True
+
+
 def test_cash_flow_table_blank_when_not_tagged_discretely_and_no_discrete_metric_computed(db_path):
     # Period 1: cfo tagged directly at the true quarterly duration. Period
     # 2: cfo only tagged year-to-date, and no cfo_discrete metric row

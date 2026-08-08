@@ -518,6 +518,31 @@ def test_discrete_quarter_capex_plausibility_gate_nulls_a_restated_endpoint(conn
     assert "implausible" in json.loads(q2["inputs_json"])["_null_reason"]
 
 
+def test_discrete_quarter_plausibility_gate_never_applies_to_q1s_direct_pass_through(conn):
+    # Found live against the real corpus (SPEC-008-batch-1 item 5,
+    # 2026-08-09): AMZN genuinely filed a NEGATIVE Q1 2025 acquisitions
+    # figure (-$48M, a real refund/adjustment) -- Q1 is never a
+    # subtraction (formula "..., already discrete"), so a plausibility
+    # floor meant to catch bad SUBTRACTIONS must never touch it, no matter
+    # what the filed number's sign is. This project's own D15 rule: if the
+    # filing really says so, the display is correct.
+    conn.execute(
+        "INSERT INTO filings (accession_no, cik, form_type, filing_date, period_end, fiscal_year, "
+        "fiscal_period, discovered_at, status) VALUES (?, ?, ?, ?, ?, 2025, 'Q1', ?, 'sectioned')",
+        ("acc-q1", MU_CIK, "10-Q", "2025-03-31", "2025-03-31", "2025-03-31T00:00:00"),
+    )
+    conn.execute(
+        "INSERT INTO xbrl_facts (cik, taxonomy, concept, unit, period_start, period_end, value, "
+        "accession_no, filed_date, duration_days) VALUES (?, 'us-gaap', 'PaymentsToAcquireBusinessesNetOfCashAcquired', "
+        "'USD', '2025-01-01', '2025-03-31', -48000000, 'acc-q1', '2025-03-31', 90)",
+        (MU_CIK,),
+    )
+    conn.commit()
+    metrics.compute_discrete_quarter_metrics(conn, tickers=["MU"])
+    rows = {r["period_end"]: r["value"] for r in _metric_rows(conn, MU_CIK, "acquisitions_discrete")}
+    assert rows["2025-03-31"] == -48_000_000.0  # NOT nulled, even though acquisitions_discrete floors at 0.0
+
+
 def test_discrete_quarter_negative_cfo_is_not_caught_by_the_plausibility_gate(conn):
     # The opposite of the case above: cfo has NO lower bound (None), since
     # a negative operating quarter is a legitimate business outcome, not an
@@ -544,6 +569,99 @@ def test_free_cash_flow_discrete_composes_cfo_and_capex_discrete(conn):
     fcf = {r["period_end"]: r["value"] for r in _metric_rows(conn, MU_CIK, "free_cash_flow_discrete")}
     for end in ("2025-11-27", "2026-02-26", "2026-05-28"):
         assert fcf[end] == pytest.approx(cfo[end] - capex[end])
+
+
+# --- SPEC-008-batch-1 item 5 (approved 2026-08-09): cash flow completeness ---
+
+
+def _seed_buybacks_cycle(conn):
+    """A clean, synthetic, single-fiscal-year cumulative-tagged buybacks
+    cycle (same shape as the revenue helper above, different concept) --
+    the trimmed fixtures don't carry data for any of item 5's new
+    concepts, so this inserts facts directly. Q1=50M, Q2 YTD=90M, Q3
+    YTD=90M (a quarter with zero buybacks -- legitimate, not a gap),
+    FY=150M. Hand-computed discrete: 50/40/0/60."""
+    concept = "PaymentsForRepurchaseOfCommonStock"
+    for accession_no, form_type, period_end, fiscal_period in (
+        ("acc-q1", "10-Q", "2025-03-31", "Q1"),
+        ("acc-q2", "10-Q", "2025-06-30", "Q2"),
+        ("acc-q3", "10-Q", "2025-09-30", "Q3"),
+        ("acc-fy", "10-K", "2025-12-31", "FY"),
+    ):
+        conn.execute(
+            "INSERT INTO filings (accession_no, cik, form_type, filing_date, period_end, fiscal_year, "
+            "fiscal_period, discovered_at, status) VALUES (?, ?, ?, ?, ?, 2025, ?, ?, 'sectioned')",
+            (accession_no, AMZN_CIK, form_type, period_end, period_end, fiscal_period, f"{period_end}T00:00:00"),
+        )
+    for period_start, period_end, value, duration_days, accession_no in (
+        ("2025-01-01", "2025-03-31", 50_000_000, 90, "acc-q1"),
+        ("2025-01-01", "2025-06-30", 90_000_000, 181, "acc-q2"),
+        ("2025-01-01", "2025-09-30", 90_000_000, 273, "acc-q3"),
+        ("2025-01-01", "2025-12-31", 150_000_000, 365, "acc-fy"),
+    ):
+        conn.execute(
+            "INSERT INTO xbrl_facts (cik, taxonomy, concept, unit, period_start, period_end, value, "
+            "accession_no, filed_date, duration_days) VALUES (?, 'us-gaap', ?, 'USD', ?, ?, ?, ?, ?, ?)",
+            (AMZN_CIK, concept, period_start, period_end, value, accession_no, period_end, duration_days),
+        )
+    conn.commit()
+
+
+def test_buybacks_discrete_derives_correctly_including_a_zero_quarter(conn):
+    _seed_buybacks_cycle(conn)
+    metrics.compute_discrete_quarter_metrics(conn, tickers=["AMZN"])
+    rows = {r["period_end"]: r["value"] for r in _metric_rows(conn, AMZN_CIK, "buybacks_discrete")}
+    assert rows["2025-03-31"] == pytest.approx(50_000_000.0)
+    assert rows["2025-06-30"] == pytest.approx(40_000_000.0)
+    assert rows["2025-09-30"] == pytest.approx(0.0)  # a real zero-buyback quarter, not a gap
+    assert rows["2025-12-31"] == pytest.approx(60_000_000.0)
+    assert sum(rows.values()) == pytest.approx(150_000_000.0)  # sums back to the filed FY figure
+
+
+def test_buybacks_discrete_plausibility_gate_nulls_a_negative_result(conn):
+    # buybacks_discrete has the same (0.0, inf) sign floor as capex/sbc/
+    # dep_amort_discrete -- a restated endpoint producing a negative
+    # "share repurchase" is meaningless, not a small number.
+    _seed_buybacks_cycle(conn)
+    conn.execute(
+        "UPDATE xbrl_facts SET value = value * 100 WHERE cik = ? AND concept = ? AND period_end = ?",
+        (AMZN_CIK, "PaymentsForRepurchaseOfCommonStock", "2025-03-31"),
+    )
+    conn.commit()
+    metrics.compute_discrete_quarter_metrics(conn, tickers=["AMZN"])
+    rows = {r["period_end"]: r for r in _metric_rows(conn, AMZN_CIK, "buybacks_discrete")}
+    q2 = rows["2025-06-30"]  # 90M YTD - 5,000M (corrupted Q1) = deeply negative
+    assert q2["value"] is None
+    assert "implausible" in json.loads(q2["inputs_json"])["_null_reason"]
+
+
+def test_receivables_change_discrete_allows_negative_values_no_plausibility_floor(conn):
+    # A bidirectional working-capital line -- unlike buybacks, a negative
+    # discrete value (receivables DECREASING that quarter) is a normal,
+    # legitimate result and must not be caught by any sign floor.
+    concept = "IncreaseDecreaseInAccountsReceivable"
+    for accession_no, form_type, period_end, fiscal_period in (
+        ("acc-q1", "10-Q", "2025-03-31", "Q1"),
+        ("acc-q2", "10-Q", "2025-06-30", "Q2"),
+    ):
+        conn.execute(
+            "INSERT INTO filings (accession_no, cik, form_type, filing_date, period_end, fiscal_year, "
+            "fiscal_period, discovered_at, status) VALUES (?, ?, ?, ?, ?, 2025, ?, ?, 'sectioned')",
+            (accession_no, AMZN_CIK, form_type, period_end, period_end, fiscal_period, f"{period_end}T00:00:00"),
+        )
+    for period_start, period_end, value, duration_days, accession_no in (
+        ("2025-01-01", "2025-03-31", 200_000_000, 90, "acc-q1"),
+        ("2025-01-01", "2025-06-30", 50_000_000, 181, "acc-q2"),  # cumulative DROPS -- Q2 discrete is negative
+    ):
+        conn.execute(
+            "INSERT INTO xbrl_facts (cik, taxonomy, concept, unit, period_start, period_end, value, "
+            "accession_no, filed_date, duration_days) VALUES (?, 'us-gaap', ?, 'USD', ?, ?, ?, ?, ?, ?)",
+            (AMZN_CIK, concept, period_start, period_end, value, accession_no, period_end, duration_days),
+        )
+    conn.commit()
+    metrics.compute_discrete_quarter_metrics(conn, tickers=["AMZN"])
+    rows = {r["period_end"]: r["value"] for r in _metric_rows(conn, AMZN_CIK, "receivables_change_discrete")}
+    assert rows["2025-06-30"] == pytest.approx(-150_000_000.0)  # 50M - 200M, negative, not nulled
 
 
 def test_discrete_quarter_metrics_idempotent(conn):

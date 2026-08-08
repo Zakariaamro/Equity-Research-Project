@@ -1058,6 +1058,12 @@ _DISCRETE_QUARTER_CANONICALS: tuple[str, ...] = (
     # quarters to check against.
     "revenue", "cogs", "gross_profit", "rnd_expense", "sga_expense",
     "operating_income", "interest_expense", "pretax_income", "tax_expense", "net_income",
+    # Cash flow completeness (SPEC-008-batch-1 item 5, approved 2026-08-09):
+    # the three-section statement's new lines get the identical treatment.
+    "receivables_change", "inventory_change", "payables_change", "deferred_tax", "other_noncash",
+    "acquisitions", "investment_purchases", "investment_maturities",
+    "buybacks", "dividends_paid", "debt_issued", "debt_repaid", "finance_lease_principal_paid",
+    "fx_effect_on_cash", "net_change_in_cash",
 )
 _PRIOR_FISCAL_PERIOD: dict[str, str] = {"Q2": "Q1", "Q3": "Q2", "FY": "Q3"}
 
@@ -1197,8 +1203,23 @@ def compute_discrete_quarter_metrics(
                             canonical, facts_by_concept, fy_start, end, prior_end if fp != "Q1" else None
                         )
 
+                    # SPEC-008-batch-1 item 5 (found live against the real
+                    # corpus, 2026-08-09): the plausibility floor must
+                    # apply ONLY to a genuinely DERIVED (subtracted) value,
+                    # never to Q1's direct pass-through of a filed fact --
+                    # AMZN really did file -$48M for Q1 2025 acquisitions
+                    # (a real, negative, directly filed number, formula
+                    # "Q1, already discrete", no subtraction involved at
+                    # all), and the gate was nulling it out on the
+                    # assumption that "Payments*" concepts are always
+                    # positive, which is the norm but not a guarantee this
+                    # project gets to override a real filed fact with.
+                    # This project's own rule, stated for D15 (Micron's
+                    # zero interest expense): if the filing really says so,
+                    # the display is correct and the finding is about the
+                    # filing, not the code -- the same rule applies here.
                     value = result.value
-                    if value is not None and mdef.plausible_range is not None:
+                    if value is not None and fp != "Q1" and mdef.plausible_range is not None:
                         lo, hi = mdef.plausible_range
                         if not (lo <= value <= hi):
                             result = MetricResult(
@@ -1333,6 +1354,21 @@ COMPUTE_FUNCS: dict[str, Callable] = {
     "pretax_income_discrete": _refused_computed_separately,
     "tax_expense_discrete": _refused_computed_separately,
     "net_income_discrete": _refused_computed_separately,
+    "receivables_change_discrete": _refused_computed_separately,
+    "inventory_change_discrete": _refused_computed_separately,
+    "payables_change_discrete": _refused_computed_separately,
+    "deferred_tax_discrete": _refused_computed_separately,
+    "other_noncash_discrete": _refused_computed_separately,
+    "acquisitions_discrete": _refused_computed_separately,
+    "investment_purchases_discrete": _refused_computed_separately,
+    "investment_maturities_discrete": _refused_computed_separately,
+    "buybacks_discrete": _refused_computed_separately,
+    "dividends_paid_discrete": _refused_computed_separately,
+    "debt_issued_discrete": _refused_computed_separately,
+    "debt_repaid_discrete": _refused_computed_separately,
+    "finance_lease_principal_paid_discrete": _refused_computed_separately,
+    "fx_effect_on_cash_discrete": _refused_computed_separately,
+    "net_change_in_cash_discrete": _refused_computed_separately,
 }
 
 assert set(COMPUTE_FUNCS) == set(config.METRIC_REGISTRY), (
