@@ -29,6 +29,12 @@ def test_format_usd_per_share_stays_in_dollars():
     assert fmt.format_usd_per_share(-1.5) == "$-1.50"
 
 
+def test_format_shares_scales_to_millions_no_dollar_sign():
+    # SPEC-008-batch-1 render-batch follow-up item 1 (approved 2026-08-11).
+    assert fmt.format_shares(10_743_000_000) == "10,743"
+    assert fmt.format_shares(685_300_000) == "685"
+
+
 def test_format_days():
     assert fmt.format_days(35, 0) == "35 days"
     assert fmt.format_days(132.7376, 0) == "133 days"

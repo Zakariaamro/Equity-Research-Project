@@ -229,6 +229,22 @@ _ROW_HEIGHT_PX = 35
 _HEADER_HEIGHT_PX = 38
 _MAX_TABLE_HEIGHT_PX = 700
 
+# SPEC-008-batch-1 render-batch follow-up item 1 (approved 2026-08-11): item
+# 6's own note ("units and formatting are explicitly NOT implemented in this
+# batch") blocked wiring EPS/shares into this table at all -- correct then,
+# since `fmt.format_usd`'s $-millions convention would have shown a $2.35
+# diluted EPS as "0". These two rows are the already-decided exception: the
+# unit each canonical needs was specified in item 6's own spec text (EPS to
+# two decimals in dollars, share counts in millions), not a new design
+# choice made here. Every other canonical still falls through to
+# `fmt.format_usd` below, unchanged.
+_CELL_FORMATTERS = {
+    "eps_basic": fmt.format_usd_per_share,
+    "eps_diluted": fmt.format_usd_per_share,
+    "basic_shares": fmt.format_shares,
+    "diluted_shares": fmt.format_shares,
+}
+
 
 def _statement_table_style(row: pd.Series, row_kind: list[str], row_group: list[int]) -> list[str]:
     i = row.name
@@ -299,13 +315,14 @@ def statement_table(rows: list[dict], periods: list[dict], show_growth: bool, ke
         cells = row["cells"]
 
         value_entry = {_LINE_ITEM_COL: row["label"]}
+        formatter = _CELL_FORMATTERS.get(row["canonical"], fmt.format_usd)
         for col_name, cell in zip(period_cols, cells):
             if cell["value"] is None:
                 cause = cell.get("blank_cause", "gap")
                 blank_causes_present.add(cause)
                 value_entry[col_name] = _BLANK_MARKERS[cause]
                 continue
-            text = fmt.format_usd(cell["value"])
+            text = formatter(cell["value"])
             if cell.get("is_derived_quarter"):
                 text += " †"
                 any_derived_quarter = True

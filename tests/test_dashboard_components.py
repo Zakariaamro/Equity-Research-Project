@@ -579,3 +579,37 @@ def test_statement_table_empty_when_no_rows():
     at.run()
     assert at.exception == []
     assert any(i.value for i in at.info)
+
+
+def test_statement_table_formats_eps_and_share_rows_in_their_own_units():
+    # SPEC-008-batch-1 render-batch follow-up item 1 (approved 2026-08-11):
+    # eps_basic/eps_diluted and basic_shares/diluted_shares must NOT go
+    # through fmt.format_usd's $-millions convention -- a $2.35 diluted EPS
+    # rendered that way would show as "0".
+    def script(rows, periods):
+        from dashboard import components
+
+        components.statement_table(rows, periods, show_growth=False, key="t")
+
+    periods = [{"period_end": "2025-03-31"}]
+    rows = [
+        {
+            "label": "Diluted EPS", "canonical": "eps_diluted",
+            "cells": [{"period_end": "2025-03-31", "value": 2.35, "is_derived_quarter": False}],
+        },
+        {
+            "label": "Diluted shares outstanding", "canonical": "diluted_shares",
+            "cells": [{"period_end": "2025-03-31", "value": 10_874_000_000, "is_derived_quarter": False}],
+        },
+        {
+            "label": "Revenue", "canonical": "revenue",
+            "cells": [{"period_end": "2025-03-31", "value": 150_000_000, "is_derived_quarter": False}],
+        },
+    ]
+    at = AppTest.from_function(script, kwargs={"rows": rows, "periods": periods})
+    at.run()
+    assert at.exception == []
+    df = at.dataframe[0].value
+    assert df.iloc[0][_col("2025-03-31")] == "$2.35"
+    assert df.iloc[1][_col("2025-03-31")] == "10,874"
+    assert df.iloc[2][_col("2025-03-31")] == "150"  # revenue: unaffected, still $m

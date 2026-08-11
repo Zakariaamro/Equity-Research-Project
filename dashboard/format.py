@@ -58,6 +58,15 @@ def format_usd_per_share(value: float, precision: int = 2) -> str:
     return f"${_format_number(value, precision)}"
 
 
+def format_shares(value: float, precision: int = 0) -> str:
+    """SPEC-008-batch-1 render-batch follow-up item 1 (approved 2026-08-11):
+    a share count, in millions -- same division as format_usd (millions is
+    the right scale for these companies' share counts too) but kept as its
+    own function since it is not a dollar amount; nothing here implies '$'
+    the way format_usd's column header does."""
+    return _format_number(value / 1_000_000, precision)
+
+
 def format_days(value: float, precision: int = 0) -> str:
     return f"{_format_number(value, precision)} days"
 
