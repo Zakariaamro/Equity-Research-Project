@@ -938,11 +938,16 @@ def test_income_statement_table_q4_blank_when_no_discrete_metric_computed_yet(db
 
 
 def test_balance_sheet_table_never_marks_a_cell_derived(db_path):
-    # D12 is explicit: the balance sheet is unaffected. BALANCE_SHEET_LINES
-    # declares no fallback_canonical for any line other than PP&E's
-    # genuinely-different-concept split, which is never "derived" (it's a
-    # different FILED concept, not a subtraction) -- confirms nothing here
-    # accidentally inherited the income-statement/cash-flow treatment.
+    # D12: BALANCE_SHEET_LINES declares no fallback_canonical for any line
+    # other than PP&E's genuinely-different-concept split (never "derived"
+    # -- a different FILED concept, not a subtraction), so nothing here
+    # inherits the income-statement/cash-flow Q4=FY-9M treatment. Item 7
+    # (approved 2026-08-11) adds a SEPARATE derivation path -- total_
+    # liabilities = total_assets - equity, arithmetic across LINES within
+    # one period, not across time -- but this fixture supplies neither
+    # input, so total_liabilities stays blank too; see
+    # test_total_liabilities_derived_from_assets_minus_equity below for
+    # that path exercised directly.
     _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
     _insert_xbrl_fact(db_path, AMZN_CIK, "CashAndCashEquivalentsAtCarryingValue", "2025-03-31", 1_000_000)
     periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
@@ -1277,3 +1282,97 @@ def test_eps_and_shares_table_computes_growth_like_any_other_statement(db_path):
     rows = data.get_eps_and_shares_table(AMZN_CIK, periods, "AMZN", db_path)
     eps_row = next(r for r in rows if r["canonical"] == "eps_diluted")
     assert eps_row["cells"][1]["growth_pct"] == pytest.approx(0.5)
+
+
+# --- SPEC-008-batch-1 item 7 (approved 2026-08-11): balance sheet completeness ---
+
+
+def test_balance_sheet_lines_includes_the_new_item_7_lines():
+    canonicals = {line[0] for line in data.BALANCE_SHEET_LINES}
+    for expected in (
+        "goodwill", "intangibles", "retained_earnings", "debt_current",
+        "operating_lease_liabilities", "total_liabilities",
+    ):
+        assert expected in canonicals
+
+
+def test_balance_sheet_table_resolves_goodwill_intangibles_and_retained_earnings_filed_directly(db_path):
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_xbrl_fact(db_path, AMZN_CIK, "Goodwill", "2025-03-31", 23_000_000_000, period_start=None)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "IntangibleAssetsNetExcludingGoodwill", "2025-03-31", 900_000_000, period_start=None,
+    )
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "RetainedEarningsAccumulatedDeficit", "2025-03-31", 300_000_000_000, period_start=None,
+    )
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_balance_sheet_table(AMZN_CIK, periods, "AMZN", db_path)
+    values = {r["canonical"]: r["cells"][0]["value"] for r in rows}
+    assert values["goodwill"] == 23_000_000_000.0
+    assert values["intangibles"] == 900_000_000.0
+    assert values["retained_earnings"] == 300_000_000_000.0
+
+
+def test_total_liabilities_derived_from_assets_minus_equity_when_not_filed(db_path):
+    # AMZN never files a standalone `Liabilities` total (only NVDA and MU
+    # do) -- confirmed against the real companyfacts corpus before this
+    # was written. Checked identity: computed == filed Liabilities in
+    # 16/16 recent NVDA and MU quarters, zero mismatches.
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_xbrl_fact(db_path, AMZN_CIK, "Assets", "2025-03-31", 1_000_000_000, period_start=None)
+    _insert_xbrl_fact(db_path, AMZN_CIK, "StockholdersEquity", "2025-03-31", 400_000_000, period_start=None)
+    # No Liabilities fact filed at all for this period.
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_balance_sheet_table(AMZN_CIK, periods, "AMZN", db_path)
+    liab_row = next(r for r in rows if r["canonical"] == "total_liabilities")
+    cell = liab_row["cells"][0]
+    assert cell["value"] == 600_000_000.0
+    assert cell["is_derived_quarter"] is True
+    assert "blank_cause" not in cell
+
+
+def test_total_liabilities_prefers_the_filed_figure_over_the_derived_one(db_path):
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_xbrl_fact(db_path, AMZN_CIK, "Assets", "2025-03-31", 1_000_000_000, period_start=None)
+    _insert_xbrl_fact(db_path, AMZN_CIK, "StockholdersEquity", "2025-03-31", 400_000_000, period_start=None)
+    _insert_xbrl_fact(db_path, AMZN_CIK, "Liabilities", "2025-03-31", 590_000_000, period_start=None)
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_balance_sheet_table(AMZN_CIK, periods, "AMZN", db_path)
+    liab_row = next(r for r in rows if r["canonical"] == "total_liabilities")
+    cell = liab_row["cells"][0]
+    assert cell["value"] == 590_000_000.0  # the FILED figure, not 600M implied by assets-equity
+    assert cell.get("is_derived_quarter") is not True
+
+
+def test_total_liabilities_stays_blank_when_assets_or_equity_also_missing(db_path):
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_xbrl_fact(db_path, AMZN_CIK, "Assets", "2025-03-31", 1_000_000_000, period_start=None)
+    # No equity at all -- can't derive.
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_balance_sheet_table(AMZN_CIK, periods, "AMZN", db_path)
+    liab_row = next(r for r in rows if r["canonical"] == "total_liabilities")
+    cell = liab_row["cells"][0]
+    assert cell["value"] is None
+    assert cell["blank_cause"] == "gap"
+
+
+def test_total_liabilities_derived_cells_get_growth_and_yoy_like_any_other_cell(db_path):
+    _insert_filing(db_path, "acc-q1-2025", form_type="10-Q", period_end="2025-03-31", fiscal_year=2025, fiscal_period="Q1")
+    _insert_filing(db_path, "acc-q1-2026", form_type="10-Q", period_end="2026-03-31", fiscal_year=2026, fiscal_period="Q1")
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2026-01-01", "2026-03-31", 0.5)
+    _insert_xbrl_fact(db_path, AMZN_CIK, "Assets", "2025-03-31", 1_000_000_000, period_start=None)
+    _insert_xbrl_fact(db_path, AMZN_CIK, "StockholdersEquity", "2025-03-31", 400_000_000, period_start=None)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "Assets", "2026-03-31", 1_200_000_000, period_start=None, accession_no="acc-fact-assets-2",
+    )
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "StockholdersEquity", "2026-03-31", 400_000_000, period_start=None,
+        accession_no="acc-fact-equity-2",
+    )
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_balance_sheet_table(AMZN_CIK, periods, "AMZN", db_path)
+    liab_row = next(r for r in rows if r["canonical"] == "total_liabilities")
+    fy2026_cell = next(c for c in liab_row["cells"] if c["period_end"] == "2026-03-31")
+    # 2025: 600M derived. 2026: 800M derived. YoY = (800-600)/600 = 1/3.
+    assert fy2026_cell["yoy_growth_pct"] == pytest.approx(1 / 3)

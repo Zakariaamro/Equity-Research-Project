@@ -454,10 +454,16 @@ BALANCE_SHEET_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
         "ppe_and_lease_net", "Property, plant and equipment and finance-lease ROU assets, net",
     ),
     ("total_assets", "Total assets", None, None),
+    ("goodwill", "Goodwill", None, None),
+    ("intangibles", "Intangible assets, net", None, None),
     ("payables", "Accounts payable", None, None),
     ("current_liabilities", "Total current liabilities", None, None),
+    ("debt_current", "Short-term debt and current portion of long-term debt", None, None),
     ("debt_noncurrent", "Long-term debt", None, None),
+    ("operating_lease_liabilities", "Operating lease liabilities", None, None),
+    ("total_liabilities", "Total liabilities", None, None),
     ("equity", "Total stockholders' equity", None, None),
+    ("retained_earnings", "Retained earnings (accumulated deficit)", None, None),
 )
 CASH_FLOW_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
     # SPEC-008 C4 (approved 2026-08-08): `fallback_label == label` on every
@@ -1069,6 +1075,7 @@ def _statement_table(
             )
         )
     _derive_gross_profit_from_components(rows, fiscal_labels)
+    _derive_total_liabilities_from_components(rows, fiscal_labels)
     return rows
 
 
@@ -1133,6 +1140,46 @@ def _derive_gross_profit_from_components(rows: list[dict], fiscal_labels: dict[s
     if patched:
         _finalize_statement_row(
             gross_profit_row["label"], gross_profit_row["canonical"], gross_profit_row["cells"], fiscal_labels
+        )
+
+
+def _derive_total_liabilities_from_components(rows: list[dict], fiscal_labels: dict[str, tuple[int, str]]) -> None:
+    """SPEC-008-batch-1 item 7 (approved 2026-08-11): total_liabilities =
+    total_assets - equity, applied only where total_liabilities itself
+    (filed directly as `Liabilities` -- NVDA and MU do; AMZN never files a
+    standalone total) is still blank at a period where BOTH total_assets
+    and equity resolve. Same pattern and same STRICT LIMIT as item 4's
+    _derive_gross_profit_from_components: exact arithmetic on lines
+    already on this statement, checked against the real corpus first --
+    computed == filed Liabilities in all 16/16 recent NVDA and MU quarters,
+    zero mismatches (see the total_liabilities ConceptInput comment in
+    edgar/config.py). A no-op for tables without all three canonicals
+    (income statement, cash flow, EPS/shares)."""
+    assets_row = next((r for r in rows if r["canonical"] == "total_assets"), None)
+    equity_row = next((r for r in rows if r["canonical"] == "equity"), None)
+    liabilities_row = next((r for r in rows if r["canonical"] == "total_liabilities"), None)
+    if assets_row is None or equity_row is None or liabilities_row is None:
+        return
+
+    assets_by_end = {cell["period_end"]: cell["value"] for cell in assets_row["cells"]}
+    equity_by_end = {cell["period_end"]: cell["value"] for cell in equity_row["cells"]}
+    patched = False
+    for cell in liabilities_row["cells"]:
+        if cell["value"] is not None:
+            continue
+        assets_value = assets_by_end.get(cell["period_end"])
+        equity_value = equity_by_end.get(cell["period_end"])
+        if assets_value is None or equity_value is None:
+            continue
+        cell["value"] = assets_value - equity_value
+        cell["is_derived_quarter"] = True
+        cell.pop("blank_cause", None)
+        cell.pop("blank_reason", None)
+        patched = True
+
+    if patched:
+        _finalize_statement_row(
+            liabilities_row["label"], liabilities_row["canonical"], liabilities_row["cells"], fiscal_labels
         )
 
 

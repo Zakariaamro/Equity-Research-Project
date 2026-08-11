@@ -246,6 +246,22 @@ CONCEPT_REGISTRY: dict[str, ConceptInput] = {
         ("OperatingLeaseLiabilityNoncurrent",), "USD", instant=True
     ),
     "operating_lease_liability_current": ConceptInput(("OperatingLeaseLiabilityCurrent",), "USD", instant=True),
+    # SPEC-008-batch-1 item 7 (approved 2026-08-11). Total tag, filed directly by
+    # all three companies (not the current/noncurrent split above) -- checked
+    # against the real companyfacts corpus before adding, present with 26-55
+    # facts per company, no need to derive from the split as a fallback.
+    "operating_lease_liabilities": ConceptInput(("OperatingLeaseLiability",), "USD", instant=True),
+    "goodwill": ConceptInput(("Goodwill",), "USD", instant=True),
+    "intangibles": ConceptInput(("IntangibleAssetsNetExcludingGoodwill",), "USD", instant=True),
+    "retained_earnings": ConceptInput(("RetainedEarningsAccumulatedDeficit",), "USD", instant=True),
+    # Filed directly by NVDA and MU; AMZN never files a standalone Liabilities
+    # total (only LiabilitiesAndStockholdersEquity), so it is derived at read
+    # time as total_assets - equity in dashboard/data.py's
+    # _derive_total_liabilities_from_components -- checked against the real
+    # corpus first: computed == filed Liabilities in all 16/16 recent NVDA and
+    # MU quarters (zero mismatches, no minority-interest gap), confirming the
+    # identity is safe to use for AMZN's missing tag too.
+    "total_liabilities": ConceptInput(("Liabilities",), "USD", instant=True),
     # Computed: borrowings (combined tag, else debt_noncurrent + debt_current) PLUS
     # finance lease liabilities (SPEC-004 R1b) -- resolved by metrics.py's
     # _resolve_total_debt, never a plain alias lookup.

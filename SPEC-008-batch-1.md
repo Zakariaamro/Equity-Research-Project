@@ -309,6 +309,67 @@ not the number between them.
 Same reporting requirement as item 5: per-company coverage before building, and drop any
 line that resolves for nobody.
 
+### Resolution (implemented 2026-08-11)
+
+Six new lines, all instant balance-sheet facts (no discrete-quarter derivation applies —
+that mechanism only exists for flow concepts on a fiscal calendar, and every one of these
+is a point-in-time snapshot):
+
+- **goodwill** → `Goodwill`
+- **intangibles** → `IntangibleAssetsNetExcludingGoodwill`
+- **retained_earnings** → `RetainedEarningsAccumulatedDeficit`
+- **debt_current** ("Short-term debt and current portion of long-term debt") — already
+  registered in `CONCEPT_REGISTRY` from an earlier SPEC-004 pass (`LongTermDebtCurrent`,
+  `DebtCurrent`), never wired into `BALANCE_SHEET_LINES` until now.
+- **operating_lease_liabilities** → `OperatingLeaseLiability`, the combined total tag filed
+  directly by all three companies — not a sum of the current/noncurrent split (those two were
+  also already registered, unused; kept as-is for a future adjusted-leverage metric per their
+  existing comment).
+- **total_liabilities** → filed directly as `Liabilities` for NVDA and MU. AMZN never files a
+  standalone liabilities total (only `LiabilitiesAndStockholdersEquity`), so this is the one
+  line in this item that needed a derivation, not just a new concept: `total_liabilities =
+  total_assets - equity`, exact arithmetic on two lines already on the statement, same pattern
+  and same strict limit as item 4's gross-profit derivation
+  (`_derive_total_liabilities_from_components`, modeled directly on
+  `_derive_gross_profit_from_components`). Checked against the real corpus before writing any
+  derivation code: computed `total_assets - equity` equals the filed `Liabilities` figure in
+  16/16 recent NVDA and MU quarters, zero mismatches, no minority-interest gap (`MinorityInterest`
+  is 0 in every one of those periods) — confirming the identity is safe to lean on for AMZN's
+  permanently-missing tag. Filed value still wins whenever available (NVDA and MU never derive).
+
+**Per-company coverage** (quarterly basis, full history):
+
+| line | AMZN | NVDA | MU |
+|---|---|---|---|
+| goodwill | 25/25 | 24/24 | 37/37 |
+| intangibles | 6/25 | 24/24 | 37/37 |
+| retained_earnings | 25/25 | 24/24 | 37/37 |
+| debt_current | 25/25 | 20/24 | 37/37 |
+| operating_lease_liabilities | 25/25 | 24/24 | 25/37 |
+| total_liabilities | 25/25 (all derived) | 24/24 | 37/37 |
+
+Nothing resolves for nobody, so no line was dropped. Two real gaps worth naming rather than
+chasing as bugs (same D15 principle as Micron's zero interest expense — checked against the
+filings, not assumed to be a resolution bug):
+
+- **AMZN's intangibles is annual-only.** `IntangibleAssetsNetExcludingGoodwill` only appears
+  in AMZN's 10-K, never its 10-Qs (confirmed against the real companyfacts corpus) — 6/25
+  quarterly cells are the 6 fiscal year-ends in the window, nothing else. goodwill and
+  retained_earnings, filed by AMZN on the same instant tags, ARE quarterly and resolve 25/25 —
+  this is specific to how AMZN discloses intangibles, not a systemic AMZN gap.
+- **MU's operating_lease_liabilities goes blank in its two most recent quarters** (2026-02-26,
+  2026-05-28) — `OperatingLeaseLiability` isn't filed for either period, and the split
+  `operating_lease_liability_current` isn't either (only `_noncurrent` is), so there's no
+  component sum that would fill it. MU's pre-existing `debt_noncurrent` line has carried the
+  same gap for the same two quarters since before this item touched anything — both point to
+  the same real recent change in what MU tags, not something this item introduced or could fix
+  by adding a fallback.
+
+Total liabilities' own display marks every AMZN cell `is_derived_quarter` (reusing item 4's
+visual language — "not filed, this project computed it" is the same claim whether the arithmetic
+runs across lines within a period, as here and in item 4, or across time via Q4 = FY - 9M) and
+gets the same growth/YoY treatment as any other cell, verified directly.
+
 ---
 
 ## When you're done
