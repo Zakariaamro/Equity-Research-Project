@@ -1061,8 +1061,9 @@ _DISCRETE_QUARTER_CANONICALS: tuple[str, ...] = (
     # Cash flow completeness (SPEC-008-batch-1 item 5, approved 2026-08-09):
     # the three-section statement's new lines get the identical treatment.
     "receivables_change", "inventory_change", "payables_change", "deferred_tax", "other_noncash",
-    "acquisitions", "investment_purchases", "investment_maturities",
+    "acquisitions", "investment_purchases", "investment_maturities", "net_cash_investing",
     "buybacks", "dividends_paid", "debt_issued", "debt_repaid", "finance_lease_principal_paid",
+    "net_cash_financing",
     "fx_effect_on_cash", "net_change_in_cash",
 )
 _PRIOR_FISCAL_PERIOD: dict[str, str] = {"Q2": "Q1", "Q3": "Q2", "FY": "Q3"}
@@ -1362,10 +1363,12 @@ COMPUTE_FUNCS: dict[str, Callable] = {
     "acquisitions_discrete": _refused_computed_separately,
     "investment_purchases_discrete": _refused_computed_separately,
     "investment_maturities_discrete": _refused_computed_separately,
+    "net_cash_investing_discrete": _refused_computed_separately,
     "buybacks_discrete": _refused_computed_separately,
     "dividends_paid_discrete": _refused_computed_separately,
     "debt_issued_discrete": _refused_computed_separately,
     "debt_repaid_discrete": _refused_computed_separately,
+    "net_cash_financing_discrete": _refused_computed_separately,
     "finance_lease_principal_paid_discrete": _refused_computed_separately,
     "fx_effect_on_cash_discrete": _refused_computed_separately,
     "net_change_in_cash_discrete": _refused_computed_separately,

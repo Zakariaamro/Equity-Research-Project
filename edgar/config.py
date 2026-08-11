@@ -352,6 +352,20 @@ CONCEPT_REGISTRY: dict[str, ConceptInput] = {
         ),
         "USD",
     ),
+    # SPEC-008-batch-1 render-batch follow-up item 3 (approved 2026-08-11):
+    # the investing section's own closing figure, filed directly by all
+    # three companies (329/153/107 facts respectively). A "sum the section's
+    # own lines" fallback was checked against the real corpus and REJECTED,
+    # not implemented -- capex + acquisitions + investment_purchases -
+    # investment_maturities reconstructs the filed total within 5% for AMZN
+    # in only 12/13 overlapping periods and for MU in 0/7 (off by
+    # 8-80%, MU carries other investing activity this project doesn't
+    # track), so summing these four lines would not honestly represent
+    # the section for at least one company. Resolves via the SAME
+    # filed/`_discrete`-subtraction mechanism as every other line here
+    # instead (mathematically exact, since it subtracts the SAME concept
+    # across cumulative periods rather than summing different ones).
+    "net_cash_investing": ConceptInput(("NetCashProvidedByUsedInInvestingActivities",), "USD"),
     # Financing.
     "buybacks": ConceptInput(("PaymentsForRepurchaseOfCommonStock",), "USD"),
     "dividends_paid": ConceptInput(("PaymentsOfDividends", "PaymentsOfDividendsCommonStock"), "USD"),
@@ -367,6 +381,12 @@ CONCEPT_REGISTRY: dict[str, ConceptInput] = {
     "finance_lease_principal_paid": ConceptInput(
         ("FinanceLeasePrincipalPayments", "RepaymentsOfFinanceLeaseObligations"), "USD"
     ),
+    # The financing section's own closing figure -- same rationale as
+    # net_cash_investing above (filed directly, no components-sum
+    # fallback; not separately re-checked, same conclusion applies since
+    # this project tracks an even narrower slice of financing activity --
+    # e.g. no line for stock-option proceeds or other borrowings).
+    "net_cash_financing": ConceptInput(("NetCashProvidedByUsedInFinancingActivities",), "USD"),
     # Reconciliation. "Beginning and ending cash" deliberately not added
     # here -- it is the SAME instant fact the balance sheet's own `cash`
     # line already carries (a period's ending cash IS the next period's
@@ -1006,6 +1026,16 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         description='Cash received from maturities and sales of investments for this quarter alone -- filed '
         'directly or derived by subtraction, same discipline as cfo_discrete.',
     ),
+    "net_cash_investing_discrete": MetricDef(
+        "net_cash_investing_discrete", ("net_cash_investing",), "quarterly", None, False, "capital_cash",
+        extreme_informative=False, computed_separately=True,
+        display_name='Net cash used in investing (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=None, group='Capital & Cash',
+        description='Net cash used in investing activities for this quarter alone -- filed directly or derived '
+        'by subtraction, same discipline as cfo_discrete. NOT summed from this project\'s own capex/'
+        'acquisitions/investment_purchases/investment_maturities lines -- checked against the real corpus '
+        'and rejected, see the net_cash_investing ConceptInput comment.',
+    ),
     "buybacks_discrete": MetricDef(
         "buybacks_discrete", ("buybacks",), "quarterly", (0.0, float("inf")), False, "capital_cash",
         extreme_informative=False, computed_separately=True,
@@ -1037,6 +1067,16 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         higher_is_better=None, group='Capital & Cash',
         description='Cash paid to repay long-term debt for this quarter alone -- filed directly or derived by '
         'subtraction, same discipline as cfo_discrete.',
+    ),
+    "net_cash_financing_discrete": MetricDef(
+        "net_cash_financing_discrete", ("net_cash_financing",), "quarterly", None, False, "capital_cash",
+        extreme_informative=False, computed_separately=True,
+        display_name='Net cash from financing (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=None, group='Capital & Cash',
+        description='Net cash provided by (used in) financing activities for this quarter alone -- filed '
+        'directly or derived by subtraction, same discipline as cfo_discrete. NOT summed from this project\'s '
+        'own buybacks/dividends_paid/debt_issued/debt_repaid/finance_lease_principal_paid lines -- same '
+        'rejected-fallback rationale as net_cash_investing_discrete.',
     ),
     "finance_lease_principal_paid_discrete": MetricDef(
         "finance_lease_principal_paid_discrete", ("finance_lease_principal_paid",), "quarterly",

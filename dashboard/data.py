@@ -497,6 +497,23 @@ CASH_FLOW_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
         "investment_maturities", "Maturities/sales of investments",
         "investment_maturities_discrete", "Maturities/sales of investments",
     ),
+    # SPEC-008-batch-1 render-batch follow-up item 3 (approved 2026-08-11):
+    # the investing section's own closing figure -- filed directly, never
+    # summed from the four lines above it (checked against the real corpus
+    # and rejected, see net_cash_investing's ConceptInput comment in
+    # edgar/config.py: our four tracked investing lines reconstruct the
+    # filed total within 5% for AMZN in only 12/13 periods and for MU in
+    # 0/7, so summing them would misrepresent the section for at least one
+    # company).
+    ("net_cash_investing", "Net cash used in investing", "net_cash_investing_discrete", "Net cash used in investing"),
+    # Render-batch follow-up item 2 (approved 2026-08-11): restored after a
+    # regression -- item 5's rewrite moved this to the very end of the
+    # tuple (after the reconciliation section), which pushed the single
+    # most-read line on the page out of view. Placed here, immediately
+    # after the investing section's own closing figure, because free cash
+    # flow spans both operating (cfo) and investing (capex) -- it belongs
+    # to neither section alone.
+    ("free_cash_flow", "Free cash flow", "free_cash_flow_discrete", "Free cash flow"),
     ("buybacks", "Share repurchases", "buybacks_discrete", "Share repurchases"),
     ("dividends_paid", "Dividends paid", "dividends_paid_discrete", "Dividends paid"),
     ("debt_issued", "Debt issued", "debt_issued_discrete", "Debt issued"),
@@ -505,9 +522,12 @@ CASH_FLOW_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
         "finance_lease_principal_paid", "Finance lease principal paid",
         "finance_lease_principal_paid_discrete", "Finance lease principal paid",
     ),
+    # The financing section's own closing figure -- same rationale as
+    # net_cash_investing above, not separately re-checked (this project
+    # tracks an even narrower slice of financing activity).
+    ("net_cash_financing", "Net cash from financing", "net_cash_financing_discrete", "Net cash from financing"),
     ("fx_effect_on_cash", "Effect of exchange rates on cash", "fx_effect_on_cash_discrete", "Effect of exchange rates on cash"),
     ("net_change_in_cash", "Net change in cash", "net_change_in_cash_discrete", "Net change in cash"),
-    ("free_cash_flow", "Free cash flow", "free_cash_flow_discrete", "Free cash flow"),
 )
 
 

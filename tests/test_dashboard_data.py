@@ -1220,6 +1220,56 @@ def test_free_cash_flow_discrete_fallback_resolves_when_free_cash_flow_itself_is
     assert fcf_row["cells"][1]["is_derived_quarter"] is True
 
 
+# --- SPEC-008-batch-1 render-batch follow-up (approved 2026-08-11) ---
+# Found live, browser-checked against batch-1's shipped data layer:
+# (1) EPS/shares built but never wired into a display list -- see
+#     dashboard/pages/financials.py and dashboard/components.py instead,
+#     this module's own rows were already correct.
+# (2) free_cash_flow moved to the very end of CASH_FLOW_LINES by item 5's
+#     rewrite -- a regression on the most-read line on the page.
+# (3) no closing figure for the investing or financing sections.
+
+
+def test_cash_flow_lines_free_cash_flow_sits_right_after_the_investing_section():
+    canonicals = [line[0] for line in data.CASH_FLOW_LINES]
+    investing_last = canonicals.index("investment_maturities")
+    net_investing_idx = canonicals.index("net_cash_investing")
+    fcf_idx = canonicals.index("free_cash_flow")
+    financing_first = canonicals.index("buybacks")
+    assert investing_last < net_investing_idx < fcf_idx < financing_first
+
+
+def test_cash_flow_lines_includes_the_two_new_section_subtotals():
+    canonicals = {line[0] for line in data.CASH_FLOW_LINES}
+    assert "net_cash_investing" in canonicals
+    assert "net_cash_financing" in canonicals
+
+
+def test_cash_flow_table_resolves_net_cash_investing_filed_directly(db_path):
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "NetCashProvidedByUsedInInvestingActivities", "2025-03-31",
+        -12_000_000_000, period_start="2025-01-01",
+    )
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
+    row = next(r for r in rows if r["canonical"] == "net_cash_investing")
+    assert row["label"] == "Net cash used in investing"
+    assert row["cells"][0]["value"] == -12_000_000_000.0
+    assert row["cells"][0].get("is_derived_quarter") is not True
+
+
+def test_cash_flow_table_resolves_net_cash_financing_via_discrete_fallback(db_path):
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "net_cash_financing_discrete", "2025-01-01", "2025-03-31", -3_000_000_000)
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
+    row = next(r for r in rows if r["canonical"] == "net_cash_financing")
+    assert row["label"] == "Net cash from financing"
+    assert row["cells"][0]["value"] == -3_000_000_000.0
+    assert row["cells"][0]["is_derived_quarter"] is True
+
+
 # --- SPEC-008-batch-1 item 6 (approved 2026-08-09): EPS and share counts ---
 
 
