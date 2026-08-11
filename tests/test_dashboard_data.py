@@ -1213,3 +1213,67 @@ def test_free_cash_flow_discrete_fallback_resolves_when_free_cash_flow_itself_is
     fcf_row = next(r for r in rows if r["canonical"] == "free_cash_flow")
     assert fcf_row["cells"][1]["value"] == 8_000_000
     assert fcf_row["cells"][1]["is_derived_quarter"] is True
+
+
+# --- SPEC-008-batch-1 item 6 (approved 2026-08-09): EPS and share counts ---
+
+
+def test_eps_and_shares_table_resolves_all_four_lines(db_path):
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_xbrl_fact(db_path, AMZN_CIK, "EarningsPerShareBasic", "2025-03-31", 1.61, period_start="2025-01-01")
+    _insert_xbrl_fact(db_path, AMZN_CIK, "EarningsPerShareDiluted", "2025-03-31", 1.59, period_start="2025-01-01")
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "WeightedAverageNumberOfSharesOutstandingBasic", "2025-03-31",
+        10_600_000_000, period_start="2025-01-01",
+    )
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "WeightedAverageNumberOfDilutedSharesOutstanding", "2025-03-31",
+        10_700_000_000, period_start="2025-01-01",
+    )
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_eps_and_shares_table(AMZN_CIK, periods, "AMZN", db_path)
+    values = {r["canonical"]: r["cells"][0]["value"] for r in rows}
+    assert values == {
+        "eps_basic": 1.61, "eps_diluted": 1.59,
+        "basic_shares": 10_600_000_000.0, "diluted_shares": 10_700_000_000.0,
+    }
+
+
+def test_eps_and_shares_table_never_derives_q4_no_fallback_at_all(db_path):
+    # The core finding this item is built on: EPS/share counts are
+    # WEIGHTED AVERAGES, not summable flows, so the Q4 = FY - 9M mechanism
+    # every other statement uses is mathematically invalid here. Confirms
+    # a missing Q4 stays a genuine gap, never a subtraction result -- no
+    # cell in this table can ever carry is_derived_quarter.
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-12-31", 0.5)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "EarningsPerShareDiluted", "2025-12-31", 7.17, period_start="2025-01-01",
+    )
+    periods = data.get_statement_periods(AMZN_CIK, "annual", db_path)
+    rows = data.get_eps_and_shares_table(AMZN_CIK, periods, "AMZN", db_path)
+    eps_row = next(r for r in rows if r["canonical"] == "eps_diluted")
+    fy_cell = next(c for c in eps_row["cells"] if c["period_end"] == "2025-12-31")
+    # The FY cumulative figure IS filed directly (7.17) -- shown as-is
+    # (this is the real filed annual EPS, correct on the annual basis);
+    # what's asserted here is that no cell anywhere carries a derived
+    # marker, since this line never attempts subtraction at all.
+    assert fy_cell["value"] == 7.17
+    for row in rows:
+        for cell in row["cells"]:
+            assert "is_derived_quarter" not in cell
+
+
+def test_eps_and_shares_table_computes_growth_like_any_other_statement(db_path):
+    _insert_filing(db_path, "acc-q1-2025", form_type="10-Q", period_end="2025-03-31", fiscal_year=2025, fiscal_period="Q1")
+    _insert_filing(db_path, "acc-q2-2025", form_type="10-Q", period_end="2025-06-30", fiscal_year=2025, fiscal_period="Q2")
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)
+    _insert_xbrl_fact(db_path, AMZN_CIK, "EarningsPerShareDiluted", "2025-03-31", 1.00, period_start="2025-01-01")
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "EarningsPerShareDiluted", "2025-06-30", 1.50, period_start="2025-04-01",
+        accession_no="acc-fact-2",
+    )
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_eps_and_shares_table(AMZN_CIK, periods, "AMZN", db_path)
+    eps_row = next(r for r in rows if r["canonical"] == "eps_diluted")
+    assert eps_row["cells"][1]["growth_pct"] == pytest.approx(0.5)

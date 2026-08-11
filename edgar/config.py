@@ -197,6 +197,9 @@ CONCEPT_REGISTRY: dict[str, ConceptInput] = {
     "net_income_including_nci": ConceptInput(("ProfitLoss",), "USD"),
     "eps_diluted": ConceptInput(("EarningsPerShareDiluted",), "USD/shares"),
     "diluted_shares": ConceptInput(("WeightedAverageNumberOfDilutedSharesOutstanding",), "shares"),
+    # SPEC-008-batch-1 item 6 (approved 2026-08-09).
+    "eps_basic": ConceptInput(("EarningsPerShareBasic",), "USD/shares"),
+    "basic_shares": ConceptInput(("WeightedAverageNumberOfSharesOutstandingBasic",), "shares"),
     "total_assets": ConceptInput(("Assets",), "USD", instant=True),
     "current_assets": ConceptInput(("AssetsCurrent",), "USD", instant=True),
     "current_liabilities": ConceptInput(("LiabilitiesCurrent",), "USD", instant=True),

@@ -408,6 +408,41 @@ INCOME_STATEMENT_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
     ("tax_expense", "Income tax expense", "tax_expense_discrete", "Income tax expense"),
     ("net_income", "Net income", "net_income_discrete", "Net income"),
 )
+
+# SPEC-008-batch-1 item 6 (approved 2026-08-09): EPS and share counts.
+# Deliberately NOT added to INCOME_STATEMENT_LINES and deliberately given
+# NO fallback_canonical (unlike every other line in this file) --
+# EarningsPerShareDiluted/Basic and the two WeightedAverageNumberOf...
+# concepts are WEIGHTED AVERAGES over their period, not summable flows.
+# The Q4 = FY - 9M discrete-quarter mechanism this project uses everywhere
+# else is exact arithmetic for a SUM (revenue, cfo, ...); for an AVERAGE it
+# is simply wrong -- confirmed against real data before this was written:
+# AMZN's 6-month-YTD diluted share count (10,889M) sits BETWEEN its two
+# discrete quarters' own counts (10,874M, 10,903M), the way an average of
+# two numbers always does, not the way a running SUM does. Subtracting two
+# cumulative averages does not recover the discrete quarter's own average;
+# it recovers a small, meaningless difference between two similar numbers.
+# Q4 is therefore a genuine, unfillable gap here where a company doesn't
+# tag it directly (confirmed: AMZN tagged discrete Q4 EPS directly through
+# fiscal 2020, then stopped -- a real disclosure change, not a bug) --
+# left blank, never derived, same "fail closed" discipline as everywhere
+# else in this project, just with no fallback to fail closed FROM.
+#
+# Render-layer note (out of scope for this batch, SPEC-008-batch-1's own
+# scope line: "No render-layer or styling work"): EPS is dollars-per-share
+# at 2 decimal places and share counts are already in whole shares (not
+# thousands or millions) -- neither should be formatted through
+# `fmt.format_usd`'s $-millions convention the way INCOME_STATEMENT_LINES'
+# rows are. This function returns raw, correctly-resolved values; the
+# render batch owns choosing how to display them.
+EPS_AND_SHARES_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
+    ("eps_basic", "Basic EPS", None, None),
+    ("eps_diluted", "Diluted EPS", None, None),
+    ("basic_shares", "Basic shares outstanding", None, None),
+    ("diluted_shares", "Diluted shares outstanding", None, None),
+)
+
+
 BALANCE_SHEET_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
     ("cash", "Cash and cash equivalents", None, None),
     ("short_term_investments", "Short-term investments", None, None),
@@ -1105,6 +1140,20 @@ def get_income_statement_table(
     cik: str, periods: list[dict], ticker: str, db_path: Path = DEFAULT_DB_PATH
 ) -> list[dict]:
     return _statement_table(cik, INCOME_STATEMENT_LINES, periods, ticker, db_path=db_path)
+
+
+def get_eps_and_shares_table(
+    cik: str, periods: list[dict], ticker: str, db_path: Path = DEFAULT_DB_PATH
+) -> list[dict]:
+    """SPEC-008-batch-1 item 6: EPS and share counts, resolved through the
+    SAME `_statement_table` machinery as every other statement (growth%,
+    YoY, blank-cause classification all apply identically -- EPS growth is
+    a completely normal thing to want) but with NO fallback_canonical on
+    any of the four lines, so the discrete-quarter merge path never
+    triggers -- see `EPS_AND_SHARES_LINES`'s own docstring for why
+    subtraction is invalid for a weighted average. A blank Q4 here is a
+    genuine, correctly-unfilled gap, not a bug."""
+    return _statement_table(cik, EPS_AND_SHARES_LINES, periods, ticker, db_path=db_path)
 
 
 def get_balance_sheet_table(

@@ -265,6 +265,36 @@ Without share count there is no way to see dilution, no way to see the effect of
 and no per-share figure of any kind. For equity research this is the most conspicuous
 remaining gap.
 
+### Resolution (implemented 2026-08-09)
+
+**Not added to `INCOME_STATEMENT_LINES`, and deliberately given no discrete-quarter fallback
+at all** — a new `EPS_AND_SHARES_LINES`/`get_eps_and_shares_table()` instead, reusing the same
+`_statement_table` machinery (growth%, YoY, blank-cause all apply identically) but wired with
+no `fallback_canonical` on any of the four lines.
+
+**Why no discrete-quarter derivation, found live before writing any code**: `EarningsPerShare*`
+and `WeightedAverageNumberOf*SharesOutstanding*` are WEIGHTED AVERAGES over their period, not
+summable flows. The `Q4 = FY − 9M` mechanism this project uses everywhere else is exact
+arithmetic for a SUM; for an AVERAGE it is simply wrong. Confirmed against real data before
+concluding this: Amazon's 6-month-YTD diluted share count (10,889M) sits BETWEEN its two
+discrete quarters' own counts (10,874M, 10,903M) — the way an average of two numbers always
+does. Subtracting two cumulative averages does not recover the discrete quarter's own average;
+it recovers a small, meaningless difference. A missing Q4 here is a genuine, unfillable gap —
+confirmed real, not a tagging quirk: Amazon tagged discrete Q4 EPS directly through fiscal
+2020, then stopped disclosing it that way — a real change in what the company discloses, the
+same shape of finding as D15 (Micron's zero interest expense), not a bug to chase.
+
+Real coverage (quarterly basis): AMZN 20/25, NVDA 18/24, MU 32/37 (EPS) and 28/37 (shares) —
+roughly one gap per fiscal year, matching the Q4 pattern exactly as expected.
+
+**Units and formatting are explicitly NOT implemented in this batch.** The data layer returns
+raw, correctly-resolved values (EPS in dollars, shares as a whole count) — dividing either by
+a million or otherwise routing them through `fmt.format_usd`'s $-millions convention would
+corrupt them (a $2.35 EPS would show as "0"). Per this batch's own scope line ("If an item here
+turns out to need a render change to be useful, implement the data half and note it"): this is
+that note. The render batch owns choosing how basic/diluted EPS (2 decimals, $) and share
+counts (millions, no `$`) actually display.
+
 ---
 
 ## Item 7 — Balance sheet completeness
