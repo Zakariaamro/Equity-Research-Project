@@ -299,6 +299,48 @@ but flagged with the same seriousness the spec asks for FCFF, since the shape of
 problem is identical: a metric near-unavailable for two of three companies, worth knowing
 before assuming it's useful across the board.
 
+### FCFE follow-up (2026-08-13): root cause per company, and the display decision
+
+**NVDA never files `RepaymentsOfLongTermDebt` at all** — zero facts, any duration, anywhere
+in its filing history. It does file `RepaymentsOfDebt`, but only as 181/272/363/370-day
+cumulative figures, never a 90-day quarterly one — no Q1 anchor exists to start a
+subtraction chain even if that concept were registered. Genuinely unresolvable with this
+company's own disclosure, on any basis.
+
+**MU's cause is different, and was worth checking separately** (it looked, at first, like
+it might be an alias gap rather than a disclosure gap — MU's own real data settles it):
+`RepaymentsOfLongTermDebt` stops appearing in MU's filings after 2013; nothing is tagged
+under it in the analyzed window (2019+) at any duration. MU does tag `RepaymentsOfDebt`
+recently (2019, 2025-2026), including a genuine 90-day figure — the same concept
+`debt_repaid` already rejects globally. Re-ran the alias-purity test the batch 1 item 5
+rejection was based on, this time checking for MU-specific overlap first: MU never tags
+`RepaymentsOfLongTermDebt` and `RepaymentsOfDebt` in the same period (zero overlapping
+windows across MU's entire history) — there is no MU-specific data to check agreement
+against. Fell back to the cross-company evidence instead, since `CONCEPT_REGISTRY` aliases
+are global, not per-company: AMZN tags both concepts with real overlap, and disagrees by
+up to 2,436% in-quarter (0% only on the two full fiscal years checked, where no other debt
+activity apparently existed) — reproduced directly, not just cited from batch 1. Confirms
+`RepaymentsOfDebt` is genuinely the broader concept the user described (total repayments,
+long-term a subset), not a synonym, for at least one company this registry serves — adding
+it would reintroduce the exact problem batch 1 fixed, for every company, to chase one
+company's coverage. Not added.
+
+One more candidate turned up while chasing this, not asked for: MU also files
+`RepaymentsOfLongTermDebtAndCapitalSecurities`, with a clean 90-day quarterly series since
+2019 (13 real quarters) — structurally the closest-sounding match. Checked whether it could
+be verified the same way: it has zero overlapping periods with `RepaymentsOfLongTermDebt`
+for MU, and zero overlap with it for AMZN either (AMZN does file the concept, just never
+in the same period as `RepaymentsOfLongTermDebt`) — no company in this three-company corpus
+ever tags both in an overlapping window, so there is no real data anywhere here to check
+its agreement against. Per the same discipline, left unadded and unverified rather than
+assumed safe because its name sounds closer.
+
+**Decision (yours): keep FCFE as a normal row, permanently blank for NVDA/MU on both bases.**
+Blank-with-a-reason is this project's convention everywhere else; a sparse row still says
+something true (AMZN's own figures stay fully usable), and removing it would be the first
+time a real disclosure gap got hidden rather than shown. No code change from this decision
+— FCFE was already displayed this way.
+
 **Shortlist, with real coverage — reported, not added:**
 
 | Candidate | Status | Coverage (quarterly, AMZN / NVDA / MU) |
