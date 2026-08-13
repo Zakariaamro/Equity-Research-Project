@@ -211,6 +211,72 @@ Sources for the rate decision:
 - Damodaran, *From Earnings to Cash Flows* (ch. 10) — https://pages.stern.nyu.edu/~adamodar/pdfiles/valn2ed/Print.pdf
 - Bratten, Gleason, Larocque, Mills, *Forecasting Taxes: New Evidence from Analysts* — https://www.kellogg.northwestern.edu/~/media/Files/Departments/Accounting/Larocque%20Paper.ashx
 
+### Resolution (implemented 2026-08-13)
+
+Tab renamed **Key metrics**, widened to 8 rows: the existing 4 per-share lines, then
+`free_cash_flow`, `fcff`, `fcfe`, and a new `fcff_tax_rate` row (its label states which
+basis produced it — "— this year's own rate" or "— trailing twelve months", inferred from
+the periods the caller already filtered to, not a new toggle).
+
+**FCFE and free_cash_flow are exact arithmetic**, same status as gross profit — computed
+via `_compute_fcfe` (`edgar/metrics.py`), with a `fcfe_discrete` companion composed from
+already-resolved discrete quarters (`cfo_discrete - capex_discrete + (debt_issued_discrete
+- debt_repaid_discrete)`), same pattern as `free_cash_flow_discrete`.
+
+**FCFF rests on a constructed rate** (`fcff_tax_rate`/`fcff_tax_rate_discrete`), split by
+basis exactly as specified: annual uses that fiscal year's own `tax_expense / pretax_income`;
+quarterly uses a trailing-twelve-month sum of the four discrete quarters already resolved
+by the discrete-quarter mechanism. Fails closed (never a statutory or clamped rate) when
+pre-tax income is negative, or positive but near zero relative to this company's own
+typical annual pre-tax income (median absolute value, reusing item 2's own 10% fraction —
+reimplemented in `edgar/metrics.py`, not imported, since `edgar/` never imports from
+`dashboard/`). Confirmed live against the real corpus: AMZN FY2022 (pretax −5,936M) and MU
+FY2023 (pretax −5,658M) both fail closed on the negative check exactly as the spec's own
+examples describe; a THIRD case not in the spec's text was also caught live — a real AMZN
+quarter with TTM pre-tax income of $3.4B against a ~$38B typical, correctly failed closed
+as near-zero rather than producing an inflated rate.
+
+Every populated FCFF cell carries a new `rate_assumption` marker, independent of
+`is_derived_quarter` — an annual, directly-filed-duration FCFF figure still rests on that
+year's own constructed rate, a different fact from "this project subtracted two filed
+cumulatives," so a cell can carry either marker, both, or neither. The render batch owns
+the actual visual treatment (marker glyph, footnote text); the data layer guarantees the
+distinction is present to render.
+
+**FCFF's real coverage** (quarterly / annual, via the actual display path — filed or
+discrete-merged):
+
+| | AMZN | NVDA | MU |
+|---|---|---|---|
+| quarterly | 17/25 | 14/24 | 27/37 |
+| annual | 5/6 | 5/6 | 8/9 |
+
+Available roughly two-thirds to three-quarters of the time, not "unavailable most of the
+time" — it earns its row. The gaps are the fail-closed cases above (negative/near-zero
+pre-tax income) plus ordinary discrete-quarter gaps shared with every other line here.
+
+**FCFE's real coverage — a finding, not asked for.** Despite being exact arithmetic, FCFE
+resolves for AMZN (24/25 quarterly, 6/6 annual) but is **0/24 and 0/37 for NVDA and MU**,
+both bases. Root cause: `debt_repaid` is barely tagged discretely by either company
+(`debt_repaid_discrete`: NVDA 0/16, MU 1/28 — confirmed directly against `data/app.db`
+before writing this), so FCFE's four-input intersection (cfo, capex, debt_issued,
+debt_repaid all resolving at the same exact window) almost never succeeds for them. Kept
+in per the spec's explicit instruction — FCFE wasn't on the "propose, don't assume" list —
+but flagged with the same seriousness the spec asks for FCFF, since the shape of the
+problem is identical: a metric near-unavailable for two of three companies, worth knowing
+before assuming it's useful across the board.
+
+**Shortlist, with real coverage — reported, not added:**
+
+| Candidate | Status | Coverage (quarterly, AMZN / NVDA / MU) |
+|---|---|---|
+| `net_debt` | **Already built and displayed nowhere on this tab** (Metrics page, Solvency group) | 25/25, 22/24, 19/37 |
+| `ebitda` | **Already built**, no `_discrete` companion yet (unlike free_cash_flow) | 25/25, 12/24, 22/37 |
+| `effective_tax_rate` | **Already built**, but the naive same-period version — no fail-closed guard, no TTM smoothing. Resolves almost everywhere (25/25, 24/24, 37/37) but a resolved quarterly value near a discrete-item quarter may be exactly the contaminated number this spec's own analysis warns about. A DIFFERENT, correct version now exists (`fcff_tax_rate`) built specifically for FCFF this item; this finding is about the pre-existing general-purpose metric, unchanged by this item | 25/25, 24/24, 37/37 (coverage, not correctness) |
+| `working_capital` | **Does not exist yet** — no MetricDef. Its two would-be inputs (`current_assets`, `current_liabilities`) are already ~100% covered (both already displayed on the balance sheet), so building it would be cheap and near-total coverage is expected, not a real risk | not built; inputs 138/138, 136/136, 132/132 (raw fact counts, not period-filtered) |
+
+Your call on which (if any) of these join the tab.
+
 ---
 
 ## What is explicitly not in this batch

@@ -951,6 +951,84 @@ METRIC_REGISTRY: dict[str, MetricDef] = {
         higher_is_better=True, group='Capital & Cash',
         description='cfo_discrete minus capex_discrete -- free cash flow for this quarter alone.',
     ),
+    # --- SPEC-008-batch-2 item 2 (approved 2026-08-13): key metrics tab ---
+    # FCFE is exact arithmetic on filed lines, same status as free_cash_flow
+    # itself (and batch 1 item 4's gross profit) -- no assumption involved.
+    "fcfe": MetricDef(
+        "fcfe", ("cfo", "capex", "debt_issued", "debt_repaid"), "both", None, False, "capital_cash",
+        extreme_informative=False,
+
+        display_name='Free cash flow to equity', unit='usd', precision=0,
+        higher_is_better=True, group='Capital & Cash',
+        description='Cash from operations minus capital expenditure, plus net debt issuance (debt issued minus debt repaid).',
+    ),
+    "fcfe_discrete": MetricDef(
+        "fcfe_discrete", ("cfo", "capex", "debt_issued", "debt_repaid"), "quarterly", None, False, "capital_cash",
+        extreme_informative=False,
+        computed_separately=True,
+
+        display_name='Free cash flow to equity (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=True, group='Capital & Cash',
+        description='cfo_discrete - capex_discrete + (debt_issued_discrete - debt_repaid_discrete) -- FCFE for this quarter alone.',
+    ),
+    # FCFF is NOT exact arithmetic -- it needs an effective tax rate this
+    # project must construct (tax_expense / pretax_income), which breaks in
+    # real cases already in the corpus (AMZN FY2022 and MU FY2023 both have
+    # negative pre-tax income; see edgar/metrics.py's _compute_fcff_tax_rate
+    # for the full reasoning and the Damodaran/analyst-forecasting sources
+    # SPEC-008-batch-2 item 2 cites). Annual uses that fiscal year's own
+    # rate (Damodaran: historical FCF should use the actual realised rate,
+    # not a forecasting-style marginal one); quarterly uses a TRAILING-
+    # TWELVE-MONTH rate instead of the single quarter's own, since GAAP
+    # requires discrete tax items to be recognised in full in the quarter
+    # they arise, contaminating any one quarter's own ratio by construction
+    # (Amazon's $15.9B Anthropic-revaluation discrete tax expense is
+    # exactly this problem in the real corpus). Fails closed -- never a
+    # statutory-rate substitute or a clamped band -- when the applicable
+    # pre-tax income is negative or near-zero by the same fractional test
+    # batch 1 item 2 established for growth (10% of this company's own
+    # typical annual pre-tax income magnitude).
+    "fcff_tax_rate": MetricDef(
+        "fcff_tax_rate", ("tax_expense", "pretax_income"), "annual", (-3.0, 2.0), False, "capital_cash",
+        extreme_informative=False, headline=False,
+
+        display_name='Effective tax rate (FCFF, this year)', unit='percent', precision=1,
+        higher_is_better=None, group='Capital & Cash',
+        description='Income tax expense divided by pre-tax income for this fiscal year -- the rate FCFF uses to '
+        'adjust interest expense. Unavailable (not clamped or substituted) when pre-tax income is negative or '
+        'near zero for this company.',
+    ),
+    "fcff_tax_rate_discrete": MetricDef(
+        "fcff_tax_rate_discrete", ("tax_expense", "pretax_income"), "quarterly", (-3.0, 2.0), False, "capital_cash",
+        extreme_informative=False, headline=False,
+        computed_separately=True,
+
+        display_name='Effective tax rate (FCFF, trailing twelve months)', unit='percent', precision=1,
+        higher_is_better=None, group='Capital & Cash',
+        description='Trailing-twelve-month income tax expense divided by trailing-twelve-month pre-tax income -- '
+        'the quarterly counterpart of fcff_tax_rate, smoothed over four discrete quarters to remove discrete-item '
+        'contamination. Unavailable when fewer than four consecutive discrete quarters exist, or when TTM pre-tax '
+        'income is negative or near zero.',
+    ),
+    "fcff": MetricDef(
+        "fcff", ("cfo", "interest_expense", "capex", "tax_expense", "pretax_income"), "annual", None, False,
+        "capital_cash", extreme_informative=False,
+
+        display_name='Free cash flow to the firm', unit='usd', precision=0,
+        higher_is_better=True, group='Capital & Cash',
+        description='Cash from operations plus interest expense net of its tax shield (using fcff_tax_rate), '
+        'minus capital expenditure. Rests on a constructed tax rate, not exact arithmetic -- see fcff_tax_rate.',
+    ),
+    "fcff_discrete": MetricDef(
+        "fcff_discrete", ("cfo", "interest_expense", "capex", "tax_expense", "pretax_income"), "quarterly", None,
+        False, "capital_cash", extreme_informative=False,
+        computed_separately=True,
+
+        display_name='Free cash flow to the firm (discrete quarter)', unit='usd', precision=0,
+        higher_is_better=True, group='Capital & Cash',
+        description='cfo_discrete + interest_expense_discrete*(1 - fcff_tax_rate_discrete) - capex_discrete -- '
+        'FCFF for this quarter alone, using the trailing-twelve-month rate.',
+    ),
     # --- Discrete fiscal quarters, cash flow completeness (SPEC-008-batch-1
     # item 5, approved 2026-08-09) -- the three-section statement's own new
     # lines get the SAME discrete-quarter treatment as the original five,

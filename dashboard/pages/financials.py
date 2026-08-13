@@ -81,18 +81,24 @@ def _render_summary(cik: str, ticker: str, period_start: str, period_end: str) -
 
 _STATEMENT_TABLE_FUNCS = {
     "Income statement": data.get_income_statement_table,
-    "EPS & shares": data.get_eps_and_shares_table,
+    "Key metrics": data.get_key_metrics_table,
     "Balance sheet": data.get_balance_sheet_table,
     "Cash flow": data.get_cash_flow_table,
 }
 # SPEC-008-batch-1 render-batch follow-up item 1 (approved 2026-08-11): item
-# 6 built get_eps_and_shares_table but never added it to the tab dict above
-# -- the rows existed in the data layer and simply had no display path at
-# all. A separate sub-tab, not merged into "Income statement"'s own rows:
-# EPS is dollars-per-share and share counts are a raw count, neither is
-# $-millions, so they cannot share that tab's "$m" caption or its cells'
-# `fmt.format_usd` -- see _EPS_SHARES_CAPTION below.
-_EPS_SHARES_CAPTION = "EPS in $ (2dp), share counts in millions"
+# 6 built the underlying table function but never added it to the tab dict
+# above -- the rows existed in the data layer and simply had no display path
+# at all. A separate sub-tab, not merged into "Income statement"'s own rows:
+# EPS is dollars-per-share, share counts are a raw count, free cash flow/
+# FCFF/FCFE are $-millions same as every other statement, and the effective
+# tax rate is a percent -- no single unit caption covers all of it, so this
+# tab states its own units per group rather than claiming "$m" the way
+# every other statement's caption does.
+# SPEC-008-batch-2 item 2 (approved 2026-08-13): renamed "EPS & shares" ->
+# "Key metrics" and widened with free_cash_flow/fcff/fcfe/fcff_tax_rate --
+# see KEY_METRICS_LINES in dashboard/data.py for the full reasoning,
+# especially FCFF's tax-rate caveat.
+_KEY_METRICS_CAPTION = "EPS in $ (2dp), shares and cash-flow figures in millions ($m), tax rate in %"
 
 
 def _render_table(cik: str, ticker: str) -> None:
@@ -123,8 +129,8 @@ def _render_table(cik: str, ticker: str) -> None:
     duration_label = fmt.format_duration_label(
         data.get_period_duration_class(periods[0]["period_start"], periods[0]["period_end"])
     )
-    # EPS & shares is the one statement not in $m -- see _EPS_SHARES_CAPTION.
-    unit_caption = _EPS_SHARES_CAPTION if statement == "EPS & shares" else "$m"
+    # Key metrics is the one statement not uniformly $m -- see _KEY_METRICS_CAPTION.
+    unit_caption = _KEY_METRICS_CAPTION if statement == "Key metrics" else "$m"
     st.caption(f"{unit_caption}, {duration_label} periods" if duration_label else unit_caption)
 
     rows = _STATEMENT_TABLE_FUNCS[statement](cik, periods, ticker)

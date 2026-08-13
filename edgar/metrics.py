@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import statistics
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Callable
@@ -629,6 +630,124 @@ def _compute_free_cash_flow(facts, periods_by_class, start, end, cls) -> MetricR
     return MetricResult(cfo - capex, inputs_used, formula, None)
 
 
+def _compute_fcfe(facts, periods_by_class, start, end, cls) -> MetricResult:
+    """SPEC-008-batch-2 item 2: exact arithmetic on filed lines, same status
+    as free_cash_flow -- no assumption involved."""
+    cfo, cfo_alias = _resolve("cfo", facts, start, end)
+    capex, capex_alias = _resolve("capex", facts, start, end)
+    debt_issued, debt_issued_alias = _resolve("debt_issued", facts, start, end)
+    debt_repaid, debt_repaid_alias = _resolve("debt_repaid", facts, start, end)
+    inputs_used: dict[str, float] = {}
+    _record(inputs_used, cfo_alias, cfo)
+    _record(inputs_used, capex_alias, capex)
+    _record(inputs_used, debt_issued_alias, debt_issued)
+    _record(inputs_used, debt_repaid_alias, debt_repaid)
+    formula = (
+        f"{cfo_alias or 'cfo'} - {capex_alias or 'capex'} + "
+        f"({debt_issued_alias or 'debt_issued'} - {debt_repaid_alias or 'debt_repaid'})"
+    )
+    if cfo is None:
+        return MetricResult(None, inputs_used, formula, "cfo missing")
+    if capex is None:
+        return MetricResult(None, inputs_used, formula, "capex missing")
+    if debt_issued is None:
+        return MetricResult(None, inputs_used, formula, "debt_issued missing")
+    if debt_repaid is None:
+        return MetricResult(None, inputs_used, formula, "debt_repaid missing")
+    return MetricResult(cfo - capex + (debt_issued - debt_repaid), inputs_used, formula, None)
+
+
+# SPEC-008-batch-2 item 2: matches batch 1 item 2's own 10%-of-typical-
+# magnitude threshold (_GROWTH_NEAR_ZERO_BASE_FRACTION in dashboard/data.py)
+# -- same reasoning, reimplemented here rather than imported, since edgar/
+# never imports from dashboard/ (dashboard reads, edgar writes -- ARCHITECTURE.md).
+_FCFF_NEAR_ZERO_PRETAX_FRACTION = 0.10
+
+
+def _median_abs_annual_pretax_income(facts, periods_by_class) -> float | None:
+    """This company's own typical annual pre-tax income magnitude -- the
+    reference `_compute_fcff_tax_rate` fails closed against when a given
+    year's pre-tax income is technically positive but too small to divide
+    by meaningfully. Computed from genuine annual-duration facts (the
+    ANNUAL basis's own natural source); the quarterly/TTM path reconstructs
+    the equivalent figure from four discrete quarters instead, see
+    compute_discrete_quarter_metrics."""
+    values = [
+        v for (p_start, p_end) in periods_by_class.get("annual", set())
+        if (v := _resolve("pretax_income", facts, p_start, p_end)[0]) is not None
+    ]
+    if not values:
+        return None
+    return statistics.median(abs(v) for v in values)
+
+
+def _compute_fcff_tax_rate(facts, periods_by_class, start, end, cls) -> MetricResult:
+    """SPEC-008-batch-2 item 2: annual only -- this fiscal year's own
+    effective rate (Damodaran: historical FCF should use the actual
+    realised rate, not a forecasting-style marginal one). The quarterly
+    trailing-twelve-month counterpart lives entirely in
+    compute_discrete_quarter_metrics (fcff_tax_rate_discrete), since it
+    needs the trailing four DISCRETE quarters, not a single duration this
+    per-period engine ever sees.
+
+    Fails closed, never substitutes a statutory rate or clamps into a
+    band: pre-tax income <= 0, or positive but near zero relative to this
+    company's own typical annual pre-tax income (the same fractional test
+    batch 1 item 2 established for growth -- a meaningless denominator is
+    a meaningless denominator whether the numerator is a growth base or a
+    tax rate's own base)."""
+    tax, tax_alias = _resolve("tax_expense", facts, start, end)
+    pretax, pretax_alias = _resolve("pretax_income", facts, start, end)
+    inputs_used: dict[str, float] = {}
+    _record(inputs_used, tax_alias, tax)
+    _record(inputs_used, pretax_alias, pretax)
+    formula = f"{tax_alias or 'tax_expense'} / {pretax_alias or 'pretax_income'} (this fiscal year)"
+    if tax is None or pretax is None:
+        return MetricResult(None, inputs_used, formula, "tax_expense or pretax_income missing")
+    if pretax <= 0:
+        return MetricResult(
+            None, inputs_used, formula,
+            f"pre-tax income is not positive ({pretax:,.0f}) -- effective tax rate not meaningful",
+        )
+    typical = _median_abs_annual_pretax_income(facts, periods_by_class)
+    if typical and pretax < _FCFF_NEAR_ZERO_PRETAX_FRACTION * typical:
+        return MetricResult(
+            None, inputs_used, formula,
+            f"pre-tax income ({pretax:,.0f}) is near zero relative to this company's typical annual "
+            f"pre-tax income ({typical:,.0f}) -- effective tax rate not meaningful",
+        )
+    return MetricResult(tax / pretax, inputs_used, formula, None)
+
+
+def _compute_fcff(facts, periods_by_class, start, end, cls) -> MetricResult:
+    """SPEC-008-batch-2 item 2: NOT exact arithmetic -- rests on
+    _compute_fcff_tax_rate's constructed rate. Fails closed whenever that
+    rate is unavailable, same as any other missing input; never falls back
+    to a statutory or clamped rate."""
+    cfo, cfo_alias = _resolve("cfo", facts, start, end)
+    capex, capex_alias = _resolve("capex", facts, start, end)
+    interest, interest_alias = _resolve("interest_expense", facts, start, end)
+    rate_result = _compute_fcff_tax_rate(facts, periods_by_class, start, end, cls)
+    inputs_used: dict[str, float] = {}
+    _record(inputs_used, cfo_alias, cfo)
+    _record(inputs_used, capex_alias, capex)
+    _record(inputs_used, interest_alias, interest)
+    inputs_used.update(rate_result.inputs_used)
+    if rate_result.value is not None:
+        inputs_used["fcff_tax_rate"] = rate_result.value
+    rate_str = f"{rate_result.value:.4f}" if rate_result.value is not None else "unavailable"
+    formula = f"{cfo_alias or 'cfo'} + {interest_alias or 'interest_expense'}*(1-{rate_str}) - {capex_alias or 'capex'}"
+    if cfo is None:
+        return MetricResult(None, inputs_used, formula, "cfo missing")
+    if capex is None:
+        return MetricResult(None, inputs_used, formula, "capex missing")
+    if interest is None:
+        return MetricResult(None, inputs_used, formula, "interest_expense missing")
+    if rate_result.value is None:
+        return MetricResult(None, inputs_used, formula, f"effective tax rate unavailable: {rate_result.null_reason}")
+    return MetricResult(cfo + interest * (1 - rate_result.value) - capex, inputs_used, formula, None)
+
+
 def _compute_fcf_margin(facts, periods_by_class, start, end, cls) -> MetricResult:
     fcf = _compute_free_cash_flow(facts, periods_by_class, start, end, cls)
     rev, rev_alias = _resolve("revenue", facts, start, end)
@@ -1068,6 +1187,25 @@ _DISCRETE_QUARTER_CANONICALS: tuple[str, ...] = (
 )
 _PRIOR_FISCAL_PERIOD: dict[str, str] = {"Q2": "Q1", "Q3": "Q2", "FY": "Q3"}
 
+# SPEC-008-batch-2 item 2: the standard Q1/Q2/Q3/FY(=Q4) cycle as an
+# ordinal sequence -- pure integer arithmetic on fiscal labels, not date
+# arithmetic, matching this project's own standing rule for period lookups.
+_FISCAL_QUARTER_ORDER: tuple[str, ...] = ("Q1", "Q2", "Q3", "FY")
+
+
+def _trailing_four_quarters(fy: int, fp: str) -> list[tuple[int, str]]:
+    """The 4 fiscal (year, period) keys ending at (fy, fp) inclusive, in
+    chronological order -- used by fcff_tax_rate_discrete's trailing-
+    twelve-month sum. Whether all 4 actually exist for this company is the
+    caller's problem (a real fail-closed case for a company's own earliest
+    few quarters, not an error here)."""
+    ordinal = fy * 4 + _FISCAL_QUARTER_ORDER.index(fp)
+    keys = []
+    for o in range(ordinal - 3, ordinal + 1):
+        year, pos = divmod(o, 4)
+        keys.append((year, _FISCAL_QUARTER_ORDER[pos]))
+    return keys
+
 
 def _fiscal_quarter_map(conn: sqlite3.Connection, cik: str) -> dict[tuple[int, str], str]:
     """(fiscal_year, fiscal_period) -> period_end, from `filings` -- the
@@ -1286,6 +1424,186 @@ def compute_discrete_quarter_metrics(
                          "class": "quarterly", "value": value, "null_reason": null_reason}
                     )
 
+        # fcfe_discrete = cfo_discrete - capex_discrete + (debt_issued_discrete
+        # - debt_repaid_discrete) -- SPEC-008-batch-2 item 2, same composition
+        # pattern as free_cash_flow_discrete above: exact arithmetic, no
+        # assumption involved.
+        if metric_names is None or "fcfe_discrete" in metric_names:
+            keys = (
+                set(resolved.get("cfo", {})) & set(resolved.get("capex", {}))
+                & set(resolved.get("debt_issued", {})) & set(resolved.get("debt_repaid", {}))
+            )
+            for key in keys:
+                cfo_value, period_start, end = resolved["cfo"][key]
+                capex_value, capex_start, _e = resolved["capex"][key]
+                debt_issued_value, di_start, _e2 = resolved["debt_issued"][key]
+                debt_repaid_value, dr_start, _e3 = resolved["debt_repaid"][key]
+                if not (period_start == capex_start == di_start == dr_start):
+                    continue  # D11 discipline: refuse unless every window genuinely agrees
+                formula = "cfo_discrete - capex_discrete + (debt_issued_discrete - debt_repaid_discrete)"
+                inputs_used = {}
+                if cfo_value is not None:
+                    inputs_used["cfo_discrete"] = cfo_value
+                if capex_value is not None:
+                    inputs_used["capex_discrete"] = capex_value
+                if debt_issued_value is not None:
+                    inputs_used["debt_issued_discrete"] = debt_issued_value
+                if debt_repaid_value is not None:
+                    inputs_used["debt_repaid_discrete"] = debt_repaid_value
+                if None in (cfo_value, capex_value, debt_issued_value, debt_repaid_value):
+                    value, null_reason = None, (
+                        "cfo_discrete, capex_discrete, debt_issued_discrete, or debt_repaid_discrete unavailable"
+                    )
+                    null_count += 1
+                else:
+                    value = cfo_value - capex_value + (debt_issued_value - debt_repaid_value)
+                    null_reason = None
+                    computed_count += 1
+                inputs_json = json.dumps(
+                    {**inputs_used, "_null_reason": null_reason} if value is None else inputs_used, sort_keys=True
+                )
+                changed = _write_metric(
+                    conn, company.cik, period_start, end, "fcfe_discrete", value, formula, inputs_json
+                )
+                if changed:
+                    written.append(
+                        {"ticker": company.ticker, "name": "fcfe_discrete", "period_end": end,
+                         "class": "quarterly", "value": value, "null_reason": null_reason}
+                    )
+
+        # fcff_tax_rate_discrete: trailing-twelve-month effective tax rate
+        # (SPEC-008-batch-2 item 2) -- GAAP requires discrete tax items
+        # excluded from the ANNUAL rate and recognised in full in the
+        # quarter they arise, so a single quarter's own ratio is
+        # contaminated by construction (Amazon's $15.9B Anthropic-
+        # revaluation discrete tax expense is exactly this problem in the
+        # real corpus). TTM sums the trailing 4 DISCRETE quarters already
+        # resolved above -- needs all 4 present, fails closed (not a
+        # shorter window) when fewer exist, which is every company's own
+        # earliest few quarters. `typical_pretax` reconstructs each fiscal
+        # year's annual pre-tax income from its own 4 discrete quarters
+        # (rather than a separate genuine-annual-duration lookup, the
+        # regular engine's own _median_abs_annual_pretax_income uses) --
+        # the two are the same quantity, this is just the version already
+        # available from this pass's own `resolved` dict.
+        fcff_tax_rate_resolved: dict[tuple[int, str], tuple[float | None, str, str]] = {}
+        if metric_names is None or "fcff_tax_rate_discrete" in metric_names:
+            annual_pretax_reconstructed = []
+            for fy in fiscal_years:
+                parts = [resolved.get("pretax_income", {}).get((fy, fp)) for fp in _FISCAL_QUARTER_ORDER]
+                if all(p is not None and p[0] is not None for p in parts):
+                    annual_pretax_reconstructed.append(sum(p[0] for p in parts))
+            typical_pretax = (
+                statistics.median(abs(v) for v in annual_pretax_reconstructed)
+                if annual_pretax_reconstructed else None
+            )
+
+            for fy in fiscal_years:
+                for fp in _FISCAL_QUARTER_ORDER:
+                    own_entry = (
+                        resolved.get("tax_expense", {}).get((fy, fp))
+                        or resolved.get("pretax_income", {}).get((fy, fp))
+                    )
+                    if own_entry is None:
+                        continue  # this quarter's own window is unknown -- no row to write
+                    _own_value, period_start, end = own_entry
+                    trailing = _trailing_four_quarters(fy, fp)
+                    tax_entries = [resolved.get("tax_expense", {}).get(k) for k in trailing]
+                    pretax_entries = [resolved.get("pretax_income", {}).get(k) for k in trailing]
+                    formula = "sum(tax_expense_discrete, 4q) / sum(pretax_income_discrete, 4q) [TTM]"
+                    have_four = (
+                        all(e is not None and e[0] is not None for e in tax_entries)
+                        and all(e is not None and e[0] is not None for e in pretax_entries)
+                    )
+                    if not have_four:
+                        value = None
+                        null_reason = "fewer than four consecutive discrete quarters on record"
+                        inputs_used = {}
+                        null_count += 1
+                    else:
+                        ttm_tax = sum(e[0] for e in tax_entries)
+                        ttm_pretax = sum(e[0] for e in pretax_entries)
+                        inputs_used = {"ttm_tax_expense": ttm_tax, "ttm_pretax_income": ttm_pretax}
+                        if ttm_pretax <= 0:
+                            value = None
+                            null_reason = f"TTM pre-tax income is not positive ({ttm_pretax:,.0f})"
+                            null_count += 1
+                        elif typical_pretax and ttm_pretax < _FCFF_NEAR_ZERO_PRETAX_FRACTION * typical_pretax:
+                            value = None
+                            null_reason = (
+                                f"TTM pre-tax income ({ttm_pretax:,.0f}) is near zero relative to this "
+                                f"company's typical annual pre-tax income ({typical_pretax:,.0f})"
+                            )
+                            null_count += 1
+                        else:
+                            value = ttm_tax / ttm_pretax
+                            null_reason = None
+                            computed_count += 1
+                    fcff_tax_rate_resolved[(fy, fp)] = (value, period_start, end)
+                    inputs_json = json.dumps(
+                        {**inputs_used, "_null_reason": null_reason} if value is None else inputs_used,
+                        sort_keys=True,
+                    )
+                    changed = _write_metric(
+                        conn, company.cik, period_start, end, "fcff_tax_rate_discrete", value, formula, inputs_json
+                    )
+                    if changed:
+                        written.append(
+                            {"ticker": company.ticker, "name": "fcff_tax_rate_discrete", "period_end": end,
+                             "class": "quarterly", "value": value, "null_reason": null_reason}
+                        )
+
+        # fcff_discrete = cfo_discrete + interest_expense_discrete*(1 -
+        # fcff_tax_rate_discrete) - capex_discrete (SPEC-008-batch-2 item 2)
+        # -- fails closed whenever the rate itself is unavailable, same as
+        # any other missing input; never substitutes a statutory rate.
+        if metric_names is None or "fcff_discrete" in metric_names:
+            keys = (
+                set(resolved.get("cfo", {})) & set(resolved.get("capex", {}))
+                & set(resolved.get("interest_expense", {})) & set(fcff_tax_rate_resolved)
+            )
+            for key in keys:
+                cfo_value, period_start, end = resolved["cfo"][key]
+                capex_value, capex_start, _e = resolved["capex"][key]
+                interest_value, interest_start, _e2 = resolved["interest_expense"][key]
+                rate_value, rate_start, _e3 = fcff_tax_rate_resolved[key]
+                if not (period_start == capex_start == interest_start == rate_start):
+                    continue  # D11 discipline: refuse unless every window genuinely agrees
+                inputs_used = {}
+                if cfo_value is not None:
+                    inputs_used["cfo_discrete"] = cfo_value
+                if capex_value is not None:
+                    inputs_used["capex_discrete"] = capex_value
+                if interest_value is not None:
+                    inputs_used["interest_expense_discrete"] = interest_value
+                if rate_value is not None:
+                    inputs_used["fcff_tax_rate_discrete"] = rate_value
+                rate_str = f"{rate_value:.4f}" if rate_value is not None else "unavailable"
+                formula = f"cfo_discrete + interest_expense_discrete*(1-{rate_str}) - capex_discrete"
+                if cfo_value is None or capex_value is None or interest_value is None:
+                    value = None
+                    null_reason = "cfo_discrete, capex_discrete, or interest_expense_discrete unavailable"
+                    null_count += 1
+                elif rate_value is None:
+                    value = None
+                    null_reason = "fcff_tax_rate_discrete unavailable"
+                    null_count += 1
+                else:
+                    value = cfo_value + interest_value * (1 - rate_value) - capex_value
+                    null_reason = None
+                    computed_count += 1
+                inputs_json = json.dumps(
+                    {**inputs_used, "_null_reason": null_reason} if value is None else inputs_used, sort_keys=True
+                )
+                changed = _write_metric(
+                    conn, company.cik, period_start, end, "fcff_discrete", value, formula, inputs_json
+                )
+                if changed:
+                    written.append(
+                        {"ticker": company.ticker, "name": "fcff_discrete", "period_end": end,
+                         "class": "quarterly", "value": value, "null_reason": null_reason}
+                    )
+
     conn.commit()
     logger.info("compute_discrete_quarter_metrics: %d computed, %d NULL", computed_count, null_count)
     return written
@@ -1319,6 +1637,9 @@ COMPUTE_FUNCS: dict[str, Callable] = {
     "free_cash_flow": _compute_free_cash_flow,
     "fcf_margin": _compute_fcf_margin,
     "fcf_conversion": _compute_fcf_conversion,
+    "fcfe": _compute_fcfe,
+    "fcff_tax_rate": _compute_fcff_tax_rate,
+    "fcff": _compute_fcff,
     "sbc_to_revenue": _compute_sbc_to_revenue,
     "depreciation_rate": _compute_depreciation_rate,
     "days_inventory": _compute_days_inventory,
@@ -1345,6 +1666,9 @@ COMPUTE_FUNCS: dict[str, Callable] = {
     "sbc_discrete": _refused_computed_separately,
     "dep_amort_discrete": _refused_computed_separately,
     "free_cash_flow_discrete": _refused_computed_separately,
+    "fcfe_discrete": _refused_computed_separately,
+    "fcff_tax_rate_discrete": _refused_computed_separately,
+    "fcff_discrete": _refused_computed_separately,
     "revenue_discrete": _refused_computed_separately,
     "cogs_discrete": _refused_computed_separately,
     "gross_profit_discrete": _refused_computed_separately,

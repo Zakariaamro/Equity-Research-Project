@@ -1342,6 +1342,13 @@ def test_cash_flow_table_cash_beginning_and_ending_get_growth_and_yoy_like_any_o
 
 
 # --- SPEC-008-batch-1 item 6 (approved 2026-08-09): EPS and share counts ---
+# (KEY_METRICS_LINES widened by SPEC-008-batch-2 item 2 -- these tests scope
+# their assertions to the four per-share canonicals specifically, not every
+# row in the table, since the table now also carries free_cash_flow/fcff/
+# fcfe/fcff_tax_rate rows that legitimately DO use the discrete-quarter
+# merge mechanism the per-share lines never do.)
+
+_PER_SHARE_CANONICALS = {"eps_basic", "eps_diluted", "basic_shares", "diluted_shares"}
 
 
 def test_eps_and_shares_table_resolves_all_four_lines(db_path):
@@ -1357,8 +1364,8 @@ def test_eps_and_shares_table_resolves_all_four_lines(db_path):
         10_700_000_000, period_start="2025-01-01",
     )
     periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
-    rows = data.get_eps_and_shares_table(AMZN_CIK, periods, "AMZN", db_path)
-    values = {r["canonical"]: r["cells"][0]["value"] for r in rows}
+    rows = data.get_key_metrics_table(AMZN_CIK, periods, "AMZN", db_path)
+    values = {r["canonical"]: r["cells"][0]["value"] for r in rows if r["canonical"] in _PER_SHARE_CANONICALS}
     assert values == {
         "eps_basic": 1.61, "eps_diluted": 1.59,
         "basic_shares": 10_600_000_000.0, "diluted_shares": 10_700_000_000.0,
@@ -1370,13 +1377,15 @@ def test_eps_and_shares_table_never_derives_q4_no_fallback_at_all(db_path):
     # WEIGHTED AVERAGES, not summable flows, so the Q4 = FY - 9M mechanism
     # every other statement uses is mathematically invalid here. Confirms
     # a missing Q4 stays a genuine gap, never a subtraction result -- no
-    # cell in this table can ever carry is_derived_quarter.
+    # PER-SHARE cell in this table can ever carry is_derived_quarter (the
+    # cash-flow rows added by batch-2 item 2 are a different story, and
+    # legitimately do).
     _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-12-31", 0.5)
     _insert_xbrl_fact(
         db_path, AMZN_CIK, "EarningsPerShareDiluted", "2025-12-31", 7.17, period_start="2025-01-01",
     )
     periods = data.get_statement_periods(AMZN_CIK, "annual", db_path)
-    rows = data.get_eps_and_shares_table(AMZN_CIK, periods, "AMZN", db_path)
+    rows = data.get_key_metrics_table(AMZN_CIK, periods, "AMZN", db_path)
     eps_row = next(r for r in rows if r["canonical"] == "eps_diluted")
     fy_cell = next(c for c in eps_row["cells"] if c["period_end"] == "2025-12-31")
     # The FY cumulative figure IS filed directly (7.17) -- shown as-is
@@ -1385,6 +1394,8 @@ def test_eps_and_shares_table_never_derives_q4_no_fallback_at_all(db_path):
     # marker, since this line never attempts subtraction at all.
     assert fy_cell["value"] == 7.17
     for row in rows:
+        if row["canonical"] not in _PER_SHARE_CANONICALS:
+            continue
         for cell in row["cells"]:
             assert "is_derived_quarter" not in cell
 
@@ -1400,9 +1411,73 @@ def test_eps_and_shares_table_computes_growth_like_any_other_statement(db_path):
         accession_no="acc-fact-2",
     )
     periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
-    rows = data.get_eps_and_shares_table(AMZN_CIK, periods, "AMZN", db_path)
+    rows = data.get_key_metrics_table(AMZN_CIK, periods, "AMZN", db_path)
     eps_row = next(r for r in rows if r["canonical"] == "eps_diluted")
     assert eps_row["cells"][1]["growth_pct"] == pytest.approx(0.5)
+
+
+# --- SPEC-008-batch-2 item 2 (approved 2026-08-13): FCF/FCFF/FCFE on the key metrics tab ---
+
+
+def test_key_metrics_lines_widened_with_cash_flow_and_rate_lines():
+    canonicals = {line[0] for line in data.KEY_METRICS_LINES}
+    for expected in ("free_cash_flow", "fcff", "fcfe", "fcff_tax_rate"):
+        assert expected in canonicals
+
+
+def test_key_metrics_table_resolves_fcfe_filed_directly(db_path):
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "fcfe", "2025-01-01", "2025-03-31", 900_000_000)
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_key_metrics_table(AMZN_CIK, periods, "AMZN", db_path)
+    row = next(r for r in rows if r["canonical"] == "fcfe")
+    assert row["label"] == "Free cash flow to equity"
+    assert row["cells"][0]["value"] == 900_000_000.0
+    assert row["cells"][0].get("rate_assumption") is not True  # only fcff carries this marker
+
+
+def test_key_metrics_table_marks_every_populated_fcff_cell_as_a_rate_assumption(db_path):
+    # Requirement 2: the marker must appear on an ANNUAL, directly-filed-
+    # duration FCFF figure too, not only on discrete-derived cells -- it
+    # is a fact about the constructed tax rate, independent of whether the
+    # cfo/capex/interest inputs themselves were filed or subtracted.
+    _insert_filing(db_path, "acc-fy2025", form_type="10-K", period_end="2025-12-31", fiscal_year=2025, fiscal_period="FY")
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-12-31", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "fcff", "2025-01-01", "2025-12-31", 1_200_000_000)
+    periods = data.get_statement_periods(AMZN_CIK, "annual", db_path)
+    rows = data.get_key_metrics_table(AMZN_CIK, periods, "AMZN", db_path)
+    fcff_row = next(r for r in rows if r["canonical"] == "fcff")
+    cell = fcff_row["cells"][0]
+    assert cell["value"] == 1_200_000_000.0
+    assert cell.get("is_derived_quarter") is not True  # a filed-duration annual figure, not a subtraction
+    assert cell["rate_assumption"] is True  # but STILL rests on the constructed rate
+
+
+def test_key_metrics_table_never_marks_a_blank_fcff_cell_a_rate_assumption(db_path):
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    # No fcff or fcff_discrete metric at all -- a genuine gap.
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_key_metrics_table(AMZN_CIK, periods, "AMZN", db_path)
+    fcff_row = next(r for r in rows if r["canonical"] == "fcff")
+    assert fcff_row["cells"][0]["value"] is None
+    assert fcff_row["cells"][0]["rate_assumption"] is False
+
+
+def test_key_metrics_table_labels_the_tax_rate_row_by_basis(db_path):
+    _insert_filing(db_path, "acc-fy2025", form_type="10-K", period_end="2025-12-31", fiscal_year=2025, fiscal_period="FY")
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-12-31", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "fcff_tax_rate", "2025-01-01", "2025-12-31", 0.21)
+    annual_periods = data.get_statement_periods(AMZN_CIK, "annual", db_path)
+    annual_rows = data.get_key_metrics_table(AMZN_CIK, annual_periods, "AMZN", db_path)
+    annual_rate_row = next(r for r in annual_rows if r["canonical"] == "fcff_tax_rate")
+    assert "this year's own rate" in annual_rate_row["label"]
+
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "fcff_tax_rate_discrete", "2025-01-01", "2025-03-31", 0.19)
+    quarterly_periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    quarterly_rows = data.get_key_metrics_table(AMZN_CIK, quarterly_periods, "AMZN", db_path)
+    quarterly_rate_row = next(r for r in quarterly_rows if r["canonical"] == "fcff_tax_rate")
+    assert "trailing twelve months" in quarterly_rate_row["label"]
 
 
 # --- SPEC-008-batch-1 item 7 (approved 2026-08-11): balance sheet completeness ---

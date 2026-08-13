@@ -410,37 +410,51 @@ INCOME_STATEMENT_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
     ("net_income", "Net income", "net_income_discrete", "Net income"),
 )
 
-# SPEC-008-batch-1 item 6 (approved 2026-08-09): EPS and share counts.
-# Deliberately NOT added to INCOME_STATEMENT_LINES and deliberately given
-# NO fallback_canonical (unlike every other line in this file) --
-# EarningsPerShareDiluted/Basic and the two WeightedAverageNumberOf...
+# SPEC-008-batch-1 item 6 (approved 2026-08-09), renamed and widened by
+# SPEC-008-batch-2 item 2 (approved 2026-08-13): the figures an analyst
+# wants that aren't line items on any of the three statements.
+#
+# Per-share lines deliberately NOT added to INCOME_STATEMENT_LINES and
+# deliberately given NO fallback_canonical (unlike every other line in this
+# file) -- EarningsPerShareDiluted/Basic and the two WeightedAverageNumberOf...
 # concepts are WEIGHTED AVERAGES over their period, not summable flows.
 # The Q4 = FY - 9M discrete-quarter mechanism this project uses everywhere
 # else is exact arithmetic for a SUM (revenue, cfo, ...); for an AVERAGE it
 # is simply wrong -- confirmed against real data before this was written:
 # AMZN's 6-month-YTD diluted share count (10,889M) sits BETWEEN its two
 # discrete quarters' own counts (10,874M, 10,903M), the way an average of
-# two numbers always does, not the way a running SUM does. Subtracting two
-# cumulative averages does not recover the discrete quarter's own average;
-# it recovers a small, meaningless difference between two similar numbers.
-# Q4 is therefore a genuine, unfillable gap here where a company doesn't
-# tag it directly (confirmed: AMZN tagged discrete Q4 EPS directly through
-# fiscal 2020, then stopped -- a real disclosure change, not a bug) --
-# left blank, never derived, same "fail closed" discipline as everywhere
-# else in this project, just with no fallback to fail closed FROM.
+# two numbers always does, not the way a running SUM does. Q4 is therefore
+# a genuine, unfillable gap here where a company doesn't tag it directly.
 #
-# Render-layer note (out of scope for this batch, SPEC-008-batch-1's own
-# scope line: "No render-layer or styling work"): EPS is dollars-per-share
-# at 2 decimal places and share counts are already in whole shares (not
-# thousands or millions) -- neither should be formatted through
-# `fmt.format_usd`'s $-millions convention the way INCOME_STATEMENT_LINES'
-# rows are. This function returns raw, correctly-resolved values; the
-# render batch owns choosing how to display them.
-EPS_AND_SHARES_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
+# Cash flow lines: free_cash_flow and fcfe are exact arithmetic on filed
+# lines (same status as batch 1 item 4's gross profit); fcff is NOT --
+# it rests on a constructed effective tax rate (edgar/metrics.py's
+# _compute_fcff_tax_rate), fails closed rather than substituting a
+# statutory rate, and its cells are marked distinctly (`rate_assumption`,
+# set in _mark_fcff_as_a_rate_assumption below) even where they aren't
+# `is_derived_quarter` -- an annual, directly-filed-duration FCFF figure
+# still rests on that year's own constructed rate, a different fact from
+# "this project subtracted two filed cumulatives". fcff_tax_rate is shown
+# as its own row (its label states which basis produced it -- see
+# _label_fcff_tax_rate_row_by_basis) so the number driving FCFF is
+# inspectable, not buried.
+#
+# Render-layer note (out of scope for this batch): EPS is dollars-per-share
+# at 2 decimal places and share counts are in millions -- neither should be
+# formatted through `fmt.format_usd`'s $-millions convention (already wired
+# in dashboard/components.py's `_CELL_FORMATTERS`, the render-batch follow-
+# up to batch 1). The rate row is a percent, also not yet wired to a
+# percent formatter -- this function returns raw, correctly-resolved
+# values; the render batch owns display.
+KEY_METRICS_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
     ("eps_basic", "Basic EPS", None, None),
     ("eps_diluted", "Diluted EPS", None, None),
     ("basic_shares", "Basic shares outstanding", None, None),
     ("diluted_shares", "Diluted shares outstanding", None, None),
+    ("free_cash_flow", "Free cash flow", "free_cash_flow_discrete", "Free cash flow"),
+    ("fcff", "Free cash flow to the firm", "fcff_discrete", "Free cash flow to the firm"),
+    ("fcfe", "Free cash flow to equity", "fcfe_discrete", "Free cash flow to equity"),
+    ("fcff_tax_rate", "Effective tax rate (FCFF)", "fcff_tax_rate_discrete", "Effective tax rate (FCFF)"),
 )
 
 
@@ -1111,6 +1125,8 @@ def _statement_table(
     _derive_gross_profit_from_components(rows, fiscal_labels)
     _derive_total_liabilities_from_components(rows, fiscal_labels)
     _derive_cash_beginning_from_prior_instant(rows, effective_periods, cik, db_path, fiscal_labels)
+    _mark_fcff_as_a_rate_assumption(rows)
+    _label_fcff_tax_rate_row_by_basis(rows, periods)
     return rows
 
 
@@ -1269,24 +1285,54 @@ def _derive_cash_beginning_from_prior_instant(
         )
 
 
+def _mark_fcff_as_a_rate_assumption(rows: list[dict]) -> None:
+    """SPEC-008-batch-2 item 2, requirement 2: "Mark FCFF distinctly from
+    FCF and FCFE. [...] That difference should be visible." `is_derived_
+    quarter` already marks "this project subtracted two filed cumulatives"
+    -- a DIFFERENT fact from "this number rests on a constructed tax rate",
+    which is true of every populated FCFF cell, including an annual,
+    directly-filed-duration one that never went through the discrete-
+    quarter mechanism at all. A no-op for any table without an `fcff` row
+    (every statement except key metrics)."""
+    fcff_row = next((r for r in rows if r["canonical"] == "fcff"), None)
+    if fcff_row is None:
+        return
+    for cell in fcff_row["cells"]:
+        cell["rate_assumption"] = cell["value"] is not None
+
+
+def _label_fcff_tax_rate_row_by_basis(rows: list[dict], periods: list[dict]) -> None:
+    """SPEC-008-batch-2 item 2, requirement 4: "Add the effective tax rate
+    used as its own row [...], labelled with which basis produced it
+    (year's own, or TTM)." Every column in one `_statement_table` call
+    shares the same basis (the page's own annual/quarterly toggle), so this
+    reads it once from the first period rather than per cell. A no-op for
+    any table without an `fcff_tax_rate` row."""
+    rate_row = next((r for r in rows if r["canonical"] == "fcff_tax_rate"), None)
+    if rate_row is None or not periods:
+        return
+    duration_class = _classify_duration(periods[0]["period_start"], periods[0]["period_end"])
+    suffix = " -- this year's own rate" if duration_class == "annual" else " -- trailing twelve months"
+    rate_row["label"] = rate_row["label"] + suffix
+
+
 def get_income_statement_table(
     cik: str, periods: list[dict], ticker: str, db_path: Path = DEFAULT_DB_PATH
 ) -> list[dict]:
     return _statement_table(cik, INCOME_STATEMENT_LINES, periods, ticker, db_path=db_path)
 
 
-def get_eps_and_shares_table(
+def get_key_metrics_table(
     cik: str, periods: list[dict], ticker: str, db_path: Path = DEFAULT_DB_PATH
 ) -> list[dict]:
-    """SPEC-008-batch-1 item 6: EPS and share counts, resolved through the
-    SAME `_statement_table` machinery as every other statement (growth%,
-    YoY, blank-cause classification all apply identically -- EPS growth is
-    a completely normal thing to want) but with NO fallback_canonical on
-    any of the four lines, so the discrete-quarter merge path never
-    triggers -- see `EPS_AND_SHARES_LINES`'s own docstring for why
-    subtraction is invalid for a weighted average. A blank Q4 here is a
-    genuine, correctly-unfilled gap, not a bug."""
-    return _statement_table(cik, EPS_AND_SHARES_LINES, periods, ticker, db_path=db_path)
+    """SPEC-008-batch-1 item 6 / SPEC-008-batch-2 item 2: EPS, share counts,
+    and derived per-share/cash-flow metrics, resolved through the SAME
+    `_statement_table` machinery as every other statement (growth%, YoY,
+    blank-cause classification all apply identically). The per-share lines
+    have NO fallback_canonical -- see `KEY_METRICS_LINES`'s own docstring
+    for why subtraction is invalid for a weighted average; a blank Q4 there
+    is a genuine, correctly-unfilled gap, not a bug."""
+    return _statement_table(cik, KEY_METRICS_LINES, periods, ticker, db_path=db_path)
 
 
 def get_balance_sheet_table(

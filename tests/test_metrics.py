@@ -770,3 +770,180 @@ def test_balance_sheet_lines_have_no_discrete_fallback(conn):
         "debt_noncurrent", "equity",
     }
     assert balance_sheet_canonicals.isdisjoint(metrics._DISCRETE_QUARTER_CANONICALS)
+
+
+# --- SPEC-008-batch-2 item 2 (approved 2026-08-13): key metrics -- FCFE, FCFF ---
+
+
+def _seed_two_fiscal_years_fcff_inputs(conn):
+    """A clean, synthetic, TWO-fiscal-year AMZN-shaped cumulative cycle
+    (same cumulative-tagging shape as _seed_amzn_fiscal_year_revenue) for
+    every input FCFE/FCFF need: cfo, capex, interest_expense, tax_expense,
+    pretax_income, debt_issued, debt_repaid. Two years, not one, so a TTM
+    lookup has real cross-fiscal-year history to draw on, and so the FIRST
+    year's own Q1-Q3 (before four discrete quarters exist anywhere) can
+    prove the "fewer than four consecutive quarters" fail-closed path.
+
+    Hand-computed discrete quarters:
+    FY2024 cfo:            100 / 120 / 110 / 130  (cumulative 100/220/330/460)
+    FY2024 capex:            40 /  50 /  40 /  50  (cumulative  40/ 90/130/180)
+    FY2024 interest_expense: 10 /  10 /  10 /  10  (cumulative  10/ 20/ 30/ 40)
+    FY2024 tax_expense:       15 /  17 /  16 /  16  (cumulative  15/ 32/ 48/ 64)
+    FY2024 pretax_income:     60 /  65 /  65 /  70  (cumulative  60/125/190/260)
+    FY2024 debt_issued:        0 /   0 /  50 /   0  (cumulative   0/  0/ 50/ 50)
+    FY2024 debt_repaid:        5 /   5 /   5 /   5  (cumulative   5/ 10/ 15/ 20)
+    FY2025 cfo:            110 / 130 / 120 / 140  (cumulative 110/240/360/500)
+    FY2025 capex:            45 /  50 /  45 /  50  (cumulative  45/ 95/140/190)
+    FY2025 interest_expense: 11 /  11 /  11 /  11  (cumulative  11/ 22/ 33/ 44)
+    FY2025 tax_expense:       16 /  17 /  17 /  17  (cumulative  16/ 33/ 50/ 67)
+    FY2025 pretax_income:     65 /  65 /  70 /  70  (cumulative  65/130/200/270)
+    FY2025 debt_issued:        0 /  20 /   0 /   0  (cumulative   0/ 20/ 20/ 20)
+    FY2025 debt_repaid:        6 /   6 /   6 /   6  (cumulative   6/ 12/ 18/ 24)
+    (all in millions, written as raw dollars below)
+    """
+    concepts = {
+        "cfo": "NetCashProvidedByUsedInOperatingActivities",
+        "capex": "PaymentsToAcquirePropertyPlantAndEquipment",
+        "interest_expense": "InterestExpense",
+        "tax_expense": "IncomeTaxExpenseBenefit",
+        "pretax_income": "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+        "debt_issued": "ProceedsFromIssuanceOfLongTermDebt",
+        "debt_repaid": "RepaymentsOfLongTermDebt",
+    }
+    cumulative = {
+        "cfo": {2024: (100, 220, 330, 460), 2025: (110, 240, 360, 500)},
+        "capex": {2024: (40, 90, 130, 180), 2025: (45, 95, 140, 190)},
+        "interest_expense": {2024: (10, 20, 30, 40), 2025: (11, 22, 33, 44)},
+        "tax_expense": {2024: (15, 32, 48, 64), 2025: (16, 33, 50, 67)},
+        "pretax_income": {2024: (60, 125, 190, 260), 2025: (65, 130, 200, 270)},
+        "debt_issued": {2024: (0, 0, 50, 50), 2025: (0, 20, 20, 20)},
+        "debt_repaid": {2024: (5, 10, 15, 20), 2025: (6, 12, 18, 24)},
+    }
+    quarter_ends = {
+        2024: (("Q1", "2024-03-31", 90), ("Q2", "2024-06-30", 181), ("Q3", "2024-09-30", 273), ("FY", "2024-12-31", 365)),
+        2025: (("Q1", "2025-03-31", 90), ("Q2", "2025-06-30", 181), ("Q3", "2025-09-30", 273), ("FY", "2025-12-31", 365)),
+    }
+    for fy, quarters in quarter_ends.items():
+        for fp, end, _days in quarters:
+            form_type = "10-K" if fp == "FY" else "10-Q"
+            _insert_filing_row(conn, AMZN_CIK, f"acc-{fy}-{fp}", form_type, end, fy, fp)
+    for canonical, concept in concepts.items():
+        for fy, quarters in quarter_ends.items():
+            for (fp, end, days), value in zip(quarters, cumulative[canonical][fy]):
+                _insert_income_fact(
+                    conn, AMZN_CIK, concept, f"{fy}-01-01", end, value * 1_000_000, days, f"acc-{fy}-{fp}"
+                )
+    conn.commit()
+
+
+def test_fcfe_discrete_composes_four_inputs_exactly(conn):
+    _seed_two_fiscal_years_fcff_inputs(conn)
+    metrics.compute_discrete_quarter_metrics(conn, tickers=["AMZN"])
+    fcfe = {r["period_end"]: r["value"] for r in _metric_rows(conn, AMZN_CIK, "fcfe_discrete")}
+    # FY2024 Q2: cfo=120, capex=50, debt_issued=0, debt_repaid=5 -> 120-50+(0-5)=65
+    assert fcfe["2024-06-30"] == pytest.approx(65_000_000.0)
+    # FY2024 Q3: cfo=110, capex=40, debt_issued=50, debt_repaid=5 -> 110-40+(50-5)=115
+    assert fcfe["2024-09-30"] == pytest.approx(115_000_000.0)
+
+
+def test_fcff_tax_rate_discrete_uses_trailing_twelve_months_not_the_single_quarter(conn):
+    _seed_two_fiscal_years_fcff_inputs(conn)
+    metrics.compute_discrete_quarter_metrics(conn, tickers=["AMZN"])
+    rate = {r["period_end"]: r["value"] for r in _metric_rows(conn, AMZN_CIK, "fcff_tax_rate_discrete")}
+    # FY2024 Q4 (the 4th quarter overall): trailing 4 = FY2024's own Q1-Q4.
+    # TTM tax = 15+17+16+16=64, TTM pretax = 60+65+65+70=260 -> 64/260.
+    assert rate["2024-12-31"] == pytest.approx(64 / 260)
+    # FY2025 Q2: trailing 4 = FY2024 Q3, FY2024 Q4, FY2025 Q1, FY2025 Q2 --
+    # genuinely crosses the fiscal year boundary, not a same-year ratio.
+    # TTM tax = 16+16+16+17=65, TTM pretax = 65+70+65+65=265 -> 65/265.
+    assert rate["2025-06-30"] == pytest.approx(65 / 265)
+    # This is NOT the single quarter's own naive ratio (16/65 = 0.246 vs
+    # the TTM's 65/265 = 0.245 here they're close by design of the clean
+    # fixture -- the distinct-from-naive claim is proven by the FY2024 Q4
+    # cross-check above, which uses a materially different window).
+
+
+def test_fcff_tax_rate_discrete_fails_closed_for_fewer_than_four_quarters(conn):
+    # FY2024 Q1/Q2/Q3 -- before four discrete quarters exist anywhere in
+    # this company's history -- must fail closed, never fall back to a
+    # shorter window.
+    _seed_two_fiscal_years_fcff_inputs(conn)
+    metrics.compute_discrete_quarter_metrics(conn, tickers=["AMZN"])
+    rows = {r["period_end"]: r for r in _metric_rows(conn, AMZN_CIK, "fcff_tax_rate_discrete")}
+    for end in ("2024-03-31", "2024-06-30", "2024-09-30"):
+        assert rows[end]["value"] is None
+        assert "fewer than four consecutive" in json.loads(rows[end]["inputs_json"])["_null_reason"]
+
+
+def test_fcff_discrete_composes_cfo_interest_and_the_ttm_rate(conn):
+    _seed_two_fiscal_years_fcff_inputs(conn)
+    metrics.compute_discrete_quarter_metrics(conn, tickers=["AMZN"])
+    fcff = {r["period_end"]: r["value"] for r in _metric_rows(conn, AMZN_CIK, "fcff_discrete")}
+    rate = {r["period_end"]: r["value"] for r in _metric_rows(conn, AMZN_CIK, "fcff_tax_rate_discrete")}
+    # FY2024 Q4: cfo=130, interest=10, capex=50, rate=64/260.
+    expected = 130_000_000 + 10_000_000 * (1 - rate["2024-12-31"]) - 50_000_000
+    assert fcff["2024-12-31"] == pytest.approx(expected)
+    # No cell here can ever substitute a rate when the TTM rate is
+    # unavailable -- proven directly on the Q1-Q3 fewer-than-four-quarters
+    # cells, which must all be None too, not silently computed some other way.
+    for end in ("2024-03-31", "2024-06-30", "2024-09-30"):
+        assert fcff[end] is None
+
+
+def test_fcff_tax_rate_annual_uses_this_fiscal_years_own_rate(conn):
+    # The ANNUAL basis is a completely different code path (_compute_fcff_
+    # tax_rate via the regular compute_metrics engine, not the discrete/TTM
+    # composition in compute_discrete_quarter_metrics) -- confirms it uses
+    # JUST that fiscal year's own tax_expense/pretax_income, per Damodaran's
+    # "leave the effective tax rate at its actual level" for historical figures.
+    _seed_two_fiscal_years_fcff_inputs(conn)
+    metrics.compute_metrics(conn, tickers=["AMZN"], metric_names=["fcff_tax_rate", "fcff"])
+    rate = {r["period_end"]: r["value"] for r in _metric_rows(conn, AMZN_CIK, "fcff_tax_rate")}
+    assert rate["2024-12-31"] == pytest.approx(64_000_000 / 260_000_000)
+    assert rate["2025-12-31"] == pytest.approx(67_000_000 / 270_000_000)
+    fcff = {r["period_end"]: r["value"] for r in _metric_rows(conn, AMZN_CIK, "fcff")}
+    expected_2024 = 460_000_000 + 40_000_000 * (1 - rate["2024-12-31"]) - 180_000_000
+    assert fcff["2024-12-31"] == pytest.approx(expected_2024)
+
+
+def test_fcff_tax_rate_fails_closed_for_negative_pretax_income(conn):
+    # Reproduces the spec's own AMZN FY2022 shape: negative pre-tax income
+    # makes an effective rate not meaningful, regardless of the tax
+    # expense's own sign -- never a statutory-rate substitute.
+    concept_tax = "IncomeTaxExpenseBenefit"
+    concept_pretax = "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"
+    _insert_filing_row(conn, AMZN_CIK, "acc-fy", "10-K", "2025-12-31", 2025, "FY")
+    _insert_income_fact(conn, AMZN_CIK, concept_tax, "2025-01-01", "2025-12-31", -3_217_000_000, 365, "acc-fy")
+    _insert_income_fact(conn, AMZN_CIK, concept_pretax, "2025-01-01", "2025-12-31", -5_936_000_000, 365, "acc-fy")
+    conn.commit()
+    metrics.compute_metrics(conn, tickers=["AMZN"], metric_names=["fcff_tax_rate", "fcff"])
+    rate_row = _metric_rows(conn, AMZN_CIK, "fcff_tax_rate")[0]
+    assert rate_row["value"] is None
+    assert "not positive" in json.loads(rate_row["inputs_json"])["_null_reason"]
+    fcff_row = _metric_rows(conn, AMZN_CIK, "fcff")[0]
+    assert fcff_row["value"] is None  # never substitutes a statutory or clamped rate
+
+
+def test_fcff_tax_rate_fails_closed_for_near_zero_pretax_income_relative_to_typical(conn):
+    # Two "normal" years establish this company's own typical annual
+    # pre-tax income (~250M); a third year with pre-tax income far below
+    # 10% of that (well under 25M) is positive but not meaningfully
+    # divisible -- same near-zero-base test batch 1 item 2 established for
+    # growth, applied here to a rate's own denominator.
+    _insert_filing_row(conn, AMZN_CIK, "acc-fy1", "10-K", "2023-12-31", 2023, "FY")
+    _insert_filing_row(conn, AMZN_CIK, "acc-fy2", "10-K", "2024-12-31", 2024, "FY")
+    _insert_filing_row(conn, AMZN_CIK, "acc-fy3", "10-K", "2025-12-31", 2025, "FY")
+    concept_tax = "IncomeTaxExpenseBenefit"
+    concept_pretax = "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"
+    _insert_income_fact(conn, AMZN_CIK, concept_tax, "2023-01-01", "2023-12-31", 50_000_000, 365, "acc-fy1")
+    _insert_income_fact(conn, AMZN_CIK, concept_pretax, "2023-01-01", "2023-12-31", 250_000_000, 365, "acc-fy1")
+    _insert_income_fact(conn, AMZN_CIK, concept_tax, "2024-01-01", "2024-12-31", 52_000_000, 365, "acc-fy2")
+    _insert_income_fact(conn, AMZN_CIK, concept_pretax, "2024-01-01", "2024-12-31", 260_000_000, 365, "acc-fy2")
+    _insert_income_fact(conn, AMZN_CIK, concept_tax, "2025-01-01", "2025-12-31", 2_000_000, 365, "acc-fy3")
+    _insert_income_fact(conn, AMZN_CIK, concept_pretax, "2025-01-01", "2025-12-31", 5_000_000, 365, "acc-fy3")
+    conn.commit()
+    metrics.compute_metrics(conn, tickers=["AMZN"], metric_names=["fcff_tax_rate"])
+    rows = {r["period_end"]: r for r in _metric_rows(conn, AMZN_CIK, "fcff_tax_rate")}
+    assert rows["2023-12-31"]["value"] == pytest.approx(50_000_000 / 250_000_000)  # comfortably typical
+    assert rows["2025-12-31"]["value"] is None  # positive, but near zero relative to ~255M typical
+    assert "near zero" in json.loads(rows["2025-12-31"]["inputs_json"])["_null_reason"]
