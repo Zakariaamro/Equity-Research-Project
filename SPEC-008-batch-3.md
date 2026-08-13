@@ -75,6 +75,14 @@ fraction being rendered with zero decimal places instead of as a percentage.
 
 Fix the formatting. The row should read `11.8%`, `19.6%` and so on.
 
+### Resolution (implemented 2026-08-14)
+
+`fcff_tax_rate` added to `components.py`'s `_CELL_FORMATTERS` dispatch (the same
+per-canonical mechanism EPS/shares already use), routed through `fmt.format_percent` at
+1 decimal place instead of falling through to `fmt.format_usd`'s $-millions default.
+`format_percent(0.118, 1)` → `"11.8%"`, `format_percent(0.196, 1)` → `"19.6%"` — matches
+the item's own worked example exactly.
+
 ---
 
 ## Item 3 — The currency/LaTeX bug is back, in a new call site

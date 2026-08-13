@@ -243,6 +243,13 @@ _CELL_FORMATTERS = {
     "eps_diluted": fmt.format_usd_per_share,
     "basic_shares": fmt.format_shares,
     "diluted_shares": fmt.format_shares,
+    # SPEC-008-batch-3 item 2 (approved 2026-08-14): fcff_tax_rate is a
+    # fraction (0.118, not 11.8) like every other rate/margin metric in
+    # this project -- falling through to fmt.format_usd's 0-decimal
+    # $-millions convention rendered it as a flat "0" in every column.
+    # fmt.format_percent needs a precision arg format_usd doesn't, hence
+    # the lambda rather than a bare function reference here.
+    "fcff_tax_rate": lambda value: fmt.format_percent(value, 1),
 }
 
 # SPEC-008-batch-3 item 1 (approved 2026-08-13): cash flow section

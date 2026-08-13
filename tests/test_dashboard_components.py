@@ -617,6 +617,30 @@ def test_statement_table_formats_eps_and_share_rows_in_their_own_units():
     assert df.iloc[2][_col("2025-03-31")] == "150"  # revenue: unaffected, still $m
 
 
+def test_statement_table_formats_fcff_tax_rate_as_a_percent():
+    # SPEC-008-batch-3 item 2 (approved 2026-08-14): fcff_tax_rate is a
+    # fraction (0.118) -- falling through to fmt.format_usd rendered it
+    # as a flat "0" in every column, for every company. AMZN FY2020's real
+    # rate (recovered from the FCFF figures in the item's own text): 11.8%.
+    def script(rows, periods):
+        from dashboard import components
+
+        components.statement_table(rows, periods, show_growth=False, key="t")
+
+    periods = [{"period_end": "2020-12-31"}]
+    rows = [
+        {
+            "label": "Effective tax rate (FCFF)", "canonical": "fcff_tax_rate",
+            "cells": [{"period_end": "2020-12-31", "value": 0.118, "is_derived_quarter": False}],
+        },
+    ]
+    at = AppTest.from_function(script, kwargs={"rows": rows, "periods": periods})
+    at.run()
+    assert at.exception == []
+    df = at.dataframe[0].value
+    assert df.iloc[0][_col("2020-12-31")] == "11.8%"
+
+
 def test_statement_table_style_bolds_subtotal_rows():
     # SPEC-008-batch-3 item 1 (approved 2026-08-13): font-weight is the
     # confirmed-safe Styler property (unlike padding, used for the
