@@ -678,6 +678,45 @@ def test_discrete_quarter_metrics_idempotent(conn):
     assert second_written == []
 
 
+def test_discrete_quarter_metrics_deletes_a_row_that_becomes_orphaned(conn):
+    # Found live (SPEC-008-batch-2 cash-reconciliation follow-up, approved
+    # 2026-08-13): MU's debt_repaid_discrete carried a $2.822B "derived"
+    # value for a real fiscal quarter, computed from RepaymentsOfDebt --
+    # an alias removed from CONCEPT_REGISTRY in an earlier session for
+    # disagreeing with the correct concept by 160-2400%. Once that alias no
+    # longer resolves any fact, _fiscal_year_start/_discrete_quarter_
+    # period_start can't establish a window at all, so the per-canonical
+    # loop skips writing entirely -- the OLD row just sits there, still
+    # displayed on the cash flow statement marked derived, with nothing
+    # left recomputing it. Reproduced directly: seed a real Q1 fact,
+    # confirm the discrete row populates, then remove the fact (the same
+    # practical effect as its alias being removed) and confirm a fresh
+    # pass DELETES the now-orphaned row rather than leaving it stale.
+    concept = "RepaymentsOfLongTermDebt"
+    _insert_filing_row(conn, AMZN_CIK, "acc-q1", "10-Q", "2025-03-31", 2025, "Q1")
+    _insert_income_fact(conn, AMZN_CIK, concept, "2025-01-01", "2025-03-31", 42_000_000, 90, "acc-q1")
+    conn.commit()
+    metrics.compute_discrete_quarter_metrics(conn, tickers=["AMZN"])
+    before = conn.execute(
+        "SELECT value FROM metrics WHERE cik = ? AND name = 'debt_repaid_discrete' AND period_end = ?",
+        (AMZN_CIK, "2025-03-31"),
+    ).fetchone()
+    assert before["value"] == pytest.approx(42_000_000.0)
+
+    conn.execute(
+        "DELETE FROM xbrl_facts WHERE cik = ? AND concept = ? AND period_end = ?",
+        (AMZN_CIK, concept, "2025-03-31"),
+    )
+    conn.commit()
+    written = metrics.compute_discrete_quarter_metrics(conn, tickers=["AMZN"])
+    after = conn.execute(
+        "SELECT value FROM metrics WHERE cik = ? AND name = 'debt_repaid_discrete' AND period_end = ?",
+        (AMZN_CIK, "2025-03-31"),
+    ).fetchone()
+    assert after is None  # deleted, not left stale
+    assert any(w["name"] == "debt_repaid_discrete" and w["period_end"] == "2025-03-31" for w in written)
+
+
 # --- SPEC-008 D12 (approved 2026-08-08): discrete Q4 on the income statement ---
 #
 # The trimmed companyfacts fixtures don't carry a clean, complete fiscal-

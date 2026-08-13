@@ -1372,6 +1372,38 @@ def compute_discrete_quarter_metrics(
                         canonical, facts_by_concept, fy_start, prior_end if fp != "Q1" else None
                     )
                     if period_start is None:
+                        # Found live (SPEC-008-batch-2 cash-reconciliation
+                        # follow-up, approved 2026-08-13): a stale row can
+                        # survive here forever if a concept's alias is later
+                        # removed from CONCEPT_REGISTRY (or a company simply
+                        # stops tagging it) -- the window this canonical used
+                        # to resolve at this fiscal quarter no longer exists,
+                        # so this pass never gets a candidate value to compare
+                        # against the old one, and _write_metric's own
+                        # unchanged-value skip never runs at all. Found live:
+                        # MU's debt_repaid_discrete carried a $2.822B
+                        # "derived" value for fiscal Q1 2026, computed from
+                        # RepaymentsOfDebt -- an alias removed in an earlier
+                        # session (batch 1 item 5) for disagreeing with the
+                        # correct concept by 160-2400% -- still displayed on
+                        # the cash flow statement, marked derived, since
+                        # before that removal. A discrete-quarter metric has
+                        # exactly one row per (cik, name, period_end) --
+                        # unlike a raw filed duration fact, its period_start
+                        # is computed, not independently chosen by the filer
+                        # -- so deleting by period_end alone (no period_start
+                        # in the WHERE clause) is safe and cannot touch a
+                        # different, still-valid window.
+                        deleted = conn.execute(
+                            "DELETE FROM metrics WHERE cik = ? AND period_end = ? AND name = ? AND calc_version = ?",
+                            (company.cik, end, name, config.CALC_VERSION),
+                        ).rowcount
+                        if deleted:
+                            written.append(
+                                {"ticker": company.ticker, "name": name, "period_end": end, "class": "quarterly",
+                                 "value": None,
+                                 "null_reason": "orphaned: no alias resolves any window for this quarter now"}
+                            )
                         continue  # can't establish the window at all -- no row to write
 
                     resolved[canonical][(fy, fp)] = (value, period_start, end)
