@@ -9,8 +9,10 @@ markdown renders as LaTeX math-mode delimiters (SPEC-008 review D1)."""
 
 from __future__ import annotations
 
+import pandas as pd
 from streamlit.testing.v1 import AppTest
 
+from dashboard import components
 from dashboard import format as fmt_module
 
 
@@ -613,3 +615,87 @@ def test_statement_table_formats_eps_and_share_rows_in_their_own_units():
     assert df.iloc[0][_col("2025-03-31")] == "$2.35"
     assert df.iloc[1][_col("2025-03-31")] == "10,874"
     assert df.iloc[2][_col("2025-03-31")] == "150"  # revenue: unaffected, still $m
+
+
+def test_statement_table_style_bolds_subtotal_rows():
+    # SPEC-008-batch-3 item 1 (approved 2026-08-13): font-weight is the
+    # confirmed-safe Styler property (unlike padding, used for the
+    # indentation half of this item instead -- see the text-prefix test
+    # below). Direct unit test of the style function itself, no need to
+    # inspect Streamlit's rendered Styler HTML.
+    row = pd.Series(["x", "y"], name=0)
+    style = components._statement_table_style(row, row_kind=["subtotal_value"], row_group=[0])
+    assert all("font-weight: bold" in s for s in style)
+    plain_style = components._statement_table_style(row, row_kind=["value"], row_group=[0])
+    assert all("font-weight: bold" not in s for s in plain_style)
+
+
+def test_statement_table_indents_cash_flow_subtotal_labels_not_other_rows():
+    # Item 1: cfo/net_cash_investing/net_cash_financing/cash_and_restricted_
+    # cash get a text indent (Streamlit's Styler never confirmed to honour
+    # CSS padding -- _GROWTH_ROW_LABEL's own turned-arrow prefix already
+    # established text-indentation as this table's working pattern).
+    # net_change_in_cash and cash_beginning are the item's own explicit
+    # exclusions -- must NOT be indented despite being on the same
+    # statement, right next to the rows that are.
+    def script(rows, periods):
+        from dashboard import components
+
+        components.statement_table(rows, periods, show_growth=False, key="t")
+
+    periods = [{"period_end": "2025-03-31"}]
+
+    def _row(canonical, label):
+        return {
+            "label": label, "canonical": canonical,
+            "cells": [{"period_end": "2025-03-31", "value": 10_000_000, "is_derived_quarter": False}],
+        }
+
+    rows = [
+        _row("cfo", "Net cash provided by operating activities"),
+        _row("net_cash_investing", "Net cash used in investing activities"),
+        _row("net_cash_financing", "Net cash provided by (used in) financing activities"),
+        _row("cash_and_restricted_cash", "Cash at end of period"),
+        _row("net_change_in_cash", "Net change in cash"),
+        _row("cash_beginning", "Cash at beginning of period"),
+    ]
+    at = AppTest.from_function(script, kwargs={"rows": rows, "periods": periods})
+    at.run()
+    assert at.exception == []
+    df = at.dataframe[0].value
+    labels = df[components._LINE_ITEM_COL].tolist()
+    assert labels[0] == components._SUBTOTAL_INDENT + "Net cash provided by operating activities"
+    assert labels[1] == components._SUBTOTAL_INDENT + "Net cash used in investing activities"
+    assert labels[2] == components._SUBTOTAL_INDENT + "Net cash provided by (used in) financing activities"
+    assert labels[3] == components._SUBTOTAL_INDENT + "Cash at end of period"
+    assert labels[4] == "Net change in cash"  # unindented, the item's own instruction
+    assert labels[5] == "Cash at beginning of period"  # unindented, the item's own instruction
+
+
+def test_statement_table_subtotal_treatment_never_depends_on_the_cells_own_value():
+    # "Weight and indentation must be a function of the row's structural
+    # role, never of its data" -- the item's own words. A subtotal row
+    # stays indented and bold whether its value is positive, negative, or
+    # blank; a non-subtotal row never gets either regardless of its value.
+    def script(rows, periods):
+        from dashboard import components
+
+        components.statement_table(rows, periods, show_growth=False, key="t")
+
+    periods = [{"period_end": "2025-03-31"}, {"period_end": "2025-06-30"}]
+    rows = [
+        {
+            "label": "Net cash provided by operating activities", "canonical": "cfo",
+            "cells": [
+                {"period_end": "2025-03-31", "value": -5_000_000, "is_derived_quarter": False},
+                {"period_end": "2025-06-30", "value": None, "is_derived_quarter": False, "blank_cause": "gap"},
+            ],
+        },
+    ]
+    at = AppTest.from_function(script, kwargs={"rows": rows, "periods": periods})
+    at.run()
+    assert at.exception == []
+    df = at.dataframe[0].value
+    assert df.iloc[0][components._LINE_ITEM_COL] == (
+        components._SUBTOTAL_INDENT + "Net cash provided by operating activities"
+    )

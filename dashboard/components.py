@@ -245,6 +245,27 @@ _CELL_FORMATTERS = {
     "diluted_shares": fmt.format_shares,
 }
 
+# SPEC-008-batch-3 item 1 (approved 2026-08-13): cash flow section
+# subtotals -- the lines each section builds up to (plus the statement's
+# own final closing balance). Structural, by canonical, never by a cell's
+# own value -- the item's own words: "weight and indentation must be a
+# function of the row's structural role, never of its data." Net change
+# in cash and Cash at beginning of period are deliberately excluded (the
+# item's own instruction) -- they aren't a SECTION's closing line the way
+# these four are.
+#
+# Indentation is TEXT (a leading space run on the label), not CSS padding
+# -- `_GROWTH_ROW_LABEL`'s own turned-arrow prefix, a few lines up,
+# already establishes this as the working pattern in this table: text
+# indentation is guaranteed to render, where a Styler CSS property is
+# not (this project's own docs review found only "colors and font
+# weights" confirmed to survive the Styler -> st.dataframe grid
+# translation -- padding was never on that list). Bold IS on that list,
+# so the weight half of this item uses `font-weight` via
+# `_statement_table_style` below, and the indent half uses this prefix.
+_SUBTOTAL_CANONICALS = {"cfo", "net_cash_investing", "net_cash_financing", "cash_and_restricted_cash"}
+_SUBTOTAL_INDENT = "    "  # 4 spaces -- costs whitespace, not rows, per the item's own framing
+
 
 def _statement_table_style(row: pd.Series, row_kind: list[str], row_group: list[int]) -> list[str]:
     i = row.name
@@ -261,6 +282,11 @@ def _statement_table_style(row: pd.Series, row_kind: list[str], row_group: list[
         # grid the way colour and weight are (Streamlit's own docs commit to
         # only "colors and font weights" for st.dataframe Styler support).
         style += "; color: #9aa0a6" if style else "color: #9aa0a6"
+    elif row_kind[i] == "subtotal_value":
+        # Item 1's weight half -- font-weight, the OTHER Styler property
+        # confirmed to survive (see this row_kind's own definition above,
+        # next to _SUBTOTAL_CANONICALS).
+        style += "; font-weight: bold" if style else "font-weight: bold"
     return [style] * len(row)
 
 
@@ -313,8 +339,10 @@ def statement_table(rows: list[dict], periods: list[dict], show_growth: bool, ke
 
     for group_idx, row in enumerate(rows):
         cells = row["cells"]
+        is_subtotal = row["canonical"] in _SUBTOTAL_CANONICALS
+        label = _SUBTOTAL_INDENT + row["label"] if is_subtotal else row["label"]
 
-        value_entry = {_LINE_ITEM_COL: row["label"]}
+        value_entry = {_LINE_ITEM_COL: label}
         formatter = _CELL_FORMATTERS.get(row["canonical"], fmt.format_usd)
         for col_name, cell in zip(period_cols, cells):
             if cell["value"] is None:
@@ -328,7 +356,7 @@ def statement_table(rows: list[dict], periods: list[dict], show_growth: bool, ke
                 any_derived_quarter = True
             value_entry[col_name] = text
         table_rows.append(value_entry)
-        row_kind.append("value")
+        row_kind.append("subtotal_value" if is_subtotal else "value")
         row_group.append(group_idx)
 
         if show_growth:
