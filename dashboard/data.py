@@ -541,21 +541,32 @@ CASH_FLOW_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
     ),
     ("fx_effect_on_cash", "Effect of exchange rates on cash", "fx_effect_on_cash_discrete", "Effect of exchange rates on cash"),
     ("net_change_in_cash", "Net change in cash", "net_change_in_cash_discrete", "Net change in cash"),
-    # New (item 1). "Cash at end of period" reuses the BALANCE SHEET'S OWN
-    # `cash` canonical directly -- the SAME instant fact at this column's
-    # period_end, not a new concept to curate (a period's ending cash IS
-    # the balance sheet's cash line at that date). No fallback: this is
-    # always the filed figure or nothing, never derived.
+    # New (item 1). SPEC-008-batch-2 cash-reconciliation follow-up
+    # (approved 2026-08-13, found live): this originally reused the
+    # BALANCE SHEET's own `cash` canonical (CashAndCashEquivalentsAt
+    # CarryingValue, EXCLUDES restricted cash) -- wrong. A real filed cash
+    # flow statement reconciles on the BROADER post-ASU-2016-18 concept,
+    # the SAME one net_change_in_cash/fx_effect_on_cash already use
+    # (`cash_and_restricted_cash`, restricted cash included since 2018);
+    # mixing the narrow balance-sheet concept in here is exactly why the
+    # statement didn't internally reconcile (confirmed live: AMZN's real
+    # cash and equivalents run 86,810 -> 78,213, but its filed cash flow
+    # statement runs 90,106 -> 80,927 -- the ~3.3B/2.7B gap is restricted
+    # cash). "Cash at end of period" now resolves `cash_and_restricted_
+    # cash` directly at this column's period_end -- a different concept
+    # from the balance sheet's own `cash` row, correctly (two statements,
+    # two concepts, as the filings do). No fallback: filed figure or
+    # nothing, never derived.
     #
     # "Cash at beginning of period" has no CONCEPT_REGISTRY entry at all --
     # it is patched by _derive_cash_beginning_from_prior_instant below,
-    # which resolves the SAME `cash` canonical one calendar day before
-    # this column's period_start (confirmed against the real corpus: a
-    # duration fact's `start` is consistently one day after the prior
-    # instant's `end`, for all three companies -- an XBRL filing
-    # convention, not a fiscal-calendar guess).
+    # which resolves the SAME `cash_and_restricted_cash` canonical one
+    # calendar day before this column's period_start (confirmed against
+    # the real corpus: a duration fact's `start` is consistently one day
+    # after the prior instant's `end`, for all three companies -- an XBRL
+    # filing convention, not a fiscal-calendar guess).
     ("cash_beginning", "Cash at beginning of period", None, None),
-    ("cash", "Cash at end of period", None, None),
+    ("cash_and_restricted_cash", "Cash at end of period", None, None),
 )
 
 
@@ -1241,11 +1252,15 @@ def _derive_cash_beginning_from_prior_instant(
     db_path: Path,
     fiscal_labels: dict[str, tuple[int, str]],
 ) -> None:
-    """SPEC-008-batch-2 item 1 (approved 2026-08-13): "cash at beginning of
-    period" is not a new duration concept to curate -- it is the SAME
-    instant fact `cash` already carries (the balance sheet's own line, and
-    this table's own "Cash at end of period" row), read at the date ONE
-    CALENDAR DAY before this column's period_start.
+    """SPEC-008-batch-2 item 1 (approved 2026-08-13), corrected by the
+    cash-reconciliation follow-up (same date, found live by independent
+    review): "cash at beginning of period" is not a new duration concept
+    to curate -- it is the SAME instant fact `cash_and_restricted_cash`
+    already carries (this table's own "Cash at end of period" row, the
+    BROADER post-ASU-2016-18 concept -- NOT the balance sheet's narrower
+    `cash`, whose reuse here was the original bug: it excludes restricted
+    cash, so beginning + net_change never equalled ending), read at the
+    date ONE CALENDAR DAY before this column's period_start.
 
     Checked against the real corpus before writing this, not assumed: a
     duration fact's `start` date is consistently one day after the PRIOR
@@ -1271,7 +1286,7 @@ def _derive_cash_beginning_from_prior_instant(
         if cell["value"] is not None or period_start is None:
             continue
         prior_instant = (date.fromisoformat(period_start) - timedelta(days=1)).isoformat()
-        value = _resolve_statement_line_value(cik, "cash", None, prior_instant, db_path)
+        value = _resolve_statement_line_value(cik, "cash_and_restricted_cash", None, prior_instant, db_path)
         if value is None:
             continue
         cell["value"] = value

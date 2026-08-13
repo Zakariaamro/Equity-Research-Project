@@ -1236,7 +1236,9 @@ def test_cash_flow_lines_investing_and_financing_sections_end_with_their_own_sub
 
 def test_cash_flow_lines_ends_with_the_reconciliation_including_beginning_and_ending_cash():
     canonicals = [line[0] for line in data.CASH_FLOW_LINES]
-    assert canonicals[-4:] == ["fx_effect_on_cash", "net_change_in_cash", "cash_beginning", "cash"]
+    assert canonicals[-4:] == [
+        "fx_effect_on_cash", "net_change_in_cash", "cash_beginning", "cash_and_restricted_cash",
+    ]
 
 
 def test_cash_flow_table_resolves_net_cash_investing_filed_directly(db_path):
@@ -1286,12 +1288,22 @@ def test_cash_flow_table_net_income_resolves_via_the_income_statements_own_canon
     assert row["cells"][0]["value"] == 7_000_000.0
 
 
-def test_cash_flow_table_cash_at_end_of_period_reuses_the_balance_sheets_cash_concept(db_path):
+def test_cash_flow_table_cash_at_end_of_period_uses_the_broad_restricted_cash_concept(db_path):
+    # SPEC-008-batch-2 cash-reconciliation follow-up (approved 2026-08-13,
+    # found live): this must NOT be the balance sheet's narrower `cash`
+    # (CashAndCashEquivalentsAtCarryingValue) -- that was the original
+    # bug. The cash flow statement's own reconciliation uses the broader
+    # post-ASU-2016-18 concept, same one net_change_in_cash already uses.
     _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
-    _insert_xbrl_fact(db_path, AMZN_CIK, "CashAndCashEquivalentsAtCarryingValue", "2025-03-31", 9_000_000)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents", "2025-03-31", 9_000_000,
+    )
+    # A DIFFERENT value under the narrow balance-sheet concept, at the
+    # SAME date -- proves the row reads the broad concept, not this one.
+    _insert_xbrl_fact(db_path, AMZN_CIK, "CashAndCashEquivalentsAtCarryingValue", "2025-03-31", 7_500_000)
     periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
     rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
-    ending_rows = [r for r in rows if r["canonical"] == "cash"]
+    ending_rows = [r for r in rows if r["canonical"] == "cash_and_restricted_cash"]
     assert len(ending_rows) == 1
     assert ending_rows[0]["label"] == "Cash at end of period"
     assert ending_rows[0]["cells"][0]["value"] == 9_000_000.0
@@ -1301,9 +1313,12 @@ def test_cash_flow_table_cash_at_end_of_period_reuses_the_balance_sheets_cash_co
 def test_cash_flow_table_cash_at_beginning_of_period_resolves_one_day_before_period_start(db_path):
     # Confirmed against the real corpus: a duration fact's period_start is
     # one calendar day after the prior instant's own date -- Q2 2025
-    # (start=2025-04-01) reads the `cash` instant filed at 2025-03-31.
+    # (start=2025-04-01) reads the cash_and_restricted_cash instant filed
+    # at 2025-03-31.
     _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)
-    _insert_xbrl_fact(db_path, AMZN_CIK, "CashAndCashEquivalentsAtCarryingValue", "2025-03-31", 6_000_000)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents", "2025-03-31", 6_000_000,
+    )
     periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
     rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
     row = next(r for r in rows if r["canonical"] == "cash_beginning")
@@ -1316,8 +1331,8 @@ def test_cash_flow_table_cash_at_beginning_of_period_resolves_one_day_before_per
 
 def test_cash_flow_table_cash_at_beginning_of_period_stays_blank_when_the_prior_instant_is_missing(db_path):
     _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)
-    # No CashAndCashEquivalentsAtCarryingValue fact at all -- neither at
-    # 2025-03-31 nor anywhere else.
+    # No cash_and_restricted_cash fact at all -- neither at 2025-03-31 nor
+    # anywhere else.
     periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
     rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
     row = next(r for r in rows if r["canonical"] == "cash_beginning")
@@ -1330,15 +1345,46 @@ def test_cash_flow_table_cash_beginning_and_ending_get_growth_and_yoy_like_any_o
     _insert_filing(db_path, "acc-q2-2025", form_type="10-Q", period_end="2025-06-30", fiscal_year=2025, fiscal_period="Q2")
     _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
     _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)
-    _insert_xbrl_fact(db_path, AMZN_CIK, "CashAndCashEquivalentsAtCarryingValue", "2025-03-31", 100_000_000)
     _insert_xbrl_fact(
-        db_path, AMZN_CIK, "CashAndCashEquivalentsAtCarryingValue", "2025-06-30", 150_000_000,
+        db_path, AMZN_CIK, "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents", "2025-03-31", 100_000_000,
+    )
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents", "2025-06-30", 150_000_000,
         accession_no="acc-fact-2",
     )
     periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
     rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
-    ending_row = next(r for r in rows if r["canonical"] == "cash")
+    ending_row = next(r for r in rows if r["canonical"] == "cash_and_restricted_cash")
     assert ending_row["cells"][1]["growth_pct"] == pytest.approx(0.5)
+
+
+def test_cash_flow_table_beginning_plus_net_change_equals_ending_on_real_shaped_data(db_path):
+    # SPEC-008-batch-2 cash-reconciliation follow-up: the whole point of
+    # switching concepts -- confirms the three reconciliation rows
+    # actually agree with each other now, reproducing AMZN's real Q1 2026
+    # shape (90,106 -> 80,927 via a net change including the FX effect,
+    # not a separate addition -- see the validate rule for the corpus-wide
+    # version of this same check).
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents", "2024-12-31",
+        90_106_000_000,
+    )
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents", "2025-03-31",
+        80_927_000_000, accession_no="acc-fact-2",
+    )
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK,
+        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncreaseDecreaseIncludingExchangeRateEffect",
+        "2025-03-31", -9_179_000_000, period_start="2025-01-01",
+    )
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
+    beginning = next(r for r in rows if r["canonical"] == "cash_beginning")["cells"][0]["value"]
+    net_change = next(r for r in rows if r["canonical"] == "net_change_in_cash")["cells"][0]["value"]
+    ending = next(r for r in rows if r["canonical"] == "cash_and_restricted_cash")["cells"][0]["value"]
+    assert beginning + net_change == pytest.approx(ending)
 
 
 # --- SPEC-008-batch-1 item 6 (approved 2026-08-09): EPS and share counts ---

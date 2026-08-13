@@ -79,10 +79,24 @@ might be) — only its label changed, to "Net cash provided by (used in) financi
 activities". `free_cash_flow` removed from this statement entirely; it moves to the key
 metrics tab in item 2.
 
-**Cash at beginning/end of period**, both new. "End" reuses the balance sheet's own `cash`
-canonical directly (the same instant fact, at this column's period_end — no new concept).
-"Beginning" has no filed concept of its own to alias; it's patched from the SAME `cash`
-canonical read one calendar day before this column's period_start
+**Cash at beginning/end of period**, both new. Original implementation (this section, as
+first written) reused the balance sheet's own `cash` canonical
+(`CashAndCashEquivalentsAtCarryingValue`, excludes restricted cash) for both — **wrong**,
+corrected by an independent-review follow-up the same day (2026-08-13): the cash flow
+statement's own reconciliation is built on the broader post-ASU-2016-18 concept,
+`CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents` (restricted cash included
+since 2018), the SAME one `net_change_in_cash` already used since batch 1 item 5 — mixing
+the narrower balance-sheet concept in here was exactly why the statement never internally
+reconciled. Confirmed live: AMZN's real cash-and-equivalents alone run
+86,810 → 78,213, but its filed cash flow statement runs 90,106 → 80,927; the ~3.3B/2.7B
+gap is restricted cash. Fixed by registering the missing concept
+(`cash_and_restricted_cash`, ingested for all three companies) and pointing both rows at
+it — the balance sheet's own `cash` row is unchanged, still correctly the narrow concept.
+Two statements, two concepts, exactly as the filings do.
+
+"End" resolves `cash_and_restricted_cash` directly at this column's period_end. "Beginning"
+has no filed concept of its own to alias; it's patched from the SAME `cash_and_restricted_
+cash` canonical read one calendar day before this column's period_start
 (`_derive_cash_beginning_from_prior_instant`). Checked against the real corpus before
 writing this: a duration fact's `start` date is consistently one day after the prior
 instant's own `end` date, confirmed for all three companies (AMZN, NVDA, MU each checked
@@ -93,13 +107,32 @@ filer's own number at the instant XBRL itself uses to represent it.
 **Coverage** (quarterly basis, full history): both new lines resolve 25/25 (AMZN), 24/24
 (NVDA), 37/37 (MU) — full coverage, nothing to drop.
 
-**Found, not asked for**: beginning/ending cash use the SAME narrow concept the balance
-sheet's `cash` line always has (`CashAndCashEquivalentsAtCarryingValue`), while
-`net_change_in_cash` uses the broader restricted-cash-inclusive concept (established in
-batch 1 item 5). For AMZN, which carries some restricted cash, `ending − beginning` and
-`net_change_in_cash` differ by roughly 1% in spot-checked quarters — each row is exactly
-what its own concept reports, they just don't perfectly reconcile against each other. Not
-a bug in either row; noted rather than silently invisible.
+**Validate rule added** (category 34): beginning + net_change_in_cash must equal ending,
+per company per period, checked directly against the raw filed corpus (not the dashboard's
+own derived display), same discipline as category 4's debt reconciliation. Confirmed
+before writing it, not assumed from the concept's name: `net_change_in_cash`'s own concept
+already ends "...IncludingExchangeRateEffect", so `fx_effect_on_cash` is deliberately NOT
+added a second time — doing so double-counts it (proven against MU's real filed data,
+where beginning + net_change + fx misses ending by exactly the fx figure, while beginning
++ net_change alone ties exactly, diff=0, across the whole corpus). Running the full check
+against the real corpus surfaced one genuine, pre-existing anomaly, unrelated to this
+concept-mismatch bug: AMZN restated its 2018-03-31 instant from $17,616M to $23,507M in a
+filing dated 2020-07-31, but the corresponding `net_change_in_cash` duration facts for the
+periods touching that date were never correspondingly restated — a real vintage mismatch
+in AMZN's own decade-old filing history, confirmed directly against the raw values (not
+guessed), registered as three `CASH_RECONCILIATION_EXCEPTIONS` entries
+(2018-03-31/2018-06-30/2019-03-31) with the full diagnosis in the reason field. Everything
+else in the corpus reconciles exactly.
+
+**Also found and fixed while investigating** (unrelated to this bug, surfaced by the same
+review): a narrow but real staleness issue in `compute_discrete_quarter_metrics` — when a
+concept's alias is later removed from `CONCEPT_REGISTRY` (or a company stops tagging it
+entirely), the discrete-quarter engine can no longer determine a period window for that
+canonical, so it silently skips writing rather than nulling the old value. Found 13
+affected rows (MU's `debt_repaid_discrete`, NVDA/MU's `investment_purchases_discrete`)
+still computed from aliases rejected in an earlier session, actively displayed on the cash
+flow statement marked derived, months after the aliases were removed. Fixed separately
+(own commit) by deleting the orphaned row when its window can no longer be established.
 
 Sign convention unchanged throughout — every value is exactly what `xbrl_facts` holds, no
 sign flips anywhere in this resolution path.

@@ -238,6 +238,108 @@ def test_discrete_quarter_sum_back_covers_income_statement_lines_too(conn):
     assert violations[0]["fy_period_end"] == "2025-12-31"
 
 
+# --- SPEC-008-batch-2 cash-reconciliation follow-up (approved 2026-08-13): category 34 ---
+
+
+def _seed_amzn_cash_reconciliation_cycle(conn, ending_value=180_000_000):
+    """A clean, synthetic beginning/net-change/ending cash triple -- the
+    trimmed AMZN fixture doesn't carry cash_and_restricted_cash or
+    net_change_in_cash at all. Beginning (2025-03-31) = 100M, Q2 2025 net
+    change = 80M, ending (2025-06-30) defaults to 180M -- reconciles
+    exactly unless the caller overrides `ending_value` to break it."""
+    conn.execute(
+        "INSERT INTO xbrl_facts (cik, taxonomy, concept, unit, period_start, period_end, value, "
+        "accession_no, filed_date) VALUES (?, 'us-gaap', ?, 'USD', NULL, ?, ?, 'acc-beg', ?)",
+        (AMZN_CIK, "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents", "2025-03-31",
+         100_000_000, "2025-03-31"),
+    )
+    conn.execute(
+        "INSERT INTO xbrl_facts (cik, taxonomy, concept, unit, period_start, period_end, value, "
+        "accession_no, filed_date) VALUES (?, 'us-gaap', ?, 'USD', NULL, ?, ?, 'acc-end', ?)",
+        (AMZN_CIK, "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents", "2025-06-30",
+         ending_value, "2025-06-30"),
+    )
+    conn.execute(
+        "INSERT INTO xbrl_facts (cik, taxonomy, concept, unit, period_start, period_end, value, "
+        "accession_no, filed_date) VALUES (?, 'us-gaap', ?, 'USD', ?, ?, ?, 'acc-chg', ?)",
+        (
+            AMZN_CIK,
+            "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncreaseDecreaseIncludingExchangeRateEffect",
+            "2025-04-01", "2025-06-30", 80_000_000, "2025-06-30",
+        ),
+    )
+    conn.commit()
+
+
+def test_cash_reconciliation_passes_on_clean_synthetic_data(conn):
+    _seed_amzn_cash_reconciliation_cycle(conn)  # 100M + 80M = 180M, ties exactly
+    report = validate.run_validate(conn, tickers=["AMZN"])
+    assert report.cash_reconciliation_violations == []
+
+
+def test_cash_reconciliation_detects_a_mismatch(conn):
+    _seed_amzn_cash_reconciliation_cycle(conn, ending_value=999_000_000)  # 100M + 80M != 999M
+    report = validate.run_validate(conn, tickers=["AMZN"])
+    violations = [v for v in report.cash_reconciliation_violations if v["period_end"] == "2025-06-30"]
+    assert violations
+    assert violations[0]["diff"] == pytest.approx(819_000_000)
+
+
+def test_cash_reconciliation_does_not_double_count_the_fx_effect(conn):
+    # net_change_in_cash's own concept name ends "...IncludingExchangeRate
+    # Effect" -- confirmed against the real corpus before this rule was
+    # written: adding fx_effect_on_cash on top double-counts it. A clean
+    # reconciliation must stay clean even when an fx_effect_on_cash fact
+    # exists alongside it for the same period.
+    _seed_amzn_cash_reconciliation_cycle(conn)
+    conn.execute(
+        "INSERT INTO xbrl_facts (cik, taxonomy, concept, unit, period_start, period_end, value, "
+        "accession_no, filed_date) VALUES (?, 'us-gaap', ?, 'USD', ?, ?, ?, 'acc-fx', ?)",
+        (
+            AMZN_CIK, "EffectOfExchangeRateOnCashAndCashEquivalents", "2025-04-01", "2025-06-30",
+            5_000_000, "2025-06-30",
+        ),
+    )
+    conn.commit()
+    report = validate.run_validate(conn, tickers=["AMZN"])
+    assert report.cash_reconciliation_violations == []
+
+
+def test_cash_reconciliation_exception_reported_not_hard_failed(conn, monkeypatch):
+    _seed_amzn_cash_reconciliation_cycle(conn, ending_value=999_000_000)
+    monkeypatch.setattr(
+        config,
+        "CASH_RECONCILIATION_EXCEPTIONS",
+        {
+            (AMZN_CIK, "2025-06-30"): config.CashReconciliationException(
+                cik=AMZN_CIK, period_end="2025-06-30", reason="test exception",
+            )
+        },
+    )
+    report = validate.run_validate(conn, tickers=["AMZN"])
+    assert report.cash_reconciliation_violations == []
+    exceptions = report.cash_reconciliation_exceptions
+    assert any(f["period_end"] == "2025-06-30" and f["reason"] == "test exception" for f in exceptions)
+
+
+def test_cash_reconciliation_unregistered_period_still_hard_fails(conn):
+    _seed_amzn_cash_reconciliation_cycle(conn, ending_value=999_000_000)
+    assert (AMZN_CIK, "2025-06-30") not in config.CASH_RECONCILIATION_EXCEPTIONS
+    report = validate.run_validate(conn, tickers=["AMZN"])
+    assert any(v["period_end"] == "2025-06-30" for v in report.cash_reconciliation_violations)
+
+
+def test_cash_reconciliation_real_amzn_2018_restatement_is_a_registered_exception(conn):
+    # The actual finding this rule was built from (SPEC-008-batch-2 cash-
+    # reconciliation follow-up): AMZN restated the 2018-03-31 instant from
+    # $17,616M to $23,507M without a corresponding restatement of the
+    # duration facts touching it. Confirms the REAL, committed exception
+    # registry (not a monkeypatched one) covers it.
+    assert ("0001018724", "2018-03-31") in config.CASH_RECONCILIATION_EXCEPTIONS
+    assert ("0001018724", "2018-06-30") in config.CASH_RECONCILIATION_EXCEPTIONS
+    assert ("0001018724", "2019-03-31") in config.CASH_RECONCILIATION_EXCEPTIONS
+
+
 def test_gross_profit_crosscheck_detects_corruption(conn):
     _ingest_and_compute(conn, ["NVDA"])
     conn.execute("UPDATE xbrl_facts SET value = value * 3 WHERE concept = 'GrossProfit'")

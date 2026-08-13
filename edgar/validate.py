@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 from edgar import analyze as analyze_mod
@@ -40,6 +40,8 @@ class ValidationReport:
     finance_lease_zero_assumptions: list[dict] = field(default_factory=list)
     discrete_quarter_sum_violations: list[dict] = field(default_factory=list)
     discrete_quarter_sum_exceptions: list[dict] = field(default_factory=list)
+    cash_reconciliation_violations: list[dict] = field(default_factory=list)
+    cash_reconciliation_exceptions: list[dict] = field(default_factory=list)
     observation_per_filing_contribution: list[dict] = field(default_factory=list)
     observation_dead_rules: list[dict] = field(default_factory=list)
     observation_lookahead_violations: list[dict] = field(default_factory=list)
@@ -70,6 +72,7 @@ class ValidationReport:
             + len(self.gross_profit_violations)
             + len(self.debt_reconciliation_violations)
             + len(self.discrete_quarter_sum_violations)
+            + len(self.cash_reconciliation_violations)
             + len(self.period_mixing_violations)
             + len(self.alias_agreement_violations)
             + len(self.observation_lookahead_violations)
@@ -731,6 +734,94 @@ def _check_discrete_quarter_sum_exceptions(conn: sqlite3.Connection, tickers: li
     return findings
 
 
+# --- category 34: cash flow reconciliation (SPEC-008-batch-2
+# cash-reconciliation follow-up, approved 2026-08-13) ---
+
+
+def _find_cash_reconciliation_violations(conn: sqlite3.Connection, tickers: list[str] | None) -> list[dict]:
+    """Every (cik, period_end) where beginning-of-period `cash_and_
+    restricted_cash` + the period's `net_change_in_cash` disagrees with
+    ending-of-period `cash_and_restricted_cash` beyond tolerance --
+    regardless of whether it's in CASH_RECONCILIATION_EXCEPTIONS.
+    Partitioned by the caller. Checks the RAW filed corpus directly (like
+    category 4's debt reconciliation), not the dashboard's own discrete-
+    quarter-merged display.
+
+    Found live (2026-08-13): the cash flow statement originally reused the
+    balance sheet's OWN `cash` concept (CashAndCashEquivalentsAtCarrying
+    Value, EXCLUDES restricted cash) for beginning/end of period, while
+    net_change_in_cash used the BROADER post-ASU-2016-18 concept (restricted
+    cash included) -- two different cash definitions mixed in one
+    statement, so it never reconciled (AMZN: cash and equivalents alone run
+    86,810 -> 78,213, but the filed cash flow statement runs
+    90,106 -> 80,927; the ~3.3B/2.7B gap is restricted cash). Fixed by
+    switching beginning/end to the SAME broad concept
+    (`cash_and_restricted_cash`) net_change_in_cash already used; this check
+    guards against that mismatch recurring.
+
+    net_change_in_cash's own concept name ends "...IncludingExchangeRate
+    Effect" -- confirmed against the real corpus before writing this, not
+    assumed from the name alone: FX is NOT added a second time here, since
+    doing so double-counts it (proven live against MU's real filed data,
+    where beginning + net_change + fx misses ending by exactly the fx
+    figure in every period checked, while beginning + net_change alone
+    ties exactly, diff=0, across the whole corpus)."""
+    findings = []
+    for cik, ticker in _companies(tickers):
+        facts = metrics_mod._load_facts(conn, cik)
+        net_change_ci = config.CONCEPT_REGISTRY["net_change_in_cash"]
+        for alias in net_change_ci.aliases:
+            for (start, end), fact in facts.get(alias, {}).items():
+                if start is None:
+                    continue
+                beginning_date = (date.fromisoformat(start) - timedelta(days=1)).isoformat()
+                beginning, _b_alias = metrics_mod._resolve("cash_and_restricted_cash", facts, None, beginning_date)
+                ending, _e_alias = metrics_mod._resolve("cash_and_restricted_cash", facts, None, end)
+                if beginning is None or ending is None:
+                    continue
+                net_change = fact.value
+                computed_ending = beginning + net_change
+                diff = abs(computed_ending - ending)
+                if diff > config.CASH_RECONCILIATION_TOLERANCE_USD:
+                    findings.append(
+                        {
+                            "ticker": ticker,
+                            "cik": cik,
+                            "period_start": start,
+                            "period_end": end,
+                            "beginning": beginning,
+                            "net_change": net_change,
+                            "ending": ending,
+                            "computed_ending": computed_ending,
+                            "diff": diff,
+                        }
+                    )
+    return findings
+
+
+def _check_cash_reconciliation(conn: sqlite3.Connection, tickers: list[str] | None) -> list[dict]:
+    """Hard-failing cash reconciliation findings: (cik, period_end) NOT in
+    CASH_RECONCILIATION_EXCEPTIONS."""
+    return [
+        f
+        for f in _find_cash_reconciliation_violations(conn, tickers)
+        if (f["cik"], f["period_end"]) not in config.CASH_RECONCILIATION_EXCEPTIONS
+    ]
+
+
+def _check_cash_reconciliation_exceptions(conn: sqlite3.Connection, tickers: list[str] | None) -> list[dict]:
+    """Cash reconciliation findings covered by the register -- informational,
+    with the written reason attached."""
+    findings = [
+        f
+        for f in _find_cash_reconciliation_violations(conn, tickers)
+        if (f["cik"], f["period_end"]) in config.CASH_RECONCILIATION_EXCEPTIONS
+    ]
+    for f in findings:
+        f["reason"] = config.CASH_RECONCILIATION_EXCEPTIONS[(f["cik"], f["period_end"])].reason
+    return findings
+
+
 # --- SPEC-005 R8: observation checks. All queries filter on each rule's own
 # CURRENT rule_version (config.RULE_REGISTRY[name].version) -- exactly as
 # metrics checks filter on config.CALC_VERSION (SPEC-005 change 8) -- so a
@@ -1353,6 +1444,8 @@ def run_validate(conn: sqlite3.Connection, tickers: list[str] | None = None) -> 
         finance_lease_zero_assumptions=_check_finance_lease_zero_assumptions(conn, tickers),
         discrete_quarter_sum_violations=_check_discrete_quarter_sum(conn, tickers),
         discrete_quarter_sum_exceptions=_check_discrete_quarter_sum_exceptions(conn, tickers),
+        cash_reconciliation_violations=_check_cash_reconciliation(conn, tickers),
+        cash_reconciliation_exceptions=_check_cash_reconciliation_exceptions(conn, tickers),
         observation_per_filing_contribution=_check_observation_per_filing_contribution(conn, tickers),
         observation_dead_rules=_check_observation_dead_rules(conn, tickers),
         observation_lookahead_violations=_check_observation_lookahead(conn, tickers),
@@ -1616,10 +1709,24 @@ def format_report(report: ValidationReport) -> str:
         lambda v: f"{v['ticker']} {v['canonical']} FY ending {v['fy_period_end']}: "
         f"Q1+Q2+Q3+Q4={v['quarter_sum']:,.0f} vs filed FY={v['filed_fy']:,.0f} (diff {v['diff']:,.0f}) -- {v['reason']}",
     )
+    _section(
+        "34. Cash flow reconciliation (beginning + net change = ending)",
+        report.cash_reconciliation_violations,
+        lambda v: f"{v['ticker']} {v['period_start']}..{v['period_end']}: "
+        f"beginning={v['beginning']:,.0f} + net_change={v['net_change']:,.0f} = {v['computed_ending']:,.0f} "
+        f"vs filed ending={v['ending']:,.0f} (diff {v['diff']:,.0f})",
+    )
+    _section(
+        "34a. Cash flow reconciliation exceptions (informational -- registered, not hard-failed)",
+        report.cash_reconciliation_exceptions,
+        lambda v: f"{v['ticker']} {v['period_start']}..{v['period_end']}: "
+        f"beginning={v['beginning']:,.0f} + net_change={v['net_change']:,.0f} = {v['computed_ending']:,.0f} "
+        f"vs filed ending={v['ending']:,.0f} (diff {v['diff']:,.0f}) -- {v['reason']}",
+    )
 
     lines.append(
         f"\n{report.hard_failure_count} finding(s) in hard-failing categories "
-        "(1, 2, 3, 4, 5, 6, 14, 15, 16, 19, 20, 21, 22, 27, 28, 29, 30, 33) -- would exit non-zero."
+        "(1, 2, 3, 4, 5, 6, 14, 15, 16, 19, 20, 21, 22, 27, 28, 29, 30, 33, 34) -- would exit non-zero."
         if report.hard_failure_count
         else "\nAll hard-failing categories clean."
     )

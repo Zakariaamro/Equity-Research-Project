@@ -387,10 +387,22 @@ CONCEPT_REGISTRY: dict[str, ConceptInput] = {
     # this project tracks an even narrower slice of financing activity --
     # e.g. no line for stock-option proceeds or other borrowings).
     "net_cash_financing": ConceptInput(("NetCashProvidedByUsedInFinancingActivities",), "USD"),
-    # Reconciliation. "Beginning and ending cash" deliberately not added
-    # here -- it is the SAME instant fact the balance sheet's own `cash`
-    # line already carries (a period's ending cash IS the next period's
-    # beginning cash), not a new duration concept to curate.
+    # Reconciliation. SPEC-008-batch-2 cash-reconciliation follow-up
+    # (approved 2026-08-13, found live by independent review): batch 2
+    # item 1 originally reused the balance sheet's own `cash` canonical
+    # (CashAndCashEquivalentsAtCarryingValue, EXCLUDES restricted cash) for
+    # this statement's beginning/end of period -- wrong. The cash flow
+    # statement's own reconciliation is built on the BROADER post-ASU-
+    # 2016-18 concept below, the SAME one net_change_in_cash already uses
+    # (restricted cash included since 2018) -- a real, filed AMZN cash
+    # flow statement runs 90,106 -> 80,927 (this concept), not
+    # 86,810 -> 78,213 (the narrow one); the ~3.3B/2.7B gap is restricted
+    # cash. Two statements, two concepts, exactly as the filings do -- the
+    # balance sheet's own `cash` line is UNCHANGED, still the narrow
+    # concept, correctly.
+    "cash_and_restricted_cash": ConceptInput(
+        ("CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",), "USD", instant=True,
+    ),
     "fx_effect_on_cash": ConceptInput(
         (
             "EffectOfExchangeRateOnCashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
@@ -512,6 +524,44 @@ class DiscreteQuarterSumException:
 
 
 DISCRETE_QUARTER_SUM_EXCEPTIONS: dict[tuple[str, str, str], DiscreteQuarterSumException] = {}
+
+
+@dataclass(frozen=True)
+class CashReconciliationException:
+    """A documented, accepted exception to R8's cash flow reconciliation
+    check (SPEC-008-batch-2 cash-reconciliation follow-up, approved
+    2026-08-13): beginning-of-period `cash_and_restricted_cash` +
+    `net_change_in_cash` failed to tie to ending-of-period
+    `cash_and_restricted_cash` within CASH_RECONCILIATION_TOLERANCE_USD.
+
+    Keyed by (cik, period_end) -- a specific company's specific period, not
+    a standing property of either concept. A combination NOT in this
+    register still hard-fails on any disagreement, same discipline as
+    DEBT_RECONCILIATION_EXCEPTIONS.
+    """
+
+    cik: str
+    period_end: str
+    reason: str
+
+
+_AMZN_2018_Q1_RESTATEMENT_REASON = (
+    "AMZN restated the 2018-03-31 CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents "
+    "instant from $17,616M to $23,507M in a filing dated 2020-07-31 (accession "
+    "0001018724-20-000021) -- confirmed directly against the raw filed values, not assumed: "
+    "every net_change_in_cash duration fact touching that instant (Q1 2018's own, and the two "
+    "trailing-twelve-month facts ending 2018-03-31/2019-03-31) was filed once and never "
+    "restated to match, still carrying the ORIGINAL $17,616M vintage through every later filing "
+    "checked (up to 2020-05-01, two months before the restatement). A genuine vintage mismatch "
+    "in AMZN's own filing history -- the surrounding periods (2017-12-31, 2018-06-30, "
+    "2019-03-31's OWN ending balance) each reconcile exactly against their own neighbours."
+)
+CASH_RECONCILIATION_EXCEPTIONS: dict[tuple[str, str], CashReconciliationException] = {
+    ("0001018724", period_end): CashReconciliationException(
+        cik="0001018724", period_end=period_end, reason=_AMZN_2018_Q1_RESTATEMENT_REASON,
+    )
+    for period_end in ("2018-03-31", "2018-06-30", "2019-03-31")
+}
 
 
 @dataclass(frozen=True)
@@ -1590,6 +1640,13 @@ ALIAS_AGREEMENT_TOLERANCE: float = 0.01
 # hasn't propagated to every quarter that depends on it -- exactly the
 # failure mode this check exists to catch.
 DISCRETE_QUARTER_SUM_TOLERANCE_USD: float = 1.0
+# SPEC-008-batch-2 cash-reconciliation follow-up (approved 2026-08-13):
+# same discipline as DISCRETE_QUARTER_SUM_TOLERANCE_USD above -- beginning +
+# net_change = ending is an algebraic identity for a correctly-matched
+# concept pair (confirmed exactly, diff=0, across the whole real corpus
+# before this was written), not a business-tolerance check. A tiny
+# ABSOLUTE dollar tolerance for float noise only.
+CASH_RECONCILIATION_TOLERANCE_USD: float = 1.0
 # Raised 1% -> 2% live (R6a): the 1% floor let a near-zero Δrevenue amplify noise into
 # a range-shaped outlier. Guarding the denominator, not the output range.
 INCREMENTAL_MARGIN_MIN_REVENUE_DELTA_PCT: float = 0.02
