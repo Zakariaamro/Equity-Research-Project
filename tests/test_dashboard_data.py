@@ -631,18 +631,20 @@ def test_classify_growth_treats_missing_typical_magnitude_as_never_near_zero():
 def test_cash_flow_table_renders_not_meaningful_flag_for_a_near_zero_base(db_path):
     # Reproduces the review's own cited case end to end, through the real
     # table-building path (not just the classifier in isolation): a run of
-    # cumulative cfo/capex facts shaped so free_cash_flow's derived
-    # discrete quarter has a tiny base relative to its own history.
+    # capex_discrete values shaped so one quarter has a tiny base relative
+    # to its own history. (Originally free_cash_flow -- moved to capex,
+    # still in this statement, when free_cash_flow moved to the key-
+    # metrics tab in SPEC-008-batch-2 item 1/2.)
     _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
     _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)
     _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-07-01", "2025-09-30", 0.5)
-    _insert_metric(db_path, AMZN_CIK, "free_cash_flow", "2025-01-01", "2025-03-31", 800_000_000)
-    _insert_metric(db_path, AMZN_CIK, "free_cash_flow", "2025-04-01", "2025-06-30", 72_000_000)
-    _insert_metric(db_path, AMZN_CIK, "free_cash_flow", "2025-07-01", "2025-09-30", 3_022_000_000)
+    _insert_metric(db_path, AMZN_CIK, "capex_discrete", "2025-01-01", "2025-03-31", 800_000_000)
+    _insert_metric(db_path, AMZN_CIK, "capex_discrete", "2025-04-01", "2025-06-30", 72_000_000)
+    _insert_metric(db_path, AMZN_CIK, "capex_discrete", "2025-07-01", "2025-09-30", 3_022_000_000)
     periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
     rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
-    fcf_row = next(r for r in rows if r["canonical"] == "free_cash_flow")
-    q3_cell = next(c for c in fcf_row["cells"] if c["period_end"] == "2025-09-30")
+    capex_row = next(r for r in rows if r["canonical"] == "capex")
+    q3_cell = next(c for c in capex_row["cells"] if c["period_end"] == "2025-09-30")
     assert q3_cell["growth_not_meaningful"] == "near_zero_base"
 
 
@@ -752,13 +754,13 @@ def test_yoy_growth_gets_the_same_n_slash_m_treatment_as_sequential_growth(db_pa
     _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)
     _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-07-01", "2025-09-30", 0.5)
     _insert_metric(db_path, AMZN_CIK, "gross_margin", "2026-04-01", "2026-06-30", 0.5)
-    _insert_metric(db_path, AMZN_CIK, "free_cash_flow", "2025-04-01", "2025-06-30", 800_000_000)
-    _insert_metric(db_path, AMZN_CIK, "free_cash_flow", "2025-07-01", "2025-09-30", 700_000_000)
-    _insert_metric(db_path, AMZN_CIK, "free_cash_flow", "2026-04-01", "2026-06-30", 72_000_000)
+    _insert_metric(db_path, AMZN_CIK, "capex_discrete", "2025-04-01", "2025-06-30", 800_000_000)
+    _insert_metric(db_path, AMZN_CIK, "capex_discrete", "2025-07-01", "2025-09-30", 700_000_000)
+    _insert_metric(db_path, AMZN_CIK, "capex_discrete", "2026-04-01", "2026-06-30", 72_000_000)
     periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
     rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
-    fcf_row = next(r for r in rows if r["canonical"] == "free_cash_flow")
-    q2_2026_cell = next(c for c in fcf_row["cells"] if c["period_end"] == "2026-06-30")
+    capex_row = next(r for r in rows if r["canonical"] == "capex")
+    q2_2026_cell = next(c for c in capex_row["cells"] if c["period_end"] == "2026-06-30")
     # YoY base is 800M, comfortably above 10% of this row's own median --
     # NOT flagged. Confirms n/m is computed independently for YoY, not
     # just copied from the sequential flag (whose own base, 700M, is also
@@ -1186,63 +1188,55 @@ def test_blank_cell_cause_is_gap_when_the_concept_is_tagged_elsewhere_but_not_th
     assert ppe_row["cells"][1]["value"] == 50_000_000_000
 
 
-def test_blank_cell_cause_is_gap_for_a_cash_flow_metric_neither_filed_nor_derived(db_path):
-    # free_cash_flow (a METRIC_REGISTRY entry) resolved directly at
-    # period 1's true quarterly duration; for period 2, neither
-    # free_cash_flow itself nor its derived fallback (free_cash_flow_
-    # discrete) has been computed -- SPEC-008 C4 (approved 2026-08-08): a
-    # plain gap. The old "duration" cause this scenario used to produce is
-    # retired along with the mechanism (is_duration_fallback) that
-    # explained it.
-    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
-    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)
-    _insert_metric(db_path, AMZN_CIK, "free_cash_flow", "2025-01-01", "2025-03-31", 5_000_000)
-    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
-    rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
-    fcf_row = next(r for r in rows if r["canonical"] == "free_cash_flow")
-    assert fcf_row["cells"][1]["value"] is None
-    assert fcf_row["cells"][1]["blank_cause"] == "gap"
-
-
-def test_free_cash_flow_discrete_fallback_resolves_when_free_cash_flow_itself_is_absent(db_path):
-    # Mirrors cfo's own fallback test above, for free_cash_flow_discrete
-    # specifically (a METRIC_REGISTRY entry, unlike cfo/capex which are
-    # raw CONCEPT_REGISTRY facts) -- confirms the SAME merge mechanism
-    # handles a METRIC_REGISTRY primary too, not just raw concepts.
-    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
-    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)
-    _insert_metric(db_path, AMZN_CIK, "free_cash_flow", "2025-01-01", "2025-03-31", 5_000_000)
-    _insert_metric(db_path, AMZN_CIK, "free_cash_flow_discrete", "2025-04-01", "2025-06-30", 8_000_000)
-    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
-    rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
-    fcf_row = next(r for r in rows if r["canonical"] == "free_cash_flow")
-    assert fcf_row["cells"][1]["value"] == 8_000_000
-    assert fcf_row["cells"][1]["is_derived_quarter"] is True
-
-
 # --- SPEC-008-batch-1 render-batch follow-up (approved 2026-08-11) ---
 # Found live, browser-checked against batch-1's shipped data layer:
 # (1) EPS/shares built but never wired into a display list -- see
 #     dashboard/pages/financials.py and dashboard/components.py instead,
 #     this module's own rows were already correct.
 # (2) free_cash_flow moved to the very end of CASH_FLOW_LINES by item 5's
-#     rewrite -- a regression on the most-read line on the page.
+#     rewrite -- a regression on the most-read line on the page. (Batch-2
+#     item 1 supersedes this again -- free_cash_flow leaves the cash flow
+#     statement entirely, see the batch-2 block below.)
 # (3) no closing figure for the investing or financing sections.
-
-
-def test_cash_flow_lines_free_cash_flow_sits_right_after_the_investing_section():
-    canonicals = [line[0] for line in data.CASH_FLOW_LINES]
-    investing_last = canonicals.index("investment_maturities")
-    net_investing_idx = canonicals.index("net_cash_investing")
-    fcf_idx = canonicals.index("free_cash_flow")
-    financing_first = canonicals.index("buybacks")
-    assert investing_last < net_investing_idx < fcf_idx < financing_first
 
 
 def test_cash_flow_lines_includes_the_two_new_section_subtotals():
     canonicals = {line[0] for line in data.CASH_FLOW_LINES}
     assert "net_cash_investing" in canonicals
     assert "net_cash_financing" in canonicals
+
+
+# --- SPEC-008-batch-2 item 1 (approved 2026-08-13): traditional statement order ---
+
+
+def test_cash_flow_lines_free_cash_flow_removed_it_now_lives_on_key_metrics(db_path):
+    canonicals = {line[0] for line in data.CASH_FLOW_LINES}
+    assert "free_cash_flow" not in canonicals
+
+
+def test_cash_flow_lines_operating_section_ends_with_its_own_subtotal():
+    # Traditional order: net_income opens the operating section, cfo (its
+    # subtotal) closes it -- the reverse of SPEC-008 C4's original layout.
+    canonicals = [line[0] for line in data.CASH_FLOW_LINES]
+    assert canonicals[0] == "net_income"
+    operating_inputs_last = canonicals.index("payables_change")
+    cfo_idx = canonicals.index("cfo")
+    investing_first = canonicals.index("capex")
+    assert operating_inputs_last < cfo_idx < investing_first
+
+
+def test_cash_flow_lines_investing_and_financing_sections_end_with_their_own_subtotal():
+    canonicals = [line[0] for line in data.CASH_FLOW_LINES]
+    assert canonicals.index("investment_maturities") < canonicals.index("net_cash_investing") < canonicals.index("buybacks")
+    assert (
+        canonicals.index("finance_lease_principal_paid") < canonicals.index("net_cash_financing")
+        < canonicals.index("fx_effect_on_cash")
+    )
+
+
+def test_cash_flow_lines_ends_with_the_reconciliation_including_beginning_and_ending_cash():
+    canonicals = [line[0] for line in data.CASH_FLOW_LINES]
+    assert canonicals[-4:] == ["fx_effect_on_cash", "net_change_in_cash", "cash_beginning", "cash"]
 
 
 def test_cash_flow_table_resolves_net_cash_investing_filed_directly(db_path):
@@ -1254,7 +1248,7 @@ def test_cash_flow_table_resolves_net_cash_investing_filed_directly(db_path):
     periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
     rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
     row = next(r for r in rows if r["canonical"] == "net_cash_investing")
-    assert row["label"] == "Net cash used in investing"
+    assert row["label"] == "Net cash used in investing activities"
     assert row["cells"][0]["value"] == -12_000_000_000.0
     assert row["cells"][0].get("is_derived_quarter") is not True
 
@@ -1265,9 +1259,86 @@ def test_cash_flow_table_resolves_net_cash_financing_via_discrete_fallback(db_pa
     periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
     rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
     row = next(r for r in rows if r["canonical"] == "net_cash_financing")
-    assert row["label"] == "Net cash from financing"
+    assert row["label"] == "Net cash provided by (used in) financing activities"
     assert row["cells"][0]["value"] == -3_000_000_000.0
     assert row["cells"][0]["is_derived_quarter"] is True
+
+
+def test_cash_flow_table_cfo_now_carries_the_operating_subtotal_label(db_path):
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "NetCashProvidedByUsedInOperatingActivities", "2025-03-31",
+        10_000_000, period_start="2025-01-01",
+    )
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
+    cfo_row = next(r for r in rows if r["canonical"] == "cfo")
+    assert cfo_row["label"] == "Net cash provided by operating activities"
+
+
+def test_cash_flow_table_net_income_resolves_via_the_income_statements_own_canonical(db_path):
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_xbrl_fact(db_path, AMZN_CIK, "NetIncomeLoss", "2025-03-31", 7_000_000, period_start="2025-01-01")
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
+    row = next(r for r in rows if r["canonical"] == "net_income")
+    assert row["label"] == "Net income"
+    assert row["cells"][0]["value"] == 7_000_000.0
+
+
+def test_cash_flow_table_cash_at_end_of_period_reuses_the_balance_sheets_cash_concept(db_path):
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_xbrl_fact(db_path, AMZN_CIK, "CashAndCashEquivalentsAtCarryingValue", "2025-03-31", 9_000_000)
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
+    ending_rows = [r for r in rows if r["canonical"] == "cash"]
+    assert len(ending_rows) == 1
+    assert ending_rows[0]["label"] == "Cash at end of period"
+    assert ending_rows[0]["cells"][0]["value"] == 9_000_000.0
+    assert ending_rows[0]["cells"][0].get("is_derived_quarter") is not True
+
+
+def test_cash_flow_table_cash_at_beginning_of_period_resolves_one_day_before_period_start(db_path):
+    # Confirmed against the real corpus: a duration fact's period_start is
+    # one calendar day after the prior instant's own date -- Q2 2025
+    # (start=2025-04-01) reads the `cash` instant filed at 2025-03-31.
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)
+    _insert_xbrl_fact(db_path, AMZN_CIK, "CashAndCashEquivalentsAtCarryingValue", "2025-03-31", 6_000_000)
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
+    row = next(r for r in rows if r["canonical"] == "cash_beginning")
+    assert row["label"] == "Cash at beginning of period"
+    assert row["cells"][0]["value"] == 6_000_000.0
+    # A real filed number at an adjacent instant, not an arithmetic
+    # derivation -- must NOT carry the derived-quarter marker.
+    assert row["cells"][0].get("is_derived_quarter") is not True
+
+
+def test_cash_flow_table_cash_at_beginning_of_period_stays_blank_when_the_prior_instant_is_missing(db_path):
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)
+    # No CashAndCashEquivalentsAtCarryingValue fact at all -- neither at
+    # 2025-03-31 nor anywhere else.
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
+    row = next(r for r in rows if r["canonical"] == "cash_beginning")
+    assert row["cells"][0]["value"] is None
+    assert row["cells"][0]["blank_cause"] == "gap"
+
+
+def test_cash_flow_table_cash_beginning_and_ending_get_growth_and_yoy_like_any_other_cell(db_path):
+    _insert_filing(db_path, "acc-q1-2025", form_type="10-Q", period_end="2025-03-31", fiscal_year=2025, fiscal_period="Q1")
+    _insert_filing(db_path, "acc-q2-2025", form_type="10-Q", period_end="2025-06-30", fiscal_year=2025, fiscal_period="Q2")
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-04-01", "2025-06-30", 0.5)
+    _insert_xbrl_fact(db_path, AMZN_CIK, "CashAndCashEquivalentsAtCarryingValue", "2025-03-31", 100_000_000)
+    _insert_xbrl_fact(
+        db_path, AMZN_CIK, "CashAndCashEquivalentsAtCarryingValue", "2025-06-30", 150_000_000,
+        accession_no="acc-fact-2",
+    )
+    periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
+    ending_row = next(r for r in rows if r["canonical"] == "cash")
+    assert ending_row["cells"][1]["growth_pct"] == pytest.approx(0.5)
 
 
 # --- SPEC-008-batch-1 item 6 (approved 2026-08-09): EPS and share counts ---

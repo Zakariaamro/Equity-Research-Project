@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import statistics
+from datetime import date, timedelta
 from pathlib import Path
 
 import streamlit as st
@@ -466,27 +467,32 @@ BALANCE_SHEET_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
     ("retained_earnings", "Retained earnings (accumulated deficit)", None, None),
 )
 CASH_FLOW_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
-    # SPEC-008 C4 (approved 2026-08-08): `fallback_label == label` on every
-    # one of these is what tells `_resolve_line_across_periods` to MERGE
-    # into one row instead of splitting into two (ppe_net's own fallback,
-    # below in BALANCE_SHEET_LINES, has a genuinely different label and
-    # keeps the two-row behaviour) -- these are the SAME accounting
-    # concept, filed directly or derived by subtraction, never two
-    # different things worth showing side by side.
-    ("cfo", "Cash from operations", "cfo_discrete", "Cash from operations"),
-    ("sbc", "Stock-based compensation", "sbc_discrete", "Stock-based compensation"),
+    # SPEC-008-batch-2 item 1 (approved 2026-08-13): TRADITIONAL statement
+    # order -- a real filed cash flow statement builds UP to each section's
+    # subtotal, it doesn't open with the result. `cfo` used to sit first
+    # (SPEC-008 C4); it moves to the end of the operating section here,
+    # relabelled to match what it actually is ("Net cash provided by
+    # operating activities"), same canonical and same filed/derived
+    # resolution, only its position and label change.
+    #
+    # `fallback_label == label` on every one of these still means MERGE
+    # (SPEC-008 C4 item 3): the SAME accounting concept, filed directly or
+    # derived by subtraction, never two different things shown side by
+    # side. `net_income` reuses the income statement's OWN canonical and
+    # `_discrete` fallback -- no new registry work, same discipline as
+    # every line below it.
+    ("net_income", "Net income", "net_income_discrete", "Net income"),
     ("dep_amort", "Depreciation and amortization", "dep_amort_discrete", "Depreciation and amortization"),
-    # SPEC-008-batch-1 item 5 (approved 2026-08-09): the three-section
-    # statement. Ordered Operating / Investing / Financing / Reconciliation
-    # to match a real cash flow statement's own layout, not registry
-    # insertion order -- a page composing this list is free to insert
-    # subtotal rows between sections; this module only orders the lines
-    # themselves.
+    ("sbc", "Stock-based compensation", "sbc_discrete", "Stock-based compensation"),
+    ("deferred_tax", "Deferred income tax", "deferred_tax_discrete", "Deferred income tax"),
+    ("other_noncash", "Other non-cash adjustments", "other_noncash_discrete", "Other non-cash adjustments"),
     ("receivables_change", "Change in receivables", "receivables_change_discrete", "Change in receivables"),
     ("inventory_change", "Change in inventory", "inventory_change_discrete", "Change in inventory"),
     ("payables_change", "Change in payables", "payables_change_discrete", "Change in payables"),
-    ("deferred_tax", "Deferred income tax", "deferred_tax_discrete", "Deferred income tax"),
-    ("other_noncash", "Other non-cash adjustments", "other_noncash_discrete", "Other non-cash adjustments"),
+    (
+        "cfo", "Net cash provided by operating activities",
+        "cfo_discrete", "Net cash provided by operating activities",
+    ),
     ("capex", "Capital expenditure", "capex_discrete", "Capital expenditure"),
     ("acquisitions", "Acquisitions, net of cash acquired", "acquisitions_discrete", "Acquisitions, net of cash acquired"),
     (
@@ -494,26 +500,19 @@ CASH_FLOW_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
         "investment_purchases_discrete", "Purchases of investments",
     ),
     (
-        "investment_maturities", "Maturities/sales of investments",
-        "investment_maturities_discrete", "Maturities/sales of investments",
+        "investment_maturities", "Maturities and sales of investments",
+        "investment_maturities_discrete", "Maturities and sales of investments",
     ),
-    # SPEC-008-batch-1 render-batch follow-up item 3 (approved 2026-08-11):
-    # the investing section's own closing figure -- filed directly, never
-    # summed from the four lines above it (checked against the real corpus
-    # and rejected, see net_cash_investing's ConceptInput comment in
-    # edgar/config.py: our four tracked investing lines reconstruct the
-    # filed total within 5% for AMZN in only 12/13 periods and for MU in
-    # 0/7, so summing them would misrepresent the section for at least one
-    # company).
-    ("net_cash_investing", "Net cash used in investing", "net_cash_investing_discrete", "Net cash used in investing"),
-    # Render-batch follow-up item 2 (approved 2026-08-11): restored after a
-    # regression -- item 5's rewrite moved this to the very end of the
-    # tuple (after the reconciliation section), which pushed the single
-    # most-read line on the page out of view. Placed here, immediately
-    # after the investing section's own closing figure, because free cash
-    # flow spans both operating (cfo) and investing (capex) -- it belongs
-    # to neither section alone.
-    ("free_cash_flow", "Free cash flow", "free_cash_flow_discrete", "Free cash flow"),
+    # Checked against the real corpus and REJECTED, per the spec's own
+    # explicit warning: summing this section's own four lines above
+    # reconstructed Micron's filed investing total 0 times out of 7 (see
+    # the render-batch follow-up commit) -- this subtotal resolves ONLY
+    # filed-or-discrete-subtraction, same as every line above it, never a
+    # sum of this project's own tracked components.
+    (
+        "net_cash_investing", "Net cash used in investing activities",
+        "net_cash_investing_discrete", "Net cash used in investing activities",
+    ),
     ("buybacks", "Share repurchases", "buybacks_discrete", "Share repurchases"),
     ("dividends_paid", "Dividends paid", "dividends_paid_discrete", "Dividends paid"),
     ("debt_issued", "Debt issued", "debt_issued_discrete", "Debt issued"),
@@ -522,12 +521,27 @@ CASH_FLOW_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
         "finance_lease_principal_paid", "Finance lease principal paid",
         "finance_lease_principal_paid_discrete", "Finance lease principal paid",
     ),
-    # The financing section's own closing figure -- same rationale as
-    # net_cash_investing above, not separately re-checked (this project
-    # tracks an even narrower slice of financing activity).
-    ("net_cash_financing", "Net cash from financing", "net_cash_financing_discrete", "Net cash from financing"),
+    (
+        "net_cash_financing", "Net cash provided by (used in) financing activities",
+        "net_cash_financing_discrete", "Net cash provided by (used in) financing activities",
+    ),
     ("fx_effect_on_cash", "Effect of exchange rates on cash", "fx_effect_on_cash_discrete", "Effect of exchange rates on cash"),
     ("net_change_in_cash", "Net change in cash", "net_change_in_cash_discrete", "Net change in cash"),
+    # New (item 1). "Cash at end of period" reuses the BALANCE SHEET'S OWN
+    # `cash` canonical directly -- the SAME instant fact at this column's
+    # period_end, not a new concept to curate (a period's ending cash IS
+    # the balance sheet's cash line at that date). No fallback: this is
+    # always the filed figure or nothing, never derived.
+    #
+    # "Cash at beginning of period" has no CONCEPT_REGISTRY entry at all --
+    # it is patched by _derive_cash_beginning_from_prior_instant below,
+    # which resolves the SAME `cash` canonical one calendar day before
+    # this column's period_start (confirmed against the real corpus: a
+    # duration fact's `start` is consistently one day after the prior
+    # instant's `end`, for all three companies -- an XBRL filing
+    # convention, not a fiscal-calendar guess).
+    ("cash_beginning", "Cash at beginning of period", None, None),
+    ("cash", "Cash at end of period", None, None),
 )
 
 
@@ -1096,6 +1110,7 @@ def _statement_table(
         )
     _derive_gross_profit_from_components(rows, fiscal_labels)
     _derive_total_liabilities_from_components(rows, fiscal_labels)
+    _derive_cash_beginning_from_prior_instant(rows, effective_periods, cik, db_path, fiscal_labels)
     return rows
 
 
@@ -1200,6 +1215,57 @@ def _derive_total_liabilities_from_components(rows: list[dict], fiscal_labels: d
     if patched:
         _finalize_statement_row(
             liabilities_row["label"], liabilities_row["canonical"], liabilities_row["cells"], fiscal_labels
+        )
+
+
+def _derive_cash_beginning_from_prior_instant(
+    rows: list[dict],
+    effective_periods: list[tuple[str | None, str]],
+    cik: str,
+    db_path: Path,
+    fiscal_labels: dict[str, tuple[int, str]],
+) -> None:
+    """SPEC-008-batch-2 item 1 (approved 2026-08-13): "cash at beginning of
+    period" is not a new duration concept to curate -- it is the SAME
+    instant fact `cash` already carries (the balance sheet's own line, and
+    this table's own "Cash at end of period" row), read at the date ONE
+    CALENDAR DAY before this column's period_start.
+
+    Checked against the real corpus before writing this, not assumed: a
+    duration fact's `start` date is consistently one day after the PRIOR
+    instant's `end` date, for all three companies (AMZN Q2 2025:
+    start=2025-04-01, prior instant end=2025-03-31; NVDA and MU confirmed
+    the same pattern across six consecutive fiscal years each) -- an XBRL
+    filing convention (duration contexts are start-inclusive, instant
+    contexts are point-in-time), not a fiscal-calendar guess. This is a
+    DIFFERENT kind of lookup than `_derive_gross_profit_from_components`/
+    `_derive_total_liabilities_from_components` above: no arithmetic runs
+    on the value at all, so a patched cell here does NOT get
+    `is_derived_quarter` -- that marker means "this project computed a
+    number the filer didn't file"; this number is the filer's own, at the
+    exact instant XBRL itself uses to represent it. A no-op for any table
+    without a `cash_beginning` row (income statement, balance sheet,
+    EPS/shares, key metrics)."""
+    beginning_row = next((r for r in rows if r["canonical"] == "cash_beginning"), None)
+    if beginning_row is None:
+        return
+
+    patched = False
+    for cell, (period_start, _period_end) in zip(beginning_row["cells"], effective_periods):
+        if cell["value"] is not None or period_start is None:
+            continue
+        prior_instant = (date.fromisoformat(period_start) - timedelta(days=1)).isoformat()
+        value = _resolve_statement_line_value(cik, "cash", None, prior_instant, db_path)
+        if value is None:
+            continue
+        cell["value"] = value
+        cell.pop("blank_cause", None)
+        cell.pop("blank_reason", None)
+        patched = True
+
+    if patched:
+        _finalize_statement_row(
+            beginning_row["label"], beginning_row["canonical"], beginning_row["cells"], fiscal_labels
         )
 
 
