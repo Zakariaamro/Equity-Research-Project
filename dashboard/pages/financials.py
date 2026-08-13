@@ -41,7 +41,12 @@ def _render_summary(cik: str, ticker: str, period_start: str, period_end: str) -
             header += f", {line_duration_label} period"
         if note:
             header += f" ({note})"
-        st.markdown(header)
+        # SPEC-008-batch-3 item 3 (approved 2026-08-14): "($m)" is a
+        # literal '$' reaching st.markdown -- the D1 currency/LaTeX bug's
+        # exact shape (Streamlit's markdown treats `$...$` as inline LaTeX
+        # math mode), caught by the widened guard in
+        # tests/test_dashboard_structure.py before this fix landed.
+        st.markdown(fmt.escape_markdown_currency(header))
         values = data.get_statement_line_values(cik, line_period_start, period_end, lines)
         for row in values:
             if row["value"] is None:
@@ -131,7 +136,15 @@ def _render_table(cik: str, ticker: str) -> None:
     )
     # Key metrics is the one statement not uniformly $m -- see _KEY_METRICS_CAPTION.
     unit_caption = _KEY_METRICS_CAPTION if statement == "Key metrics" else "$m"
-    st.caption(f"{unit_caption}, {duration_label} periods" if duration_label else unit_caption)
+    # SPEC-008-batch-3 item 3 (approved 2026-08-14): the reported bug --
+    # _KEY_METRICS_CAPTION's two literal '$' characters reached st.caption
+    # unescaped, and Streamlit's markdown swallowed the span between them
+    # into LaTeX math mode (D1, a second time). Caught by the widened
+    # guard in tests/test_dashboard_structure.py before this fix landed;
+    # "$m" (the other branch) carries the same class of bug and is
+    # escaped here too, not just the reported instance.
+    caption = f"{unit_caption}, {duration_label} periods" if duration_label else unit_caption
+    st.caption(fmt.escape_markdown_currency(caption))
 
     rows = _STATEMENT_TABLE_FUNCS[statement](cik, periods, ticker)
     components.statement_table(rows, periods, show_growth, key=f"{ticker}_{statement}")

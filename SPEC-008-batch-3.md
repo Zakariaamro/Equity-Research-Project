@@ -108,6 +108,36 @@ Two parts:
 
 This is the second occurrence of one defect. The fix is the guard, not the instance.
 
+### Resolution (implemented 2026-08-14)
+
+Widened `tests/test_dashboard_structure.py`'s guard to a new, general check
+(`test_no_unescaped_currency_reaches_streamlit_markdown`) covering `components.py` AND
+every file under `dashboard/pages/`, and general across *how* a `$` reaches a render call
+— not just a literal directly in the call, but a module-level constant reached only
+through a local variable, an f-string, or a ternary branch (the caption bug's exact
+shape: `_KEY_METRICS_CAPTION` never appears as a literal at the `st.caption(...)` call
+site itself, only via `unit_caption`). Kept the old, narrower
+`test_narrative_renderers_use_the_escaping_wrapper` alongside it rather than replacing it
+— it guards a different, still-real case the new one structurally can't: `brief_sentence`
+etc. render arbitrary DB-generated prose (`sentence["text"]`, a Subscript, not a resolvable
+literal or constant), so the general check has nothing to statically resolve there and
+would pass silently even if the wrapper were bypassed; the old check forbids the raw call
+by function name regardless of content.
+
+**Confirmed the widened test actually caught the bug before fixing anything**, per the
+instruction: run against the pre-fix source, it failed with two findings —
+`financials.py:134: 'EPS in $ (2dp), shares and cash-flow figures in millions ($m), tax
+rate in %'` (the reported bug) and `financials.py:44: '** ($m)'` (the Summary tab's own
+section header, same defect, not previously reported — found by the guard itself, not a
+human).
+
+Fixed both by wrapping the final string in `fmt.escape_markdown_currency(...)` at the
+`st.markdown`/`st.caption` call site (this project's established pattern — escape at the
+render boundary, never by editing the stored text) rather than hand-escaping the string
+literals. Also fixed the caption's OTHER branch (plain `"$m"`, same class of bug, not
+itself flagged as a separate finding since the guard reports one offender per call and
+both branches share one call site) while in there.
+
 ---
 
 ## Item 4 — Right-align numbers, parentheses for negatives
