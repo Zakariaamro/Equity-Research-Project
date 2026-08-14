@@ -801,6 +801,51 @@ def test_statement_table_column_headers_lead_with_the_fiscal_label_date_moves_to
     assert column_config[col_key]["help"] == col_key  # the calendar date, secondary, in the tooltip
 
 
+def test_statement_table_widens_the_line_item_column_past_the_longest_real_label():
+    # SPEC-008-batch-3 item 6 (approved 2026-08-14): no explicit width
+    # meant "sized to fit the cell contents" per column_config's own docs,
+    # but the grid still shows a single-line, ellipsis-truncated cell past
+    # whatever width that produced -- this is what "Property, plant and
+    # equipment and…" was. An explicit, generously-sized width fixes it;
+    # confirms the actual column_config value, not just that SOME width
+    # was set.
+    import json
+
+    def script(rows, periods):
+        from dashboard import components
+
+        components.statement_table(rows, periods, show_growth=False, key="t")
+
+    rows, periods = _table_fixture(with_growth=False)
+    at = AppTest.from_function(script, kwargs={"rows": rows, "periods": periods})
+    at.run()
+    assert at.exception == []
+    column_config = json.loads(at.dataframe[0].proto.columns)
+    assert column_config[components._LINE_ITEM_COL]["width"] == components._LINE_ITEM_COL_WIDTH_PX
+    # Wide enough for the real registry's own longest label, not just an
+    # arbitrary bigger number -- proves the width was actually SIZED to
+    # something, not picked blind.
+    longest_real_label = "Property, plant and equipment and finance-lease ROU assets, net"
+    assert components._LINE_ITEM_COL_WIDTH_PX > len(longest_real_label) * 7  # rough px-per-character floor
+
+
+def test_statement_table_period_columns_are_wider_than_the_old_75px_default():
+    import json
+
+    def script(rows, periods):
+        from dashboard import components
+
+        components.statement_table(rows, periods, show_growth=False, key="t")
+
+    rows, periods = _table_fixture(with_growth=False)
+    at = AppTest.from_function(script, kwargs={"rows": rows, "periods": periods})
+    at.run()
+    assert at.exception == []
+    column_config = json.loads(at.dataframe[0].proto.columns)
+    assert column_config[_col("2025-06-30")]["width"] == components._PERIOD_COL_WIDTH_PX
+    assert components._PERIOD_COL_WIDTH_PX > 75
+
+
 def test_statement_table_style_bolds_subtotal_rows():
     # SPEC-008-batch-3 item 1 (approved 2026-08-13): font-weight is the
     # confirmed-safe Styler property (unlike padding, used for the

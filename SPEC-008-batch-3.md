@@ -233,6 +233,31 @@ Both are cut mid-word today:
 Widen the label column, wrap, or add a tooltip carrying the full text. A truncated line item
 on a financial statement is a line item a reader can't identify.
 
+### Resolution (implemented 2026-08-14)
+
+Checked before choosing: `column_config`'s own docs (read directly) say a column with no
+explicit `width` is "sized to fit the cell contents" — true, but the grid still renders a
+single-line, ellipsis-truncated cell past whatever width that produces, and text columns
+expose no wrap option at all (checked the installed 1.60.0's own `column_types.py`
+directly — `alignment` exists, nothing for wrapping). That rules out "wrap" as an option
+here; went with "widen" instead, sized from the real registry rather than guessed: the
+longest label across every statement is *"Property, plant and equipment and finance-lease
+ROU assets, net"* (63 characters). The line-item column now gets an explicit 520px width
+(`"large"` is only 400px, read from the same source — none of `small`/`medium`/`large`
+fits this project's own worst case). Period columns bumped from the old 75px default to
+100px too, cheap insurance for formatted values that run longer than the fiscal-label
+header sitting above them.
+
+Item 5's header fix does fully resolve the *header* half on its own, as its own text
+predicted — `FY2025`/`Q3 FY26` are 6-7 characters, comfortably inside even the old 75px.
+This item's own width increase is really about the *line-item label* half, which item 5
+never touched.
+
+**Caveat, stated plainly**: 520px is a generous, rounded-up estimate at typical UI-font
+metrics for the worst-case label, not a browser-measured exact fit. This batch's own
+opening line is right that a screenshot is the only thing that can confirm it precisely —
+that's the next pass's job, not something achievable from here.
+
 ---
 
 ## Item 7 — Column scroll position — settle it

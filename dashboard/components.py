@@ -229,6 +229,32 @@ _ROW_HEIGHT_PX = 35
 _HEADER_HEIGHT_PX = 38
 _MAX_TABLE_HEIGHT_PX = 700
 
+# SPEC-008-batch-3 item 6 (approved 2026-08-14): `column_config`'s own
+# docs (read directly, not assumed) say a column with no explicit `width`
+# is "sized to fit the cell contents" -- true in spirit, but the grid
+# still shows a single-line, ellipsis-truncated cell past whatever width
+# it lands on (`column_config` has no wrap option at all -- checked; text
+# columns support `alignment` but nothing for wrapping), which is exactly
+# what was happening to the line-item column ("Property, plant and
+# equipment and…"). `"small"`/`"medium"`/`"large"` are 75/200/400px
+# (also read from the installed 1.60.0's own docstring, not guessed);
+# none of the three fits this project's own longest label. Sized instead
+# from the real registry: the longest label across every statement is
+# "Property, plant and equipment and finance-lease ROU assets, net" (63
+# characters), and a subtotal row (item 1) adds a further 4-space indent
+# on top of that for ITS OWN longest label -- 520px is a generous,
+# rounded-up estimate at typical UI-font metrics for the worst case, not
+# a browser-measured exact fit; the browser pass this batch defers to is
+# the one thing that can confirm it precisely.
+_LINE_ITEM_COL_WIDTH_PX = 520
+# "small" (75px) already comfortably fits every fiscal-label header item
+# 5 produces (FY2025, Q3 FY26 -- 6-7 characters) by the same rough
+# metric; widened modestly anyway as cheap insurance for the longer
+# formatted VALUES this same column width also governs (a derived,
+# parenthesized figure like "(123,456) †" runs longer than the header
+# text sitting above it).
+_PERIOD_COL_WIDTH_PX = 100
+
 # SPEC-008-batch-1 render-batch follow-up item 1 (approved 2026-08-11): item
 # 6's own note ("units and formatting are explicitly NOT implemented in this
 # batch") blocked wiring EPS/shares into this table at all -- correct then,
@@ -466,7 +492,9 @@ def statement_table(rows: list[dict], periods: list[dict], show_growth: bool, ke
     # its own signature rather than assumed -- no Styler CSS needed for
     # this one.
     column_config = {
-        _LINE_ITEM_COL: st.column_config.TextColumn(_LINE_ITEM_COL, pinned=True, alignment="left"),
+        _LINE_ITEM_COL: st.column_config.TextColumn(
+            _LINE_ITEM_COL, pinned=True, alignment="left", width=_LINE_ITEM_COL_WIDTH_PX,
+        ),
     }
     # SPEC-008-batch-3 item 5 (approved 2026-08-14): `col_name` (the actual
     # DataFrame column key, `fmt.format_date`'s output) is unchanged and
@@ -475,7 +503,7 @@ def statement_table(rows: list[dict], periods: list[dict], show_growth: bool, ke
     # this column's own tooltip (`help`) rather than dropped.
     for col_name, period in zip(period_cols, periods):
         column_config[col_name] = st.column_config.TextColumn(
-            _fiscal_column_label(period), width="small", alignment="right", help=col_name,
+            _fiscal_column_label(period), width=_PERIOD_COL_WIDTH_PX, alignment="right", help=col_name,
         )
 
     height = min(_HEADER_HEIGHT_PX + _ROW_HEIGHT_PX * len(table_rows), _MAX_TABLE_HEIGHT_PX)
