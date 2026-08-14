@@ -573,6 +573,28 @@ def test_get_statement_periods_orders_oldest_to_newest_and_filters_by_basis(db_p
     assert [p["period_end"] for p in annual] == ["2024-12-31"]
 
 
+def test_get_statement_periods_carries_fiscal_year_and_period_from_filings(db_path):
+    # SPEC-008-batch-3 item 5 (approved 2026-08-14): the render layer's
+    # column headers need fiscal_year/fiscal_period straight from
+    # `filings` -- never computed from the date -- to lead with FY2025/
+    # Q3 FY26 instead of a bare calendar date.
+    _insert_filing(db_path, "acc-q1-2025", form_type="10-Q", period_end="2025-03-31", fiscal_year=2025, fiscal_period="Q1")
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    quarterly = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    period = next(p for p in quarterly if p["period_end"] == "2025-03-31")
+    assert period["fiscal_year"] == 2025
+    assert period["fiscal_period"] == "Q1"
+
+
+def test_get_statement_periods_fails_closed_when_no_filing_carries_a_fiscal_label(db_path):
+    _insert_metric(db_path, AMZN_CIK, "gross_margin", "2025-01-01", "2025-03-31", 0.5)
+    # No filings row at all for this period.
+    quarterly = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
+    period = next(p for p in quarterly if p["period_end"] == "2025-03-31")
+    assert period["fiscal_year"] is None
+    assert period["fiscal_period"] is None
+
+
 def test_growth_pct_computes_period_over_period_change():
     assert data._growth_pct(100.0, 110.0) == pytest.approx(0.10)
     assert data._growth_pct(100.0, 90.0) == pytest.approx(-0.10)

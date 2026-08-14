@@ -194,6 +194,31 @@ its annual columns look like an inconsistent date series rather than FY2017 thro
 `filings.fiscal_year` / `fiscal_period` already carry this — the same fields the
 discrete-quarter work used. Do not compute the fiscal label from dates.
 
+### Resolution (implemented 2026-08-14)
+
+`data.get_statement_periods` now attaches `fiscal_year`/`fiscal_period` to every period
+dict, from `_fiscal_labels` (the same `filings`-sourced lookup D13's YoY comparison and
+the discrete-quarter mechanism already use) — never computed from the date, and `None`
+when no filing on record carries a label for that period (fails closed to the calendar
+date alone). `components._fiscal_column_label` builds the header text from those two
+fields; the calendar date moves to the column's own `help` tooltip rather than being
+dropped, matching "calendar date secondary."
+
+Micron's own worked example, checked against the real corpus: `FY2019`/`FY2020` for
+`Aug 29, 2019`/`Sep 3, 2020` — reads as the consecutive fiscal years they are.
+
+**Found live, not in the spec's own text**: this project's fiscal-period vocabulary has no
+separate "Q4" value — the filing that reports the fourth quarter *is* the annual 10-K, so
+`filings.fiscal_period` is `"FY"` for both a genuinely annual-duration period and a
+genuinely quarterly-duration one landing at fiscal year end (confirmed against real NVDA
+data: `2026-01-25` is duration-classified `"quarterly"`, sitting right after `Q1 FY26`/
+`Q2 FY26`/`Q3 FY26`, with `fiscal_period` `"FY"` from the same 10-K that also carries the
+annual figures). Labelling it `FY2026` there — correct on the annual basis — would have
+read as a stray annual total dropped into a row of quarters. Disambiguated using the
+period's own duration (already available, no new lookup): `"FY2026"` on the annual basis,
+`"Q4 FY26"` on the quarterly basis, for the exact same underlying `(fiscal_year,
+fiscal_period)` pair.
+
 ---
 
 ## Item 6 — Stop truncating labels and headers

@@ -716,6 +716,91 @@ def test_statement_table_period_columns_are_right_aligned_line_item_column_stays
     assert column_config[_col("2025-06-30")]["alignment"] == "right"
 
 
+def test_fiscal_column_label_annual_leads_with_fy_and_year():
+    # SPEC-008-batch-3 item 5 (approved 2026-08-14). A genuine 365-day
+    # annual duration -- period_start matters here (see the Q4-vs-annual
+    # disambiguation test below), so it's included even though this case
+    # doesn't exercise that branch.
+    period = {
+        "period_start": "2025-01-01", "period_end": "2025-12-31",
+        "fiscal_year": 2025, "fiscal_period": "FY",
+    }
+    assert components._fiscal_column_label(period) == "FY2025"
+
+
+def test_fiscal_column_label_quarterly_leads_with_quarter_and_two_digit_year():
+    period = {
+        "period_start": "2025-10-27", "period_end": "2026-01-25",
+        "fiscal_year": 2026, "fiscal_period": "Q3",
+    }
+    assert components._fiscal_column_label(period) == "Q3 FY26"
+
+
+def test_fiscal_column_label_disambiguates_fy_between_annual_total_and_fourth_quarter():
+    # Found live against real NVDA data while checking this item: this
+    # project's own fiscal-period vocabulary has no separate "Q4" value --
+    # the filing that reports the fourth quarter IS the annual 10-K, so
+    # `filings.fiscal_period` is "FY" for BOTH a genuinely annual-duration
+    # period and a genuinely quarterly-duration one landing at fiscal year
+    # end. Duration (from period_start/period_end) is what disambiguates
+    # them -- the SAME fiscal_year/fiscal_period pair reads differently
+    # depending on which table column it's in.
+    annual = components._fiscal_column_label(
+        {"period_start": "2025-01-27", "period_end": "2026-01-25", "fiscal_year": 2026, "fiscal_period": "FY"}
+    )
+    quarterly = components._fiscal_column_label(
+        {"period_start": "2025-10-27", "period_end": "2026-01-25", "fiscal_year": 2026, "fiscal_period": "FY"}
+    )
+    assert annual == "FY2026"
+    assert quarterly == "Q4 FY26"
+
+
+def test_fiscal_column_label_micron_consecutive_fiscal_years_read_as_such():
+    # The item's own worked example: Micron's floating fiscal year-end
+    # (late August one year, early September the next) makes "Sep 3, 2020"
+    # and "Aug 29, 2019" look like an inconsistent date series with
+    # nothing on screen saying they're consecutive fiscal years.
+    fy2019 = components._fiscal_column_label(
+        {"period_start": "2018-08-30", "period_end": "2019-08-29", "fiscal_year": 2019, "fiscal_period": "FY"}
+    )
+    fy2020 = components._fiscal_column_label(
+        {"period_start": "2019-08-30", "period_end": "2020-09-03", "fiscal_year": 2020, "fiscal_period": "FY"}
+    )
+    assert (fy2019, fy2020) == ("FY2019", "FY2020")
+
+
+def test_fiscal_column_label_fails_closed_to_the_calendar_date_when_no_fiscal_label_on_record():
+    # data.get_statement_periods sets fiscal_year/fiscal_period to None
+    # when no filing on record carries a label for this period -- never a
+    # guessed year, the calendar date alone instead.
+    period = {"period_end": "2025-12-31", "fiscal_year": None, "fiscal_period": None}
+    assert components._fiscal_column_label(period) == fmt_module.format_date("2025-12-31")
+
+
+def test_statement_table_column_headers_lead_with_the_fiscal_label_date_moves_to_the_tooltip():
+    import json
+
+    def script(rows, periods):
+        from dashboard import components
+
+        components.statement_table(rows, periods, show_growth=False, key="t")
+
+    periods = [{"period_end": "2026-01-25", "fiscal_year": 2026, "fiscal_period": "Q3"}]
+    rows = [
+        {
+            "label": "Revenue", "canonical": "revenue",
+            "cells": [{"period_end": "2026-01-25", "value": 100_000_000, "is_derived_quarter": False}],
+        },
+    ]
+    at = AppTest.from_function(script, kwargs={"rows": rows, "periods": periods})
+    at.run()
+    assert at.exception == []
+    column_config = json.loads(at.dataframe[0].proto.columns)
+    col_key = _col("2026-01-25")  # the DataFrame's own column key is unchanged, still the date
+    assert column_config[col_key]["label"] == "Q3 FY26"
+    assert column_config[col_key]["help"] == col_key  # the calendar date, secondary, in the tooltip
+
+
 def test_statement_table_style_bolds_subtotal_rows():
     # SPEC-008-batch-3 item 1 (approved 2026-08-13): font-weight is the
     # confirmed-safe Styler property (unlike padding, used for the

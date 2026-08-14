@@ -786,11 +786,30 @@ def get_statement_periods(cik: str, basis: str, db_path: Path = DEFAULT_DB_PATH)
     `_CLASSES_FOR_BASIS` mapping `get_metric_series` already uses, then
     reverses it -- a table reads oldest-to-newest; a selector dropdown
     reads newest-first. One source of periods, two orderings for two
-    different UIs, not two queries."""
+    different UIs, not two queries.
+
+    SPEC-008-batch-3 item 5 (approved 2026-08-14): each period dict also
+    carries `fiscal_year`/`fiscal_period`, from `_fiscal_labels` -- the
+    SAME `filings`-table source the discrete-quarter mechanism and D13's
+    YoY lookup already use, never computed from the date. `None` for a
+    period with no filing on record carrying a fiscal label (fails closed;
+    the render layer falls back to the calendar date alone rather than
+    inventing one)."""
     all_periods = get_statement_period_ends(cik, db_path)
     allowed_classes = _CLASSES_FOR_BASIS[basis]
     filtered = [p for p in all_periods if _classify_duration(p["period_start"], p["period_end"]) in allowed_classes]
-    return list(reversed(filtered))
+    fiscal_labels = _fiscal_labels(cik, db_path)
+    with_fiscal_labels = []
+    for p in filtered:
+        label = fiscal_labels.get(p["period_end"])
+        with_fiscal_labels.append(
+            {
+                **p,
+                "fiscal_year": label[0] if label else None,
+                "fiscal_period": label[1] if label else None,
+            }
+        )
+    return list(reversed(with_fiscal_labels))
 
 
 def _growth_pct(prior_value: float, value: float) -> float | None:

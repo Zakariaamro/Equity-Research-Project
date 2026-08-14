@@ -274,6 +274,47 @@ _SUBTOTAL_CANONICALS = {"cfo", "net_cash_investing", "net_cash_financing", "cash
 _SUBTOTAL_INDENT = "    "  # 4 spaces -- costs whitespace, not rows, per the item's own framing
 
 
+def _fiscal_column_label(period: dict) -> str:
+    """SPEC-008-batch-3 item 5 (approved 2026-08-14): lead with the fiscal
+    label, calendar date secondary -- the date moves to this column's own
+    `help` tooltip (see the column_config construction in `statement_table`
+    below), not dropped, just no longer primary. `fiscal_year`/
+    `fiscal_period` come straight from `period` (attached by `data.
+    get_statement_periods`, sourced from `filings`, the same table the
+    discrete-quarter mechanism and D13's YoY lookup already use) -- never
+    computed from the date, so Micron's own floating fiscal year-end
+    (`Sep 3, 2020` and `Aug 29, 2019`, consecutive fiscal years with
+    nothing on screen saying so before this item) reads as `FY2020`/
+    `FY2019` instead of an inconsistent-looking date series.
+
+    Fails closed to the calendar date alone when no filing on record
+    carries a fiscal label for this period -- never a guessed year.
+
+    Found live while checking this against real data (SPEC-008-batch-3
+    item 5, same date): this project's own fiscal-period vocabulary has
+    no separate "Q4" value at all -- the filing that reports the fourth
+    quarter IS the annual 10-K, so `filings.fiscal_period` is "FY" for
+    BOTH a genuinely annual-duration period AND a genuinely quarterly-
+    duration one that happens to fall at fiscal year end (confirmed
+    against NVDA's real data: 2026-01-25 is duration-classified
+    "quarterly", 90 days, sitting right after Q1/Q2/Q3 FY26, with
+    fiscal_period "FY" from the same 10-K that also carries the annual
+    figures). On an annual column that's correct as `FY{year}`; on a
+    quarterly column showing it the same way would read as a stray annual
+    total mixed into a row of quarters, so it's relabelled `Q4 FY{yy}`
+    there instead, matching its Q1/Q2/Q3 siblings."""
+    fiscal_year = period.get("fiscal_year")
+    fiscal_period = period.get("fiscal_period")
+    if fiscal_year is None or fiscal_period is None:
+        return fmt.format_date(period["period_end"])
+    if fiscal_period == "FY":
+        duration_class = data.get_period_duration_class(period.get("period_start"), period["period_end"])
+        if duration_class != "annual":
+            return f"Q4 FY{fiscal_year % 100:02d}"
+        return f"FY{fiscal_year}"
+    return f"{fiscal_period} FY{fiscal_year % 100:02d}"
+
+
 def _parenthesize_if_negative(text: str, value: float) -> str:
     """SPEC-008-batch-3 item 4 (approved 2026-08-14): standard financial-
     statement convention -- a negative value in parentheses, never a
@@ -427,8 +468,15 @@ def statement_table(rows: list[dict], periods: list[dict], show_growth: bool, ke
     column_config = {
         _LINE_ITEM_COL: st.column_config.TextColumn(_LINE_ITEM_COL, pinned=True, alignment="left"),
     }
-    for col_name in period_cols:
-        column_config[col_name] = st.column_config.TextColumn(col_name, width="small", alignment="right")
+    # SPEC-008-batch-3 item 5 (approved 2026-08-14): `col_name` (the actual
+    # DataFrame column key, `fmt.format_date`'s output) is unchanged and
+    # still what every cell above is keyed by -- only the column's VISIBLE
+    # `label` changes, to the fiscal label, with the calendar date moved to
+    # this column's own tooltip (`help`) rather than dropped.
+    for col_name, period in zip(period_cols, periods):
+        column_config[col_name] = st.column_config.TextColumn(
+            _fiscal_column_label(period), width="small", alignment="right", help=col_name,
+        )
 
     height = min(_HEADER_HEIGHT_PX + _ROW_HEIGHT_PX * len(table_rows), _MAX_TABLE_HEIGHT_PX)
     st.dataframe(
