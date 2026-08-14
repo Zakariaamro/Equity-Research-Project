@@ -152,6 +152,29 @@ Two conventions, both cheap, both high-leverage on how the table reads:
 
 The `-` for a missing value and `(0)` for a real negative zero must remain distinguishable.
 
+### Resolution (implemented 2026-08-14)
+
+Right-alignment uses `st.column_config.TextColumn`'s native `alignment` parameter
+(`"left"`/`"right"`) — confirmed present on the installed 1.60.0 by reading its own
+signature first, no Styler CSS needed for this one (unlike item 1's indentation, which
+needed the text-prefix workaround specifically because padding isn't on the confirmed-safe
+Styler property list — alignment is a first-class `column_config` field, a completely
+different mechanism). Applied to every period column; the line-item label column is
+explicitly `"left"` rather than left as an unstated default.
+
+Negative parentheses: a new `_parenthesize_if_negative(text, value)`, keyed off the cell's
+own raw numeric value (not by re-parsing the formatted string), applied after formatting
+and before the derived-quarter `†` suffix. Handles `fmt.format_usd_per_share`'s own
+minus-after-the-`$` placement correctly (`"$-1.50"` → `"($1.50)"`, not `"($-1.50)"`) since
+it strips the sign character rather than assuming its position.
+
+The distinguishability requirement holds by construction, not by coincidence: a blank
+cell's em-dash marker (`"—"`) is assigned before the formatter is ever called (the blank
+branch `continue`s first), so it can never reach `_parenthesize_if_negative` at all. A
+real negative value that rounds to zero at display precision does reach it — Python's own
+formatting preserves the sign on such a value (`f"{-40000/1_000_000:,.0f}"` is `"-0"`, not
+`"0"`) — and becomes `"(0)"`, visibly different from the blank marker. Tested directly.
+
 ---
 
 ## Item 5 — Fiscal labels on column headers

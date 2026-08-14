@@ -641,6 +641,81 @@ def test_statement_table_formats_fcff_tax_rate_as_a_percent():
     assert df.iloc[0][_col("2020-12-31")] == "11.8%"
 
 
+def test_parenthesize_if_negative_wraps_and_strips_the_minus_sign():
+    # SPEC-008-batch-3 item 4 (approved 2026-08-14): standard financial-
+    # statement convention. Keyed off the raw value, not by re-parsing the
+    # formatted text -- fmt.format_usd_per_share puts its own minus AFTER
+    # the "$" ("$-1.50"), and the parens must still land around the whole
+    # thing with the stray minus gone, not "($-1.50)".
+    assert components._parenthesize_if_negative("18,171", -18_171) == "(18,171)"
+    assert components._parenthesize_if_negative("$-1.50", -1.5) == "($1.50)"
+
+
+def test_parenthesize_if_negative_leaves_positive_values_and_marks_alone():
+    assert components._parenthesize_if_negative("18,171", 18_171) == "18,171"
+    assert components._parenthesize_if_negative("0", 0) == "0"
+
+
+def test_parenthesize_if_negative_produces_a_real_negative_zero_as_paren_zero():
+    # The item's own explicit requirement: "(0) for a real negative zero"
+    # must stay distinguishable from a missing value's dash. Python's own
+    # formatting preserves the sign on a value that rounds to zero at
+    # display precision ("-0", not "0") -- this is what turns THAT into
+    # "(0)", never silently "0".
+    text = fmt_module.format_usd(-40_000)  # -40,000 / 1e6 rounds to "-0" at 0dp
+    assert text == "-0"
+    assert components._parenthesize_if_negative(text, -40_000) == "(0)"
+
+
+def test_statement_table_renders_negative_values_in_parentheses_not_with_a_minus_sign():
+    def script(rows, periods):
+        from dashboard import components
+
+        components.statement_table(rows, periods, show_growth=False, key="t")
+
+    periods = [{"period_end": "2025-03-31"}, {"period_end": "2025-06-30"}, {"period_end": "2025-09-30"}]
+    rows = [
+        {
+            "label": "Net change in cash", "canonical": "net_change_in_cash",
+            "cells": [
+                {"period_end": "2025-03-31", "value": -8_821_000_000, "is_derived_quarter": False},
+                {"period_end": "2025-06-30", "value": 100_000_000, "is_derived_quarter": False},
+                {"period_end": "2025-09-30", "value": None, "is_derived_quarter": False, "blank_cause": "gap"},
+            ],
+        },
+    ]
+    at = AppTest.from_function(script, kwargs={"rows": rows, "periods": periods})
+    at.run()
+    assert at.exception == []
+    df = at.dataframe[0].value
+    assert df.iloc[0][_col("2025-03-31")] == "(8,821)"  # not "-8,821"
+    assert df.iloc[0][_col("2025-06-30")] == "100"  # positive: unaffected
+    assert df.iloc[0][_col("2025-09-30")] == "—"  # blank stays the em-dash marker, distinguishable from "(0)"
+
+
+def test_statement_table_period_columns_are_right_aligned_line_item_column_stays_left():
+    # SPEC-008-batch-3 item 4 (approved 2026-08-14): TextColumn exposes
+    # `alignment` natively in the installed 1.60.0 (confirmed against its
+    # own signature before using it) -- no Styler CSS needed. AppTest's
+    # dataframe element doesn't expose column_config as a Python object
+    # directly, but the underlying protobuf's `columns` field carries it
+    # as JSON, which is what this reads.
+    import json
+
+    def script(rows, periods):
+        from dashboard import components
+
+        components.statement_table(rows, periods, show_growth=False, key="t")
+
+    rows, periods = _table_fixture(with_growth=False)
+    at = AppTest.from_function(script, kwargs={"rows": rows, "periods": periods})
+    at.run()
+    assert at.exception == []
+    column_config = json.loads(at.dataframe[0].proto.columns)
+    assert column_config[components._LINE_ITEM_COL]["alignment"] == "left"
+    assert column_config[_col("2025-06-30")]["alignment"] == "right"
+
+
 def test_statement_table_style_bolds_subtotal_rows():
     # SPEC-008-batch-3 item 1 (approved 2026-08-13): font-weight is the
     # confirmed-safe Styler property (unlike padding, used for the

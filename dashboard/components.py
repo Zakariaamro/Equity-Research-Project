@@ -274,6 +274,32 @@ _SUBTOTAL_CANONICALS = {"cfo", "net_cash_investing", "net_cash_financing", "cash
 _SUBTOTAL_INDENT = "    "  # 4 spaces -- costs whitespace, not rows, per the item's own framing
 
 
+def _parenthesize_if_negative(text: str, value: float) -> str:
+    """SPEC-008-batch-3 item 4 (approved 2026-08-14): standard financial-
+    statement convention -- a negative value in parentheses, never a
+    leading minus: `(8,821)`, not `-8,821`. Applied post-format, keyed off
+    the cell's own RAW value rather than re-parsing the formatted text, so
+    it works uniformly regardless of where a formatter put its own minus
+    sign (`fmt.format_usd_per_share`'s `"$-1.50"` becomes `"($1.50)"`, not
+    `"($-1.50)"` -- the parentheses already say negative; a minus sign
+    inside them would be redundant and non-standard). Strips only the
+    FIRST '-' found, which is safe here because every formatter this
+    table uses produces a single leading sign character and nothing else
+    that could contain one.
+
+    Also the mechanism behind the item's own explicit requirement that a
+    real negative zero stay distinguishable from a missing value: Python's
+    own formatting preserves the sign on a value that rounds to zero
+    (`f"{-40000/1e6:,.0f}"` is `"-0"`, not `"0"`), so a genuinely negative
+    figure this small still becomes `"(0)"` here -- visibly different from
+    a blank cell's em-dash marker, which never reaches this function at
+    all (blank cells are handled, and `continue`, before the formatter is
+    even called)."""
+    if value >= 0:
+        return text
+    return f"({text.replace('-', '', 1)})"
+
+
 def _statement_table_style(row: pd.Series, row_kind: list[str], row_group: list[int]) -> list[str]:
     i = row.name
     style = "background-color: rgba(255, 255, 255, 0.04)" if row_group[i] % 2 else ""
@@ -358,6 +384,7 @@ def statement_table(rows: list[dict], periods: list[dict], show_growth: bool, ke
                 value_entry[col_name] = _BLANK_MARKERS[cause]
                 continue
             text = formatter(cell["value"])
+            text = _parenthesize_if_negative(text, cell["value"])
             if cell.get("is_derived_quarter"):
                 text += " †"
                 any_derived_quarter = True
@@ -389,9 +416,19 @@ def statement_table(rows: list[dict], periods: list[dict], show_growth: bool, ke
     df = pd.DataFrame(table_rows, columns=[_LINE_ITEM_COL] + period_cols)
     styled = df.style.apply(_statement_table_style, axis=1, row_kind=row_kind, row_group=row_group)
 
-    column_config = {_LINE_ITEM_COL: st.column_config.TextColumn(_LINE_ITEM_COL, pinned=True)}
+    # SPEC-008-batch-3 item 4 (approved 2026-08-14): financial tables align
+    # numerals so digits line up by place value; a line-item label is text,
+    # not a number, and stays left-aligned. `TextColumn` (used for every
+    # column here, not `NumberColumn` -- these are pre-formatted strings
+    # carrying their own † / n/m / em-dash markers, not raw numbers)
+    # exposes `alignment` natively in the installed 1.60.0, confirmed via
+    # its own signature rather than assumed -- no Styler CSS needed for
+    # this one.
+    column_config = {
+        _LINE_ITEM_COL: st.column_config.TextColumn(_LINE_ITEM_COL, pinned=True, alignment="left"),
+    }
     for col_name in period_cols:
-        column_config[col_name] = st.column_config.TextColumn(col_name, width="small")
+        column_config[col_name] = st.column_config.TextColumn(col_name, width="small", alignment="right")
 
     height = min(_HEADER_HEIGHT_PX + _ROW_HEIGHT_PX * len(table_rows), _MAX_TABLE_HEIGHT_PX)
     st.dataframe(
