@@ -830,8 +830,12 @@ def test_statement_table_widens_the_line_item_column_past_the_longest_real_label
     assert column_config[components._LINE_ITEM_COL]["width"] == components._LINE_ITEM_COL_WIDTH_PX
     # Wide enough for the real registry's own longest label, not just an
     # arbitrary bigger number -- proves the width was actually SIZED to
-    # something, not picked blind.
-    longest_real_label = "Property, plant and equipment and finance-lease ROU assets, net"
+    # something, not picked blind. SPEC-008-batch-4 item 1 (approved
+    # 2026-08-16) shortened the labels themselves ("Property, plant and
+    # equipment and finance-lease ROU assets, net", 63 characters, is now
+    # "PP&E and finance-lease ROU assets, net", 39) -- this is the new
+    # real worst case, not the old one.
+    longest_real_label = "PP&E and finance-lease ROU assets, net"
     assert components._LINE_ITEM_COL_WIDTH_PX > len(longest_real_label) * 7  # rough px-per-character floor
 
 
@@ -921,7 +925,11 @@ def test_statement_table_reversed_columns_keep_growth_comparing_to_the_chronolog
 
 
 def test_statement_table_growth_row_label_states_the_comparison_direction():
-    # "The row label must say so unambiguously" -- the item's own words.
+    # SPEC-008-batch-4 item 1 (approved 2026-08-16) moved this OUT of the
+    # per-row label ("↳ Growth % (vs. period to the right)" repeated on
+    # every second row and was a major width contributor) and into the
+    # table's own caption, stated once -- still unambiguous, just not
+    # repeated. The row label itself is now the short "↳ Growth %".
     def script(rows, periods):
         from dashboard import components
 
@@ -932,7 +940,27 @@ def test_statement_table_growth_row_label_states_the_comparison_direction():
     at.run()
     assert at.exception == []
     df = at.dataframe[0].value
-    assert "right" in df.iloc[1]["Line item"].lower()
+    assert df.iloc[1]["Line item"].strip() == "↳ Growth %"
+    captions = [c.value for c in at.caption]
+    assert any("right" in c.lower() for c in captions)
+
+
+def test_statement_table_caption_states_the_column_order():
+    # Found while fixing this item, not asked for: item 7's own column
+    # reversal shipped with no on-screen notice of the new order at all.
+    # Stated unconditionally (not gated on show_growth), since it governs
+    # reading the whole table, not just the growth row.
+    def script(rows, periods):
+        from dashboard import components
+
+        components.statement_table(rows, periods, show_growth=False, key="t")
+
+    rows, periods = _table_fixture(with_growth=False)
+    at = AppTest.from_function(script, kwargs={"rows": rows, "periods": periods})
+    at.run()
+    assert at.exception == []
+    captions = [c.value for c in at.caption]
+    assert any("newest to oldest" in c.lower() for c in captions)
 
 
 def test_statement_table_style_bolds_subtotal_rows():

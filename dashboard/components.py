@@ -185,13 +185,17 @@ def sub_tab_bar(key: str, label: str, options: list[str]) -> str:
 # --- C4: the multi-period statement table ---
 
 _LINE_ITEM_COL = "Line item"
-_GROWTH_ROW_LABEL = " ↳ Growth % (vs. period to the right)"  # em-space + turned arrow, indented under its value row
+_GROWTH_ROW_LABEL = " ↳ Growth %"  # em-space + turned arrow, indented under its value row
 # SPEC-008-batch-3 item 7 (approved 2026-08-14): columns run newest-to-
 # oldest, left to right (this item's own fallback -- see statement_table's
 # reversal a few lines down) -- the chronologically PRIOR period a growth
 # figure compares against now sits to a cell's RIGHT, not its left as a
-# reader would otherwise assume from a normal left-to-right timeline. The
-# label says so directly rather than leaving it to be inferred or missed.
+# reader would otherwise assume from a normal left-to-right timeline.
+#
+# SPEC-008-batch-4 item 1 (approved 2026-08-16): the direction note itself
+# moved OUT of this label -- "(vs. period to the right)" repeated on every
+# second row and was a major contributor to the line-item column's own
+# width. Said once instead, in statement_table's own caption, below.
 
 # SPEC-008 review (found live, C4): `st.columns`-per-row wraps a date header
 # into a vertical stack of digits and splits a value across four lines the
@@ -242,17 +246,17 @@ _MAX_TABLE_HEIGHT_PX = 700
 # it lands on (`column_config` has no wrap option at all -- checked; text
 # columns support `alignment` but nothing for wrapping), which is exactly
 # what was happening to the line-item column ("Property, plant and
-# equipment and…"). `"small"`/`"medium"`/`"large"` are 75/200/400px
-# (also read from the installed 1.60.0's own docstring, not guessed);
-# none of the three fits this project's own longest label. Sized instead
-# from the real registry: the longest label across every statement is
-# "Property, plant and equipment and finance-lease ROU assets, net" (63
-# characters), and a subtotal row (item 1) adds a further 4-space indent
-# on top of that for ITS OWN longest label -- 520px is a generous,
-# rounded-up estimate at typical UI-font metrics for the worst case, not
-# a browser-measured exact fit; the browser pass this batch defers to is
-# the one thing that can confirm it precisely.
-_LINE_ITEM_COL_WIDTH_PX = 520
+# equipment and…"). `"small"`/`"medium"`/`"large"` are 75/200/400px (also
+# read from the installed 1.60.0's own docstring, not guessed); none of
+# the three fits this project's own longest label. Sized from the real
+# registry, same discipline as before -- SPEC-008-batch-4 item 1 (approved
+# 2026-08-16) shortened the labels themselves rather than widening the
+# column further; the old 63-character worst case ("Property, plant and
+# equipment and finance-lease ROU assets, net") is now 39 ("PP&E and
+# finance-lease ROU assets, net"), and this width shrinks to match --
+# still a generous, rounded-up estimate at typical UI-font metrics, not a
+# browser-measured exact fit.
+_LINE_ITEM_COL_WIDTH_PX = 320
 # "small" (75px) already comfortably fits every fiscal-label header item
 # 5 produces (FY2025, Q3 FY26 -- 6-7 characters) by the same rough
 # metric; widened modestly anyway as cheap insurance for the longer
@@ -538,6 +542,12 @@ def statement_table(rows: list[dict], periods: list[dict], show_growth: bool, ke
         styled, column_config=column_config, hide_index=True, height=height, key=f"table_grid__{key}",
     )
 
+    # SPEC-008-batch-4 item 1 (approved 2026-08-16): stated once, here,
+    # rather than on every growth row's own label (item 7's own reversal
+    # shipped with no on-screen notice of the new column order at all --
+    # found while fixing this, not asked for, folded into the same
+    # caption since the growth direction only makes sense in light of it).
+    st.caption("Columns run newest to oldest, left to right.")
     if any_derived_quarter:
         st.caption(
             "† derived: this company files a cumulative (year-to-date) figure here, not a discrete quarterly "
@@ -548,7 +558,10 @@ def statement_table(rows: list[dict], periods: list[dict], show_growth: bool, ke
         if cause in blank_causes_present:
             st.caption(_BLANK_FOOTNOTES[cause])
     if show_growth:
-        st.caption(f"“{_GROWTH_ROW_LABEL.strip()}” rows are derived by this project, not filed.")
+        st.caption(
+            f"“{_GROWTH_ROW_LABEL.strip()}” rows are derived by this project, not filed, and compare each "
+            "period to the one to ITS RIGHT (chronologically prior)."
+        )
 
 
 # --- empty / null states (SPEC-008 v1.1: legitimately empty says so, in words) ---

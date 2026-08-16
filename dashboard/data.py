@@ -398,11 +398,11 @@ INCOME_STATEMENT_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
     ("revenue", "Revenue", "revenue_discrete", "Revenue"),
     ("cogs", "Cost of goods sold", "cogs_discrete", "Cost of goods sold"),
     ("gross_profit", "Gross profit", "gross_profit_discrete", "Gross profit"),
-    ("rnd_expense", "Research and development", "rnd_expense_discrete", "Research and development"),
-    (
-        "sga_expense", "Selling, general and administrative",
-        "sga_expense_discrete", "Selling, general and administrative",
-    ),
+    # SPEC-008-batch-4 item 1 (approved 2026-08-16): "R&D"/"SG&A" -- the
+    # item's own suggested shorthand, standard financial-statement
+    # abbreviations a reader recognises instantly, not invented here.
+    ("rnd_expense", "R&D", "rnd_expense_discrete", "R&D"),
+    ("sga_expense", "SG&A", "sga_expense_discrete", "SG&A"),
     ("operating_income", "Operating income", "operating_income_discrete", "Operating income"),
     ("interest_expense", "Interest expense", "interest_expense_discrete", "Interest expense"),
     ("pretax_income", "Pre-tax income", "pretax_income_discrete", "Pre-tax income"),
@@ -464,21 +464,25 @@ BALANCE_SHEET_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
     ("receivables", "Accounts receivable", None, None),
     ("inventory", "Inventory", None, None),
     ("current_assets", "Total current assets", None, None),
+    # SPEC-008-batch-4 item 1 (approved 2026-08-16): "PP&E" is the item's
+    # own suggested shorthand, and the single biggest contributor to the
+    # line-item column's old 63-character worst case -- 63 -> 39 for the
+    # fallback row alone.
     (
-        "ppe_net", "Property, plant and equipment, net",
-        "ppe_and_lease_net", "Property, plant and equipment and finance-lease ROU assets, net",
+        "ppe_net", "PP&E, net",
+        "ppe_and_lease_net", "PP&E and finance-lease ROU assets, net",
     ),
     ("total_assets", "Total assets", None, None),
     ("goodwill", "Goodwill", None, None),
     ("intangibles", "Intangible assets, net", None, None),
     ("payables", "Accounts payable", None, None),
     ("current_liabilities", "Total current liabilities", None, None),
-    ("debt_current", "Short-term debt and current portion of long-term debt", None, None),
+    ("debt_current", "Short-term debt", None, None),
     ("debt_noncurrent", "Long-term debt", None, None),
     ("operating_lease_liabilities", "Operating lease liabilities", None, None),
     ("total_liabilities", "Total liabilities", None, None),
     ("equity", "Total stockholders' equity", None, None),
-    ("retained_earnings", "Retained earnings (accumulated deficit)", None, None),
+    ("retained_earnings", "Retained earnings", None, None),
 )
 CASH_FLOW_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
     # SPEC-008-batch-2 item 1 (approved 2026-08-13): TRADITIONAL statement
@@ -496,16 +500,19 @@ CASH_FLOW_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
     # `_discrete` fallback -- no new registry work, same discipline as
     # every line below it.
     ("net_income", "Net income", "net_income_discrete", "Net income"),
-    ("dep_amort", "Depreciation and amortization", "dep_amort_discrete", "Depreciation and amortization"),
+    # "D&A" -- SPEC-008-batch-4 item 1's own suggested shorthand.
+    ("dep_amort", "D&A", "dep_amort_discrete", "D&A"),
     ("sbc", "Stock-based compensation", "sbc_discrete", "Stock-based compensation"),
     ("deferred_tax", "Deferred income tax", "deferred_tax_discrete", "Deferred income tax"),
     ("other_noncash", "Other non-cash adjustments", "other_noncash_discrete", "Other non-cash adjustments"),
     ("receivables_change", "Change in receivables", "receivables_change_discrete", "Change in receivables"),
     ("inventory_change", "Change in inventory", "inventory_change_discrete", "Change in inventory"),
     ("payables_change", "Change in payables", "payables_change_discrete", "Change in payables"),
+    # SPEC-008-batch-4 item 1 (approved 2026-08-16): "Net cash from
+    # operating activities" -- the item's own suggested shorthand.
     (
-        "cfo", "Net cash provided by operating activities",
-        "cfo_discrete", "Net cash provided by operating activities",
+        "cfo", "Net cash from operating activities",
+        "cfo_discrete", "Net cash from operating activities",
     ),
     ("capex", "Capital expenditure", "capex_discrete", "Capital expenditure"),
     ("acquisitions", "Acquisitions, net of cash acquired", "acquisitions_discrete", "Acquisitions, net of cash acquired"),
@@ -523,9 +530,14 @@ CASH_FLOW_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
     # the render-batch follow-up commit) -- this subtotal resolves ONLY
     # filed-or-discrete-subtraction, same as every line above it, never a
     # sum of this project's own tracked components.
+    #
+    # "Net cash used in investing" -- SPEC-008-batch-4 item 1 (approved
+    # 2026-08-16) only names the operating/financing shorthand explicitly;
+    # dropping "activities" here too keeps all three section subtotals
+    # parallel rather than leaving one inconsistently longer.
     (
-        "net_cash_investing", "Net cash used in investing activities",
-        "net_cash_investing_discrete", "Net cash used in investing activities",
+        "net_cash_investing", "Net cash used in investing",
+        "net_cash_investing_discrete", "Net cash used in investing",
     ),
     ("buybacks", "Share repurchases", "buybacks_discrete", "Share repurchases"),
     ("dividends_paid", "Dividends paid", "dividends_paid_discrete", "Dividends paid"),
@@ -535,11 +547,15 @@ CASH_FLOW_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
         "finance_lease_principal_paid", "Finance lease principal paid",
         "finance_lease_principal_paid_discrete", "Finance lease principal paid",
     ),
+    # "Net cash from financing activities" -- the item's own suggested
+    # shorthand.
     (
-        "net_cash_financing", "Net cash provided by (used in) financing activities",
-        "net_cash_financing_discrete", "Net cash provided by (used in) financing activities",
+        "net_cash_financing", "Net cash from financing activities",
+        "net_cash_financing_discrete", "Net cash from financing activities",
     ),
-    ("fx_effect_on_cash", "Effect of exchange rates on cash", "fx_effect_on_cash_discrete", "Effect of exchange rates on cash"),
+    # "FX" is standard shorthand for foreign exchange, same discipline as
+    # PP&E/SG&A/R&D/D&A above -- not invented for this line specifically.
+    ("fx_effect_on_cash", "FX effect on cash", "fx_effect_on_cash_discrete", "FX effect on cash"),
     ("net_change_in_cash", "Net change in cash", "net_change_in_cash_discrete", "Net change in cash"),
     # New (item 1). SPEC-008-batch-2 cash-reconciliation follow-up
     # (approved 2026-08-13, found live): this originally reused the

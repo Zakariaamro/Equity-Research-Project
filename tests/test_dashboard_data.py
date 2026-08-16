@@ -1116,10 +1116,10 @@ def test_balance_sheet_table_splits_ppe_row_when_fallback_used_in_at_least_one_c
     rows = data.get_balance_sheet_table(AMZN_CIK, periods, "AMZN", db_path)
     ppe_rows = [r for r in rows if r["canonical"] == "ppe_net"]
     assert len(ppe_rows) == 2
-    assert ppe_rows[0]["label"] == "Property, plant and equipment, net"
+    assert ppe_rows[0]["label"] == "PP&E, net"
     assert ppe_rows[0]["cells"][0]["value"] == 50_000_000_000
     assert ppe_rows[0]["cells"][1]["value"] is None
-    assert ppe_rows[1]["label"] == "Property, plant and equipment and finance-lease ROU assets, net"
+    assert ppe_rows[1]["label"] == "PP&E and finance-lease ROU assets, net"
     assert ppe_rows[1]["cells"][0]["value"] is None
     assert ppe_rows[1]["cells"][1]["value"] == 80_000_000_000
 
@@ -1131,7 +1131,7 @@ def test_balance_sheet_table_single_row_when_fallback_never_used(db_path):
     rows = data.get_balance_sheet_table(AMZN_CIK, periods, "AMZN", db_path)
     ppe_rows = [r for r in rows if r["canonical"] == "ppe_net"]
     assert len(ppe_rows) == 1
-    assert ppe_rows[0]["label"] == "Property, plant and equipment, net"
+    assert ppe_rows[0]["label"] == "PP&E, net"
 
 
 def test_balance_sheet_table_omits_the_primary_row_when_only_the_fallback_is_ever_used(db_path):
@@ -1155,7 +1155,7 @@ def test_balance_sheet_table_omits_the_primary_row_when_only_the_fallback_is_eve
     rows = data.get_balance_sheet_table(AMZN_CIK, periods, "AMZN", db_path)
     ppe_rows = [r for r in rows if r["canonical"] == "ppe_net"]
     assert len(ppe_rows) == 1
-    assert ppe_rows[0]["label"] == "Property, plant and equipment and finance-lease ROU assets, net"
+    assert ppe_rows[0]["label"] == "PP&E and finance-lease ROU assets, net"
 
 
 def test_statement_table_row_with_no_data_at_all_still_shows_a_single_blank_row(db_path):
@@ -1191,7 +1191,7 @@ def test_blank_cell_cause_is_split_when_the_paired_row_carries_this_period(db_pa
     assert primary_row["cells"][1]["blank_cause"] == "split"
     assert "finance-lease ROU assets" in primary_row["cells"][1]["blank_reason"]
     assert fallback_row["cells"][0]["blank_cause"] == "split"
-    assert "Property, plant and equipment, net" in fallback_row["cells"][0]["blank_reason"]
+    assert "PP&E, net" in fallback_row["cells"][0]["blank_reason"]
 
 
 def test_blank_cell_cause_is_gap_when_the_concept_is_tagged_elsewhere_but_not_this_period(db_path):
@@ -1272,7 +1272,7 @@ def test_cash_flow_table_resolves_net_cash_investing_filed_directly(db_path):
     periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
     rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
     row = next(r for r in rows if r["canonical"] == "net_cash_investing")
-    assert row["label"] == "Net cash used in investing activities"
+    assert row["label"] == "Net cash used in investing"  # SPEC-008-batch-4 item 1: shortened
     assert row["cells"][0]["value"] == -12_000_000_000.0
     assert row["cells"][0].get("is_derived_quarter") is not True
 
@@ -1283,7 +1283,7 @@ def test_cash_flow_table_resolves_net_cash_financing_via_discrete_fallback(db_pa
     periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
     rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
     row = next(r for r in rows if r["canonical"] == "net_cash_financing")
-    assert row["label"] == "Net cash provided by (used in) financing activities"
+    assert row["label"] == "Net cash from financing activities"  # SPEC-008-batch-4 item 1: shortened
     assert row["cells"][0]["value"] == -3_000_000_000.0
     assert row["cells"][0]["is_derived_quarter"] is True
 
@@ -1297,7 +1297,7 @@ def test_cash_flow_table_cfo_now_carries_the_operating_subtotal_label(db_path):
     periods = data.get_statement_periods(AMZN_CIK, "quarterly", db_path)
     rows = data.get_cash_flow_table(AMZN_CIK, periods, "AMZN", db_path)
     cfo_row = next(r for r in rows if r["canonical"] == "cfo")
-    assert cfo_row["label"] == "Net cash provided by operating activities"
+    assert cfo_row["label"] == "Net cash from operating activities"  # SPEC-008-batch-4 item 1: shortened
 
 
 def test_cash_flow_table_net_income_resolves_via_the_income_statements_own_canonical(db_path):
