@@ -84,6 +84,21 @@ Sort descending by severity, then by category, then by whatever tie-break alread
 Severity ordering is the whole reason the severity field exists; it currently does nothing
 on this page.
 
+### Resolution (implemented 2026-08-16)
+
+`data.get_findings_for_filing`'s entire sort key was `ORDER BY id` (insertion order) --
+now `CASE severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, category, id`, the
+SAME severity-ordering expression `get_observations_for_filing` already uses a few lines
+down (reused, not reinvented, so the two lists read consistently). `id` stays as the final
+tie-break, unchanged. The page itself needed no change at all -- `_render_detail` already
+just iterates `detail["findings"]` in whatever order the data layer hands back.
+
+Verified against the exact real filing the item describes (AMZN's latest 10-Q,
+`0001018724-26-000026`): all three High findings now sit first -- the Anthropic
+revaluation (category `concentration`), then the $15.9B discrete tax expense and the
+Indian tax dispute (both `litigation`, alphabetically after `concentration`, `id` breaking
+the tie between them).
+
 ---
 
 ## Item 3 — The brief and the observations list duplicate each other

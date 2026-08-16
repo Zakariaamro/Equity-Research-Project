@@ -202,6 +202,29 @@ def test_get_red_flag_findings_empty_list_when_none(db_path):
     assert data.get_red_flag_findings("acc1", db_path) == []
 
 
+def test_get_findings_for_filing_sorts_by_severity_then_category_then_id(db_path):
+    # SPEC-008-batch-4 item 2 (approved 2026-08-16): reproduces the item's
+    # own reported shape -- insertion order scattered Medium/Low/High
+    # throughout, with ORDER BY id alone (this function's entire sort key
+    # before this item) as the only ordering. Descending by severity,
+    # then category, then id (the prior tie-break, still there).
+    _insert_filing(db_path, "acc1")
+    _insert_finding(db_path, "acc1", "note_item", "medium", "fog index note")
+    _insert_finding(db_path, "acc1", "note_item", "low", "a low note")
+    _insert_finding(db_path, "acc1", "concentration", "low", "customer concentration")
+    _insert_finding(db_path, "acc1", "litigation", "high", "Indian tax dispute")
+    _insert_finding(db_path, "acc1", "accounting_change", "medium", "revenue recognition change")
+    _insert_finding(db_path, "acc1", "red_flag", "high", "$15.9B discrete tax expense")
+    _insert_finding(db_path, "acc1", "concentration", "high", "Anthropic revaluation")
+    findings = data.get_findings_for_filing("acc1", db_path)
+    severities = [f["severity"] for f in findings]
+    assert severities == ["high", "high", "high", "medium", "medium", "low", "low"]
+    # Within "high", category is the tie-break: alphabetical (concentration
+    # < litigation < red_flag), not insertion order.
+    high_categories = [f["category"] for f in findings if f["severity"] == "high"]
+    assert high_categories == ["concentration", "litigation", "red_flag"]
+
+
 # --- metrics ---
 
 

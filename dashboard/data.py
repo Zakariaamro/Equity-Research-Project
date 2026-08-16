@@ -330,7 +330,19 @@ def get_red_flag_findings(accession_no: str, db_path: Path = DEFAULT_DB_PATH) ->
 
 
 def get_findings_for_filing(accession_no: str, db_path: Path = DEFAULT_DB_PATH) -> list[dict]:
-    return _run(db_path, "SELECT * FROM findings WHERE accession_no = ? ORDER BY id", (accession_no,))
+    """SPEC-008-batch-4 item 2 (approved 2026-08-16): descending by
+    severity, then category, then id -- ORDER BY id alone (this
+    function's entire sort key before this item) meant the Filings page
+    ran Medium, Medium, Low, Low, Medium, ..., with the real High findings
+    scattered mid-list. Same severity-ordering CASE expression
+    `get_observations_for_filing` already uses a few lines down --
+    reused, not reinvented, so the two lists read consistently."""
+    return _run(
+        db_path,
+        "SELECT * FROM findings WHERE accession_no = ? ORDER BY "
+        "CASE severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, category, id",
+        (accession_no,),
+    )
 
 
 def get_observations_for_filing(accession_no: str, db_path: Path = DEFAULT_DB_PATH) -> list[dict]:
