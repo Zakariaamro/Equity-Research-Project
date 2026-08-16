@@ -269,6 +269,57 @@ def test_metric_tile_bolds_the_caption_when_its_period_differs_from_the_anchor()
     assert any(c.startswith("**") and "different period" in c for c in captions)
 
 
+def test_chart_series_color_assigns_three_distinct_colors_for_the_real_watchlist():
+    # SPEC-008-batch-4 item 4 (approved 2026-08-16): AMZN and MU were
+    # rendering in near-identical blues under Plotly's own default
+    # sequence (no colour was ever set here before this item).
+    from dashboard import components
+
+    colors = {t: components._chart_series_color(t) for t in ("AMZN", "NVDA", "MU")}
+    assert len(set(colors.values())) == 3
+
+
+def test_chart_series_color_is_a_pure_function_of_the_ticker_alone():
+    # A company keeps the SAME colour whether it's shown alongside all
+    # three others or alone -- true by construction here (the function
+    # takes only `ticker`, nothing about which others are also being
+    # charted), asserted directly rather than left implicit.
+    from dashboard import components
+
+    assert components._chart_series_color("MU") == components._chart_series_color("MU")
+    solo_amzn = components._chart_series_color("AMZN")
+    assert solo_amzn == components._chart_series_color("AMZN")
+
+
+def test_metric_chart_renders_three_genuinely_distinguishable_series_colors():
+    import json
+
+    from edgar import config
+
+    def script(metric_def, series_by_ticker, cik_by_ticker):
+        from dashboard import components
+
+        components.metric_chart(metric_def, series_by_ticker, cik_by_ticker, key_prefix="t")
+
+    mdef = config.METRIC_REGISTRY["gross_margin"]
+    series_by_ticker = {
+        "AMZN": [{"period_end": "2025-03-31", "period_start": "2025-01-01", "value": 0.5, "null_reason": None}],
+        "NVDA": [{"period_end": "2025-03-31", "period_start": "2025-01-01", "value": 0.6, "null_reason": None}],
+        "MU": [{"period_end": "2025-03-31", "period_start": "2025-01-01", "value": 0.4, "null_reason": None}],
+    }
+    cik_by_ticker = {"AMZN": "0001018724", "NVDA": "0001045810", "MU": "0000723125"}
+    at = AppTest.from_function(
+        script, kwargs={"metric_def": mdef, "series_by_ticker": series_by_ticker, "cik_by_ticker": cik_by_ticker}
+    )
+    at.run()
+    assert at.exception == []
+    chart = at.get("plotly_chart")[0]
+    spec = json.loads(chart.proto.spec)
+    colors_by_name = {trace["name"]: trace["line"]["color"] for trace in spec["data"]}
+    assert len(colors_by_name) == 3
+    assert len(set(colors_by_name.values())) == 3  # all three genuinely distinct, not two matching
+
+
 def test_observation_ids_cited_in_brief_extracts_observation_refs_only():
     # SPEC-008 review D10: the same observation must not appear verbatim in
     # both "The brief" and "What changed?" -- this is the set the caller

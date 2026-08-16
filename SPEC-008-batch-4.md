@@ -150,6 +150,27 @@ This does **not** conflict with the no-colour rule: that rule forbids colour enc
 identity, not judgement. Note the distinction in the spec so the rule doesn't get
 misremembered later as "no colour anywhere".
 
+### Resolution (implemented 2026-08-16)
+
+**The rule distinction, stated for the record**: ARCHITECTURE.md/SPEC-005's no-colour rule
+forbids colour encoding *severity or analytical meaning* — a red cell would claim "this
+number is bad" without a reader having to read the label. A chart legend's colours encode
+*which company's line is which*, a fact identical to the ticker already printed next to it
+in the legend text; colour here is redundant with a label, not a silent claim standing in
+for one. Not the same rule, and not an exception to it either — outside its scope.
+
+**Root cause**: no colour was ever set explicitly in `metric_chart`'s `go.Scatter` calls —
+every trace fell through to Plotly's own default categorical sequence, which happens to put
+two similar blues in its first three slots. Fixed with Okabe-Ito, the standard colorblind-
+safe categorical palette: `#E69F00` (AMZN), `#009E73` (NVDA), `#CC79A7` (MU), assigned by
+each ticker's position in `config.WATCHLIST` — a company keeps the same colour whether
+shown alongside all three others or alone, not whatever Plotly's own trace-iteration order
+happens to be for the currently-selected subset.
+
+**Contrast against the dark theme, computed, not eyeballed**: WCAG relative-luminance
+contrast ratio against Streamlit's default dark background (`#0e1117`) — AMZN 8.4:1, NVDA
+5.5:1, MU 6.2:1. All comfortably clear of the 3:1 floor WCAG sets for graphical objects.
+
 ---
 
 ## Item 5 — The section-text viewer is unreadable

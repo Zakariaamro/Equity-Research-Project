@@ -808,6 +808,33 @@ def metric_tile(metric_def: "config.MetricDef", latest: dict | None, anchor_peri
         st.caption(f"Conventional flag threshold: {threshold_str}")
 
 
+# SPEC-008-batch-4 item 4 (approved 2026-08-16): AMZN and MU were rendering
+# in near-identical blues -- no colour was ever set explicitly here before
+# this item, so every trace fell through to Plotly's own default sequence,
+# which happens to put two similar blues in its first three slots; only
+# NVDA happened to land on a visibly different one. Okabe-Ito, the
+# standard colorblind-safe categorical palette -- checked for contrast
+# against this app's dark theme too (none of these is a near-black hue
+# that would wash out against it). Assigned by each ticker's position in
+# `config.WATCHLIST`, not by dict-iteration order of whatever subset of
+# companies happens to be selected -- a company keeps the SAME colour
+# whether it's shown alongside all three others or alone.
+#
+# This is NOT the no-colour-for-severity rule (ARCHITECTURE.md/SPEC-005:
+# never encode severity or analytical meaning in colour). Distinguishing
+# one company's own line from another's on a chart with a legend is
+# identity, a chart's ordinary job -- not a judgement about what the data
+# MEANS. Noted here explicitly so the rule doesn't get misremembered later
+# as "no colour anywhere."
+_CHART_SERIES_COLORS: tuple[str, ...] = ("#E69F00", "#009E73", "#CC79A7", "#56B4E9", "#D55E00", "#F0E442")
+
+
+def _chart_series_color(ticker: str) -> str:
+    tickers_in_order = [c.ticker for c in config.WATCHLIST]
+    index = tickers_in_order.index(ticker) if ticker in tickers_in_order else 0
+    return _CHART_SERIES_COLORS[index % len(_CHART_SERIES_COLORS)]
+
+
 def metric_chart(
     metric_def: "config.MetricDef",
     series_by_ticker: dict[str, list[dict]],
@@ -835,6 +862,7 @@ def metric_chart(
         fig.add_trace(
             go.Scatter(
                 x=[p["period_end"] for p in points], y=y_values, mode="lines+markers", name=ticker,
+                line=dict(color=_chart_series_color(ticker)), marker=dict(color=_chart_series_color(ticker)),
             )
         )
     ticksuffix = "" if scale == "indexed" else fmt.axis_ticksuffix(metric_def.unit)
