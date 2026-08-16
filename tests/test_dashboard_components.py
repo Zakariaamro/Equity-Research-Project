@@ -452,7 +452,9 @@ def test_statement_table_renders_growth_as_a_separate_row_beneath_the_value():
     # SPEC-008 C4 constraint 1: a separate row, directly beneath its line
     # item, carries the derived figure -- load-bearing, not decorative
     # (renamed from the old caption-based mechanism, same requirement).
-    assert df.iloc[1]["Line item"].strip().endswith("Growth %")
+    # SPEC-008-batch-3 item 7 (approved 2026-08-14): the label now states
+    # the comparison direction explicitly (columns run newest-to-oldest).
+    assert "Growth %" in df.iloc[1]["Line item"]
     assert df.iloc[1][_col("2025-06-30")] == "+50.0%"
     captions = [c.value for c in at.caption]
     assert any("derived by this project, not filed" in c for c in captions)
@@ -567,7 +569,11 @@ def test_statement_table_shows_all_periods_with_no_windowing_or_checkbox():
     at.run()
     assert at.exception == []
     df = at.dataframe[0].value
-    assert list(df.columns)[1:] == [_col(p["period_end"]) for p in periods]
+    # SPEC-008-batch-3 item 7 (approved 2026-08-14): every period still
+    # renders (this test's own original point), but newest-to-oldest,
+    # left to right, not the caller's oldest-to-newest order -- the
+    # fallback's own reversal.
+    assert list(df.columns)[1:] == [_col(p["period_end"]) for p in reversed(periods)]
     assert not at.checkbox
 
 
@@ -844,6 +850,89 @@ def test_statement_table_period_columns_are_wider_than_the_old_75px_default():
     column_config = json.loads(at.dataframe[0].proto.columns)
     assert column_config[_col("2025-06-30")]["width"] == components._PERIOD_COL_WIDTH_PX
     assert components._PERIOD_COL_WIDTH_PX > 75
+
+
+# --- SPEC-008-batch-3 item 7 (approved 2026-08-14): reversed-column fallback ---
+# Routes 1 (CSS direction:rtl via an injected <style> block) and 2 (a native
+# scroll-position field) were both checked against the installed 1.60.0 and
+# neither produced a confirmable fix -- see SPEC-008-batch-3.md's own
+# resolution for the investigation. Columns now run newest-to-oldest, left
+# to right, so the table opens already showing the newest period without
+# scrolling; growth keeps comparing each period to the chronologically
+# PRIOR one, which now sits to a cell's right.
+
+
+def _three_period_fixture():
+    """Q1=100M, Q2=150M (+50% vs Q1), Q3=90M (-40% vs Q2) -- growth_pct is
+    ALREADY computed here, in chronological cell order, exactly as
+    data.py would hand it to the render layer; statement_table must
+    display these values unchanged, never recompute them from whichever
+    columns end up visually adjacent after reversal."""
+    periods = [
+        {"period_end": "2025-03-31"}, {"period_end": "2025-06-30"}, {"period_end": "2025-09-30"},
+    ]
+    rows = [
+        {
+            "label": "Revenue", "canonical": "revenue",
+            "cells": [
+                {"period_end": "2025-03-31", "value": 100_000_000, "growth_pct": None, "is_derived_quarter": False},
+                {"period_end": "2025-06-30", "value": 150_000_000, "growth_pct": 0.5, "is_derived_quarter": False},
+                {"period_end": "2025-09-30", "value": 90_000_000, "growth_pct": -0.4, "is_derived_quarter": False},
+            ],
+        },
+    ]
+    return rows, periods
+
+
+def test_statement_table_columns_run_newest_to_oldest_left_to_right():
+    def script(rows, periods):
+        from dashboard import components
+
+        components.statement_table(rows, periods, show_growth=False, key="t")
+
+    rows, periods = _three_period_fixture()
+    at = AppTest.from_function(script, kwargs={"rows": rows, "periods": periods})
+    at.run()
+    assert at.exception == []
+    df = at.dataframe[0].value
+    assert list(df.columns)[1:] == [_col("2025-09-30"), _col("2025-06-30"), _col("2025-03-31")]
+
+
+def test_statement_table_reversed_columns_keep_growth_comparing_to_the_chronologically_prior_period():
+    # The item's own explicit ask: "Add a test that a known growth figure
+    # is unchanged by the reversal; this is exactly the kind of flip that
+    # silently inverts a sign." Q2's growth (+50%, vs Q1) and Q3's growth
+    # (-40%, vs Q2) must render EXACTLY as computed, under their own
+    # columns, regardless of the columns' new left-to-right positions.
+    def script(rows, periods):
+        from dashboard import components
+
+        components.statement_table(rows, periods, show_growth=True, key="t")
+
+    rows, periods = _three_period_fixture()
+    at = AppTest.from_function(script, kwargs={"rows": rows, "periods": periods})
+    at.run()
+    assert at.exception == []
+    df = at.dataframe[0].value
+    growth_row = df.iloc[1]
+    assert growth_row[_col("2025-03-31")] == ""  # no prior period to compare against
+    assert growth_row[_col("2025-06-30")] == "+50.0%"  # NOT -50.0% or any inverted variant
+    assert growth_row[_col("2025-09-30")] == "-40.0%"
+
+
+def test_statement_table_growth_row_label_states_the_comparison_direction():
+    # "The row label must say so unambiguously" -- the item's own words.
+    def script(rows, periods):
+        from dashboard import components
+
+        components.statement_table(rows, periods, show_growth=True, key="t")
+
+    rows, periods = _three_period_fixture()
+    at = AppTest.from_function(script, kwargs={"rows": rows, "periods": periods})
+    at.run()
+    assert at.exception == []
+    df = at.dataframe[0].value
+    assert "right" in df.iloc[1]["Line item"].lower()
 
 
 def test_statement_table_style_bolds_subtotal_rows():

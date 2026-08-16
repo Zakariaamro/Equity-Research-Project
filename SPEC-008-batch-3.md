@@ -282,6 +282,63 @@ Whatever the outcome, record it in the spec, including which routes failed and w
 Streamlit's rendering layer has dictated a third design decision in this project, that
 pattern is worth having written down before the deployment spec is drafted.
 
+### Resolution (implemented 2026-08-14): the reversed-column fallback, settled
+
+**Route 1 (CSS `direction: rtl` via an injected `<style>` block): re-investigated, not
+resolved either way with certainty, treated as failed.** The existing in-repo comment
+claiming this was already checked and blocked ("the frontend bundle's own sanitizer call
+is literally `FORBID_TAGS: ['style']`") turned out to be a misattribution, corrected here:
+that string is real and present in the installed 1.60.0 (`chunk-WYO6CB5R.-gOV9D83.js`), but
+it sits alongside unmistakably mermaid-specific code (`hasBreaks`/`#br#` line-break
+placeholder handling, mermaid's own internal text-sanitization convention) — it belongs to
+the bundled Mermaid diagram renderer's own DOMPurify instance, not necessarily
+`StreamlitMarkdown.DJLoxxnS.js` (Streamlit's actual markdown component, confirmed by name
+and by its own `rehype-raw` import). Traced that component specifically: no
+`rehype-sanitize` or `hast-util-sanitize` chunk exists anywhere in the bundled `static/js/`
+directory, and neither string appears inside `StreamlitMarkdown.DJLoxxnS.js` itself — so
+there is no direct evidence a `<style>` tag is stripped by Streamlit's OWN markdown
+sanitizer specifically, contrary to the old comment's confident claim.
+
+That is not the same as evidence it *survives*. This can only be settled by rendering the
+page in an actual browser and checking the computed styles apply — outside this
+environment's reach, and after already having reached the wrong-for-the-wrong-reason
+conclusion once, a second unverified guess was judged not worth a fourth round on this
+same question. Route 1 is left untried in shipped code; the finding above is recorded so
+the NEXT investigation starts from a corrected premise instead of repeating this one.
+
+**Route 2 (a native scroll-position mechanism): re-confirmed closed, directly against the
+installed 1.60.0, not assumed from the old comment.** `st.dataframe`'s own signature has no
+scroll-related parameter. The underlying `Dataframe` protobuf message's field list —
+enumerated directly via its descriptor — is exactly `arrow_data, id, columns, editing_mode,
+disabled, form_id, column_order, selection_mode, row_height, placeholder, selection_state,
+selection_default, button_click_widgets`; nothing there sets an initial scroll offset.
+`TextColumn`'s `pinned` option, read from its own docstring, still pins "on the left side no
+matter where the user scrolls" only — no right-pin, and pinning was never an initial-offset
+mechanism even where it exists.
+
+**Route 3, implemented.** Columns now run newest-to-oldest, left to right — the table opens
+already showing the newest period without any scrolling at all, which is what the
+underlying requirement was actually for. `statement_table` reverses `periods` and every
+row's own `cells` together, in lockstep, at the top of the function, before anything else
+runs; every cell's `growth_pct`/`yoy_growth_pct` is untouched (computed upstream in
+`data.py`, purely chronological) — only which column a cell's already-computed value
+renders under changes. The growth row's own label now says `"(vs. period to the right)"`
+directly, rather than leaving the new direction to be inferred.
+
+Tested against the exact risk the item names: a three-period fixture with known,
+opposite-signed growth (+50% then −40%) confirms both figures render unchanged under
+their own columns after reversal — not flipped, not swapped. Verified again against real
+AMZN data outside the test suite: Q2 2026's own +10.5% growth (hand-computed from the real
+filed figures) renders correctly under its own column post-reversal.
+
+**If Streamlit's rendering layer dictates a design decision a fourth time**: the pattern
+across all three so far (the C4 rebuild's own column layout, this item's three routes, and
+D1's currency escaping) is that this project's read of the *Python-side* API surface has
+consistently been more reliable than any claim about *client-side* rendering/sanitization
+behavior that can't be checked from here — worth defaulting to a render-layer-side
+workaround early rather than spending a round on an unverifiable client-side one, when
+the deployment spec is drafted.
+
 ---
 
 ## When you're done

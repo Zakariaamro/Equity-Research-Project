@@ -185,7 +185,13 @@ def sub_tab_bar(key: str, label: str, options: list[str]) -> str:
 # --- C4: the multi-period statement table ---
 
 _LINE_ITEM_COL = "Line item"
-_GROWTH_ROW_LABEL = " ↳ Growth %"  # em-space + turned arrow, indented under its value row
+_GROWTH_ROW_LABEL = " ↳ Growth % (vs. period to the right)"  # em-space + turned arrow, indented under its value row
+# SPEC-008-batch-3 item 7 (approved 2026-08-14): columns run newest-to-
+# oldest, left to right (this item's own fallback -- see statement_table's
+# reversal a few lines down) -- the chronologically PRIOR period a growth
+# figure compares against now sits to a cell's RIGHT, not its left as a
+# reader would otherwise assume from a normal left-to-right timeline. The
+# label says so directly rather than leaving it to be inferred or missed.
 
 # SPEC-008 review (found live, C4): `st.columns`-per-row wraps a date header
 # into a vertical stack of digits and splits a value across four lines the
@@ -429,6 +435,27 @@ def statement_table(rows: list[dict], periods: list[dict], show_growth: bool, ke
     if not rows or not periods:
         empty_state("No periods with computed metrics for this company/basis yet.")
         return
+
+    # SPEC-008-batch-3 item 7 (approved 2026-08-14): FALLBACK -- reversed
+    # column order, newest LEFTMOST. Routes 1 (CSS `direction: rtl` via an
+    # injected `<style>` block) and 2 (a native scroll-position field on
+    # `st.dataframe`) were both checked against the installed 1.60.0 and
+    # neither produced a confirmable fix -- see this item's own spec
+    # resolution for the full investigation and why "confirmable" was the
+    # bar, not just "plausible."
+    #
+    # `periods` and every row's own `cells` are reversed TOGETHER, in
+    # lockstep, right here, before anything downstream runs. Each cell's
+    # `growth_pct`/`yoy_growth_pct` is untouched -- computed upstream in
+    # `data.py`, purely chronological, independent of DISPLAY order; only
+    # WHICH COLUMN a cell's already-computed value renders under changes.
+    # Nothing below this point may re-derive growth from adjacent visual
+    # columns -- that would silently invert its sign, exactly the risk
+    # this item's own test (`test_statement_table_reversed_columns_keep_
+    # growth_comparing_to_the_chronologically_prior_period`) guards
+    # against.
+    periods = list(reversed(periods))
+    rows = [{**row, "cells": list(reversed(row["cells"]))} for row in rows]
 
     period_cols = [fmt.format_date(p["period_end"]) for p in periods]
     table_rows: list[dict] = []
