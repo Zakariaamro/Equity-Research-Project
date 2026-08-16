@@ -32,13 +32,23 @@ def _render_detail(accession_no: str) -> None:
     st.write(f"Filed {fmt.format_date(filing['filing_date'])}, period {fmt.format_date(filing['period_end'])} — [View on SEC]({sec_link})")
 
     st.markdown("### Brief")
+    observations = detail["observations"]
     if detail["brief"] is None:
         components.empty_state("No brief exists for this filing.")
     else:
-        components.brief_section(detail["brief"]["sentences"], top_n=6)
+        sentences = detail["brief"]["sentences"]
+        components.brief_section(sentences, top_n=6)
+        # SPEC-008-batch-4 item 3 (approved 2026-08-16): D10 solved this
+        # exact duplication on the Overview page's "What changed?" --
+        # reused here, not reinvented. Excludes an observation already
+        # cited by a kept brief sentence (a restatement is close to a
+        # direct rewording of its one cited observation) from this
+        # section, so the same fact isn't listed twice on one page.
+        already_in_brief = components.observation_ids_cited_in_brief(sentences)
+        observations = [o for o in observations if o["id"] not in already_in_brief]
 
     st.markdown("### Observations")
-    components.observations_section(detail["observations"])
+    components.observations_section(observations)
 
     st.markdown("### Findings")
     if not detail["findings"]:

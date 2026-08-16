@@ -119,6 +119,23 @@ Reuse it. Do not write a second mechanism.
 Check what's left afterwards — if the Filings observations list drops to two or three
 low-severity items, say so, because that changes whether it earns its own section.
 
+### Resolution (implemented 2026-08-16)
+
+Applied the exact same two lines `overview.py` already uses — `observation_ids_cited_in_
+brief(sentences)` then a list-comprehension filter — to `filings.py`'s `_render_detail`,
+guarded the same way (only when a brief exists at all; nothing to exclude against
+otherwise). No second mechanism written.
+
+**What's left, checked against the real corpus**: of the 74 filings in the database, only
+19 have a generated brief (the feature is recent; every older filing's observations list
+is completely unaffected by this item, dedup has nothing to compare against). Across those
+19, the exclusion drops 5–8 observations each, leaving 4–44 remaining (median 20). One
+filing — AMZN's `0001018724-25-000123` — comes closest to the item's own trigger: 12 → 4
+(one medium, three low). None drop to exactly two or three. **The section clearly still
+earns its place**: a handful of filings sit in the high single digits after dedup, but the
+typical case (median 20) is nowhere close to thin, and the one outlier is a single real
+filing, not a pattern.
+
 ---
 
 ## Item 4 — Two of three chart series are the same colour
