@@ -64,8 +64,12 @@ def _render_detail(accession_no: str) -> None:
         return
     section_labels = [f"{s['category']} — {s['short_name']}" for s in sections]
     section_choice = st.selectbox("Section text", options=range(len(sections)), format_func=lambda i: section_labels[i])
-    text = section_store.read_section_text(sections[section_choice]["text_hash"])
-    st.text(text)
+    chosen_section = sections[section_choice]
+    text = section_store.read_section_text(chosen_section["text_hash"])
+    # SPEC-008-batch-4 item 5 (approved 2026-08-16): DISPLAY-TIME cleanup
+    # only -- `text` above is exactly what read_section_text returned,
+    # unmodified; the stored, content-addressed row is never touched.
+    st.text(fmt.clean_section_display_text(text, chosen_section["short_name"]))
 
 
 def render() -> None:

@@ -12,7 +12,7 @@ import json
 from streamlit.testing.v1 import AppTest
 
 from dashboard import data
-from edgar import db
+from edgar import db, section_store
 
 AMZN_CIK = "0001018724"
 
@@ -45,6 +45,19 @@ def _insert_observation(db_path, accession_no, rule_name, statement, severity, s
     row_id = cur.lastrowid
     conn.close()
     return row_id
+
+
+def _insert_section(db_path, accession_no, short_name, text, category="Notes", position=0):
+    text_hash = section_store.write_section_text(text)
+    conn = db.get_connection(db_path)
+    conn.execute(
+        "INSERT INTO sections (accession_no, category, short_name, source_file, position, text_hash) "
+        "VALUES (?, ?, ?, 'source.htm', ?, ?)",
+        (accession_no, category, short_name, position, text_hash),
+    )
+    conn.commit()
+    conn.close()
+    return text_hash
 
 
 def _insert_brief(db_path, accession_no, cik, sentences):
@@ -122,3 +135,46 @@ def test_filings_page_excludes_observations_already_cited_in_the_brief(tmp_path,
     # The uncited observation must still be there -- this is an exclusion
     # of the specific cited fact, not a blanket suppression of the section.
     assert any("second, uncited observation" in m for m in markdowns)
+
+
+# SPEC-008-batch-4 item 5 (approved 2026-08-16): the section-text viewer's
+# display-time cleanup. Hard constraint: the stored, content-addressed row
+# must never be touched -- only what reaches `st.text` is cleaned.
+
+def test_filings_page_source_reuses_clean_section_display_text():
+    from pathlib import Path
+
+    text = (Path(__file__).parent.parent / "dashboard" / "pages" / "filings.py").read_text()
+    assert "fmt.clean_section_display_text(" in text
+
+
+def test_filings_page_renders_cleaned_section_text_without_touching_the_stored_row(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    db.init_db(db_path)
+    accession_no = "acc1"
+    _insert_filing(db_path, accession_no)
+    raw_text = (
+        "v3.26.1\nLeases 3 Months Ended\nMar. 31, 2026\nLeases [Abstract]\n"
+        "Leases LEASESWe have entered into non-cancellable operating leases."
+    )
+    text_hash = _insert_section(db_path, accession_no, "Leases", raw_text)
+
+    real_get_filing_detail = data.get_filing_detail
+    monkeypatch.setattr(data, "get_filing_detail", lambda accession_no: real_get_filing_detail(accession_no, db_path=db_path))
+
+    def script(accession_no):
+        from dashboard.pages import filings
+
+        filings._render_detail(accession_no)
+
+    at = AppTest.from_function(script, kwargs={"accession_no": accession_no})
+    at.run()
+    assert at.exception == []
+
+    rendered = [t.value for t in at.text]
+    assert any("v3.26.1" not in r and "We have entered into non-cancellable operating leases." in r for r in rendered)
+    assert not any("LEASESWe" in r for r in rendered)
+
+    # The hard constraint: the stored, content-addressed row is exactly
+    # what was written -- rendering never rewrites it in place.
+    assert section_store.read_section_text(text_hash) == raw_text

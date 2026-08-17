@@ -6,6 +6,7 @@ without a running app.
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
 
 from edgar import config
@@ -249,6 +250,120 @@ def escape_markdown_currency(text: str) -> str:
     reaches `st.markdown`/`st.write`/`st.caption` -- never by editing the
     stored text itself, which is correct; only the rendering was wrong."""
     return text.replace("$", r"\$")
+
+
+# Reused, not reinvented: `section_store.normalize_for_wording_hash` (SPEC-005)
+# already strips this exact artifact for its own purpose (wording-identity
+# hashing) using this pattern from config -- it handles a variable number of
+# dot-separated version segments ("v3.25.0.1" as well as "v3.26.1", noted in
+# that function's own docstring), which a hand-rolled 3-segment-only pattern
+# would silently miss.
+_VIEWER_VERSION_LINE = re.compile(config.XBRL_VIEWER_VERSION_LINE_PATTERN)
+_BARE_DATE_LINE = re.compile(r"^[A-Z][a-z]{2}\.\s\d{1,2},\s\d{4}$")
+# A 4+-letter ALL-CAPS run immediately followed by a Titlecase word start
+# (uppercase, then lowercase) -- a former all-caps header/label directly
+# abutting the body text that used to follow it in a different table cell
+# or HTML element, e.g. "DISCLOSURESUnaudited" or "LEASESWe". The first
+# group is non-greedy so it stops at the shortest run that still lets the
+# second group match, rather than swallowing the next word's own leading
+# capital (a plain `[A-Z]{4,}` would consume "DISCLOSURESU" whole and the
+# match would fail).
+#
+# Deliberately narrower than "any lowercase immediately followed by
+# uppercase" (which would also catch this) -- checked against a real
+# false-positive case before choosing this shape: NVDA's own filings
+# contain genuine camelCase product names ("GeForce"), which a lowercase-
+# to-uppercase rule would incorrectly split ("Ge", "Force"). Requiring an
+# ALL-CAPS run before the split point rules that out (confirmed directly:
+# re.sub leaves "GeForce RTX and DGX systems" untouched).
+#
+# The minimum run length is 4, not 2 -- found live against NVDA's own
+# "Stock-Based Compensation" section text: a 2-letter minimum matched
+# inside "RSUs" and "PSUs" (the acronym fragment "RS"/"PS" is itself a
+# 2-letter ALL-CAPS run immediately followed by a Titlecase-shaped "Us"),
+# corrupting them into "RS\n\nUs" / "PS\n\nUs". Every real header this
+# function needs to catch (DISCLOSURES, FINANCIAL INSTRUMENTS, LEASES,
+# COMMITMENTS AND CONTINGENCIES, STOCKHOLDERS' EQUITY) is well over 4
+# letters, so raising the floor to 4 loses no real match -- verified
+# against the same real sections -- while it stops matching inside RSUs,
+# PSUs, and the same-shaped ISOs/IPOs/SPACs (all confirmed left untouched).
+_ALL_CAPS_RUN_INTO_TITLECASE = re.compile(r"([A-Z]{4,}?)([A-Z][a-z])")
+
+
+def clean_section_display_text(raw_text: str, short_name: str) -> str:
+    """SPEC-008-batch-4 item 5 (approved 2026-08-16): DISPLAY-TIME cleanup
+    of SEC R-file rendering artifacts, exactly like currency escaping --
+    the stored text (content-addressed; `section_store`'s hashes feed the
+    analysis layer and every cached result keyed off them) is NEVER
+    touched. Apply this only at the point section text reaches the
+    viewer; the DB row `read_section_text` returns stays exactly what was
+    stored.
+
+    Strips, in order, only from the START of the text (never searched for
+    deep in the body, so a coincidentally similar phrase in real prose is
+    never touched):
+
+    1. A leading viewer version string (`v3.26.1`) on its own line --
+       reuses `config.XBRL_VIEWER_VERSION_LINE_PATTERN`, the same pattern
+       `section_store.normalize_for_wording_hash` (SPEC-005) already
+       strips for its own, unrelated purpose; not a second mechanism.
+    2. The duration line (`{short_name} 6 Months Ended` / `12 Months
+       Ended` / ...) -- identified by STARTING WITH the section's own
+       `short_name`, not by matching a specific duration phrase (10-Ks
+       say "12 Months Ended", 10-Qs vary) -- so this doesn't need to
+       enumerate every duration phrase SEC filings use.
+    3. A bare date line (`Jun. 30, 2026`) immediately after it.
+    4. The XBRL abstract-element line (ends in ` [Abstract]`) -- checked
+       against the real corpus before writing this: this string does NOT
+       always match `short_name` (short_name "Financial Instruments" vs.
+       abstract line "Investments, Debt and Equity Securities [Abstract]"
+       for the SAME section) so it's identified structurally, by suffix,
+       not by content match.
+    5. The note's own title, repeated up to a few more times immediately
+       before real content starts -- checked against the real corpus
+       before writing this: the repeat isn't always title-case-then-ALL-
+       CAPS (AMZN's shape, "Accounting Policies and Supplemental
+       Disclosures ACCOUNTING POLICIES..."); NVIDIA's own filings repeat
+       the SAME-CASE title instead ("Groq Groq...", "Organization and
+       Summary of Significant Accounting Policies Organization and
+       Summary..."). Strips `short_name` or `short_name.upper()`,
+       whichever matches, with or without a trailing space, in a loop --
+       general to either shape and to however many times it actually
+       repeats, not hard-coded to exactly three.
+
+    Then restores a paragraph break at every remaining ALL-CAPS-run/
+    Titlecase join anywhere in the text (see `_ALL_CAPS_RUN_INTO_TITLECASE`
+    for why this specific pattern, not a broader lowercase-to-uppercase
+    one, was checked and chosen). A join that ISN'T this exact shape --
+    e.g. "Stock Repurchase ActivityIn March 2022", a title-case sub-header
+    running into title-case content, structurally identical to a genuine
+    camelCase brand name -- is deliberately left alone: this project's own
+    rule for D15-style findings applies here too, a wrong split is worse
+    than an ugly one, and there is no reliable way to tell the two apart
+    from the text alone."""
+    lines = raw_text.split("\n")
+    idx = 0
+    if idx < len(lines) and _VIEWER_VERSION_LINE.match(lines[idx].strip()):
+        idx += 1
+    if idx < len(lines) and lines[idx].startswith(short_name):
+        idx += 1
+    if idx < len(lines) and _BARE_DATE_LINE.match(lines[idx].strip()):
+        idx += 1
+    if idx < len(lines) and lines[idx].rstrip().endswith("[Abstract]"):
+        idx += 1
+    remainder = "\n".join(lines[idx:])
+
+    for _ in range(5):  # a handful of repeats at most; never loops on real content
+        stripped = remainder.lstrip()
+        if short_name and stripped.startswith(short_name):
+            remainder = stripped[len(short_name):]
+        elif short_name and stripped.startswith(short_name.upper()):
+            remainder = stripped[len(short_name.upper()):]
+        else:
+            break
+
+    remainder = remainder.lstrip()
+    return _ALL_CAPS_RUN_INTO_TITLECASE.sub(r"\1\n\n\2", remainder)
 
 
 def format_growth_pct(value: float | None, precision: int = 1) -> str:

@@ -201,6 +201,67 @@ Strip the version string and the repeated title, and restore paragraph breaks wh
 element boundary can be identified. If run-together words can't be split reliably, leave
 them — a wrong split is worse than an ugly one.
 
+### Resolution (implemented 2026-08-17)
+
+New `format.clean_section_display_text(raw_text, short_name)`, called at the one render
+site (`filings.py`'s `_render_detail`, right before `st.text`). `text` — exactly what
+`section_store.read_section_text` returns — is never reassigned; the cleaned string is a
+separate value passed straight to `st.text`. The stored row is read-only here, same
+discipline as currency escaping.
+
+**Version string**: reuses `config.XBRL_VIEWER_VERSION_LINE_PATTERN`, the pattern
+SPEC-005's `section_store.normalize_for_wording_hash` already strips for its own,
+unrelated purpose (wording-identity hashing) — not a second mechanism. Checked before
+reusing it: it handles a variable number of dot-separated version segments
+("v3.25.0.1" as well as "v3.26.1"), which a hand-rolled 3-segment-only pattern (my first
+draft) would have silently missed.
+
+**Repeated title**: checked against the real corpus before writing this, and found two
+different shapes, not one — AMZN doubles as title-case-then-ALL-CAPS ("Accounting
+Policies and Supplemental Disclosures ACCOUNTING POLICIES..."), NVIDIA repeats the same
+case verbatim ("Groq Groq...", "Organization and Summary... Organization and
+Summary..."). A loop strips `short_name` or `short_name.upper()`, whichever matches,
+however many times it actually repeats — general to both shapes, not hard-coded to
+exactly three repeats. The duration line ("6 Months Ended" / "12 Months Ended" / ...) is
+stripped by starting-with-`short_name`, not by enumerating every SEC duration phrase; the
+`[Abstract]` line by its own suffix, not by content match against `short_name` — checked
+live that the two don't always agree ("Financial Instruments" vs. "Investments, Debt and
+Equity Securities [Abstract]" for the same section).
+
+**Run-together words**: restores a paragraph break at a 4+-letter ALL-CAPS run
+immediately followed by a Titlecase word start (`DISCLOSURESUnaudited` →
+`DISCLOSURES\n\nUnaudited`) — the shape of a former header directly abutting the body
+text that used to sit in a different table cell. This went through two rounds of
+false-positive checking against real filing text, not just the header cases it needs to
+catch:
+
+- A broader "any lowercase immediately followed by uppercase" rule was rejected first,
+  after checking it against NVDA's own product name "GeForce" and confirming it would
+  wrongly split into "Ge"/"Force".
+- The narrower ALL-CAPS-run rule was then found, live against NVDA's "Stock-Based
+  Compensation" section, to have its own false positive: a 2-letter minimum matched
+  inside "RSUs"/"PSUs" (the acronym fragment "RS"/"PS" is itself a short ALL-CAPS run
+  followed by a Titlecase-shaped "Us"), corrupting them into "RS\n\nUs"/"PS\n\nUs".
+  Raising the minimum run length to 4 letters fixes this — every real header this
+  function needs to catch is well over 4 letters — while leaving RSUs, PSUs, and the
+  same-shaped ISOs/IPOs/SPACs untouched. Re-checked against the full corpus (all 2,190
+  sections currently in the database) after the fix: zero remaining short-acronym
+  false positives, zero leaked version strings.
+
+**Left deliberately alone, per the item's own instruction**: a Titlecase-word directly
+abutting another Titlecase word (`Stock Repurchase ActivityIn March 2022`,
+`SecuritiesAs of December 31`) is structurally identical to a genuine camelCase brand
+name using text alone — there is no reliable way to tell a real header join from a real
+proper noun in this shape, so it is left unsplit. This is a real, known limitation, not
+an oversight: some run-together joins in the viewer will still read run-together.
+
+**Reliability, stated plainly**: the version-string, duration-line, date-line,
+`[Abstract]`-line, and repeated-title stripping are all structural (matched by shape or
+position, not guessed) and reliable. The ALL-CAPS-run paragraph-break restoration is
+reliable for the specific shape it targets, but is deliberately conservative — it does
+not attempt the harder, ambiguous Titlecase-to-Titlecase case at all. Overall: **best-
+effort**, by design, not because the reliable part is in doubt.
+
 ---
 
 ## When you're done

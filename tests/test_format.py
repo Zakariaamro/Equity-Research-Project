@@ -186,3 +186,125 @@ def test_format_growth_pct_is_always_signed():
 
 def test_format_growth_pct_empty_string_when_none():
     assert fmt.format_growth_pct(None) == ""
+
+
+# SPEC-008-batch-4 item 5: display-time cleanup of SEC R-file rendering
+# artifacts. Every case below is built from the real shapes confirmed
+# against the live database (AMZN 10-Q, NVDA 10-K) before writing the
+# function -- not invented edge cases.
+
+def test_clean_section_display_text_strips_leading_version_string():
+    raw = "v3.26.1\nAccounting Policies 6 Months Ended\nJun. 30, 2026\nAccounting Policies [Abstract]\nAccounting Policies ACCOUNTING POLICIES\nReal content starts here."
+    cleaned = fmt.clean_section_display_text(raw, "Accounting Policies")
+    assert "v3.26.1" not in cleaned
+    assert cleaned.startswith("Real content starts here.")
+
+
+def test_clean_section_display_text_strips_duration_and_date_and_abstract_lines():
+    raw = "v1.0.0\nLeases 3 Months Ended\nMar. 31, 2026\nLeases [Abstract]\nLeases LEASES\nWe have entered into leases."
+    cleaned = fmt.clean_section_display_text(raw, "Leases")
+    assert "3 Months Ended" not in cleaned
+    assert "Mar. 31, 2026" not in cleaned
+    assert "[Abstract]" not in cleaned
+    assert cleaned.startswith("We have entered into leases.")
+
+
+def test_clean_section_display_text_strips_abstract_line_even_when_it_does_not_match_short_name():
+    # Checked live: the abstract line's own text does not always match
+    # short_name (e.g. short_name "Financial Instruments" vs. abstract
+    # line "Investments, Debt and Equity Securities [Abstract]") -- must
+    # be identified structurally, by the "[Abstract]" suffix, not by
+    # content match.
+    raw = (
+        "v3.26.1\nFinancial Instruments 6 Months Ended\nJun. 30, 2026\n"
+        "Investments, Debt and Equity Securities [Abstract]\n"
+        "Financial Instruments FINANCIAL INSTRUMENTS\nCash and equivalents were as follows."
+    )
+    cleaned = fmt.clean_section_display_text(raw, "Financial Instruments")
+    assert "[Abstract]" not in cleaned
+    assert cleaned.startswith("Cash and equivalents were as follows.")
+
+
+def test_clean_section_display_text_strips_title_case_then_all_caps_repeat():
+    # AMZN's shape.
+    raw = (
+        "v3.26.1\nAccounting Policies and Supplemental Disclosures 6 Months Ended\n"
+        "Jun. 30, 2026\nAccounting Policies [Abstract]\n"
+        "Accounting Policies and Supplemental Disclosures ACCOUNTING POLICIES AND SUPPLEMENTAL "
+        "DISCLOSURESUnaudited Interim Financial Information follows."
+    )
+    cleaned = fmt.clean_section_display_text(raw, "Accounting Policies and Supplemental Disclosures")
+    assert "ACCOUNTING POLICIES" not in cleaned
+    assert cleaned.startswith("Unaudited Interim Financial Information follows.")
+
+
+def test_clean_section_display_text_strips_same_case_doubled_title_repeat():
+    # NVDA's shape -- the title repeats verbatim rather than title-case-
+    # then-ALL-CAPS.
+    raw = "v3.26.1\nGroq 3 Months Ended\nApr. 26, 2026\nGroq [Abstract]\nGroq Groq Real content about the acquisition follows."
+    cleaned = fmt.clean_section_display_text(raw, "Groq")
+    assert cleaned.startswith("Real content about the acquisition follows.")
+
+
+def test_clean_section_display_text_restores_paragraph_break_at_all_caps_header_join():
+    # short_name deliberately doesn't match the embedded ALL-CAPS run, so
+    # this exercises the paragraph-break regex itself rather than the
+    # title-repeat stripping loop (which would otherwise consume
+    # "DISCLOSURES" as a repeat of a matching title first).
+    raw = "COMMITMENTSAndContingencies were as follows for the period."
+    cleaned = fmt.clean_section_display_text(raw, "Unrelated Section Name")
+    assert "COMMITMENTSAndContingencies" not in cleaned
+    assert "COMMITMENTS\n\nAndContingencies were as follows for the period." in cleaned
+
+
+def test_clean_section_display_text_does_not_split_camelcase_brand_names():
+    # NVDA's own filings contain genuine camelCase product names --
+    # "GeForce" must never be split into "Ge" / "Force".
+    raw = "GeForce RTX and DGX systems drove datacenter revenue growth."
+    cleaned = fmt.clean_section_display_text(raw, "Products")
+    assert "GeForce" in cleaned
+    assert "Ge\n\nForce" not in cleaned
+
+
+def test_clean_section_display_text_does_not_split_short_acronym_plurals():
+    # The bug found live in NVDA's "Stock-Based Compensation" section: a
+    # 2-letter ALL-CAPS-run minimum matched inside "RSUs"/"PSUs" ("RS"/
+    # "PS" being themselves a short all-caps run followed by a
+    # Titlecase-shaped "Us"), corrupting them into "RS\n\nUs"/"PS\n\nUs".
+    raw = (
+        "We recognize stock-based compensation expense from grants of restricted "
+        "stock units, or RSUs, performance stock units, or PSUs, and market-based "
+        "PSUs, and issuances under our employee stock purchase plan, or ESPP."
+    )
+    cleaned = fmt.clean_section_display_text(raw, "Stock-Based Compensation")
+    assert "RS\n\nUs" not in cleaned
+    assert "PS\n\nUs" not in cleaned
+    assert "RSUs" in cleaned
+    assert "PSUs" in cleaned
+
+
+def test_clean_section_display_text_does_not_split_other_short_acronyms():
+    raw = "Grants of ISOs and RSUs are common; our IPOs and SPACs this year were unrelated."
+    cleaned = fmt.clean_section_display_text(raw, "Equity")
+    for acronym in ("ISOs", "RSUs", "IPOs", "SPACs"):
+        assert acronym in cleaned
+
+
+def test_clean_section_display_text_never_modifies_the_stored_text_object():
+    # The hard constraint: this function must be side-effect-free on its
+    # input -- the stored, content-addressed row is never touched, only
+    # what's handed back for display.
+    raw = "v3.26.1\nLeases 3 Months Ended\nMar. 31, 2026\nLeases [Abstract]\nLeases LEASES\nBody text."
+    original = str(raw)
+    fmt.clean_section_display_text(raw, "Leases")
+    assert raw == original
+
+
+def test_clean_section_display_text_leaves_titlecase_to_titlecase_joins_alone():
+    # Deliberate limitation, stated in the item itself: a join that isn't
+    # an ALL-CAPS-run-into-Titlecase is structurally indistinguishable
+    # from a genuine camelCase brand name using text alone -- a wrong
+    # split is worse than an ugly one, so these are left untouched.
+    raw = "Stock Repurchase ActivityIn March 2022, the Board authorized a program."
+    cleaned = fmt.clean_section_display_text(raw, "Stockholders' Equity")
+    assert "Stock Repurchase ActivityIn March 2022" in cleaned
