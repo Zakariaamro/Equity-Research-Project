@@ -289,6 +289,43 @@ _BARE_DATE_LINE = re.compile(r"^[A-Z][a-z]{2}\.\s\d{1,2},\s\d{4}$")
 # PSUs, and the same-shaped ISOs/IPOs/SPACs (all confirmed left untouched).
 _ALL_CAPS_RUN_INTO_TITLECASE = re.compile(r"([A-Z]{4,}?)([A-Z][a-z])")
 
+# SPEC-008-batch-4 follow-up item 2 (approved 2026-08-18): a full stop
+# directly followed by a capital letter, no space -- "10-K.Principles",
+# "eliminated.Use", "costs.On November 21" -- is always a lost element
+# boundary; there is no legitimate piece of running prose shaped this way
+# (a real sentence end is always followed by a space). Deliberately
+# narrower than a bare `\.([A-Z])`, though: checked against the full real
+# corpus before choosing this shape, and a bare version corrupted roughly
+# 2,700 genuine multi-period abbreviations -- "U.S." (by far the most
+# common), "U.K.", "B.V.", "K.K.", and district-court short forms
+# ("E.D.", "W.D.", "N.D.") -- every one of which is written as a run of
+# SINGLE letters each followed by its own period with no space
+# ("U.S." is "U" + "." + "S" + "."), the identical local shape to a
+# genuine one-letter sentence ending. The token captured before the
+# period is checked, and left untouched only when it is EXACTLY one
+# uppercase letter: excludes "U.S."/"B.V."-style initials, but not a real
+# multi-character word or code ending in a capital, e.g. "10-K." (the
+# `(?:\d+-)?` prefix keeps a digit-hyphen lead like "10-"/"8-" glued to
+# the letter that follows it, so "10-K" reads as the 4-character token
+# "10-K", not the bare 1-character "K" alone -- confirmed live: without
+# this, "Annual Report on Form 10-K.Prior Period Reclassifications" (a
+# real, repeated case in the corpus) would have been wrongly excluded
+# too). Re-verified against all 2,190 sections after adding this
+# exclusion: zero remaining false positives, and the exclusion's own
+# false-negative cost is small and known -- a genuine single-capital-
+# letter sentence ending (found once: "...Term Loan A.On June 7, 2023",
+# a loan tranche literally named "A") stays unsplit rather than risk
+# every "U.S." in the corpus -- the same "a wrong split is worse than an
+# ugly one" trade this project already made for the ALL-CAPS rule above.
+_SENTENCE_END_INTO_CAPITAL = re.compile(r"((?:\d+-)?[A-Za-z0-9]+)\.([A-Z])")
+
+
+def _restore_sentence_break(match: re.Match) -> str:
+    token = match.group(1)
+    if len(token) == 1 and token.isalpha() and token.isupper():
+        return match.group(0)  # "U.S."/"B.V."-shaped initials -- left exactly as found
+    return f"{token}.\n\n{match.group(2)}"
+
 
 def clean_section_display_text(raw_text: str, short_name: str) -> str:
     """SPEC-008-batch-4 item 5 (approved 2026-08-16): DISPLAY-TIME cleanup
@@ -334,9 +371,16 @@ def clean_section_display_text(raw_text: str, short_name: str) -> str:
     Then restores a paragraph break at every remaining ALL-CAPS-run/
     Titlecase join anywhere in the text (see `_ALL_CAPS_RUN_INTO_TITLECASE`
     for why this specific pattern, not a broader lowercase-to-uppercase
-    one, was checked and chosen). A join that ISN'T this exact shape --
-    e.g. "Stock Repurchase ActivityIn March 2022", a title-case sub-header
-    running into title-case content, structurally identical to a genuine
+    one, was checked and chosen), and separately at every unambiguous
+    full-stop-directly-into-capital-letter join (see
+    `_SENTENCE_END_INTO_CAPITAL` / `_restore_sentence_break` -- a period
+    is never legitimately followed directly by a capital with no space,
+    EXCEPT inside a multi-period initialism like "U.S."/"B.V.", which is
+    excluded by name, not guessed).
+
+    A join that is neither of these two specific shapes -- e.g. "Stock
+    Repurchase ActivityIn March 2022", a title-case sub-header running
+    into title-case content, structurally identical to a genuine
     camelCase brand name -- is deliberately left alone: this project's own
     rule for D15-style findings applies here too, a wrong split is worse
     than an ugly one, and there is no reliable way to tell the two apart
@@ -363,7 +407,8 @@ def clean_section_display_text(raw_text: str, short_name: str) -> str:
             break
 
     remainder = remainder.lstrip()
-    return _ALL_CAPS_RUN_INTO_TITLECASE.sub(r"\1\n\n\2", remainder)
+    remainder = _ALL_CAPS_RUN_INTO_TITLECASE.sub(r"\1\n\n\2", remainder)
+    return _SENTENCE_END_INTO_CAPITAL.sub(_restore_sentence_break, remainder)
 
 
 def format_growth_pct(value: float | None, precision: int = 1) -> str:

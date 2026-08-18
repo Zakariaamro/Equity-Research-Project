@@ -268,3 +268,49 @@ effort**, by design, not because the reliable part is in doubt.
 
 Report once. Note explicitly whether item 3 left the Filings observations list thin enough
 to question, and whether item 5's paragraph reconstruction is reliable or best-effort.
+
+---
+
+## Follow-up (approved 2026-08-18)
+
+Three more items, raised after using the shipped batch.
+
+### Follow-up item 1 — the line-item column is still a bit wide
+
+Resolved — see the batch 4 item 1 resolution above, updated in place is not how this
+project records changes, so recorded here instead: the binding label ("PP&E and
+finance-lease ROU assets, net", 39 chars) went to 36 via ampersand-for-and ("PP&E &
+finance-lease ROU assets, net"), the same convention "PP&E" itself already uses. "ROU
+assets" was kept rather than dropped — it's the underlying XBRL concept's own wording,
+not decoration. Two labels the original item 1 had declared unshortenable turned out to
+have real forms after all: "Acquisitions, net" (a caption used verbatim in real condensed
+cash-flow disclosures) and "Maturities/sales of investments" (reused from this project's
+own config.py METRIC_REGISTRY, not invented a second time). Column width 320 → 300px, fit
+to the new 36-char worst case by the same two-point estimate this project has used since
+batch 3 item 6. The requested ~260px isn't reachable at 36 chars without inventing further
+abbreviation ("fin." for "finance") — reported rather than forced.
+
+### Follow-up item 2 — restore paragraph breaks at period-into-capital joins
+
+`format.clean_section_display_text` now also restores a break at a full stop directly
+followed by a capital letter with no space (`_SENTENCE_END_INTO_CAPITAL`) — this shape
+has no legitimate reading other than a lost element boundary, since a real sentence end is
+always followed by a space.
+
+The one real risk — checked against the full corpus before, not after, committing — is a
+multi-period initialism ("U.S.", "B.V.", "K.K.", district-court short forms "E.D."/"W.D."/
+"N.D.") that has the identical local shape (one capital letter, a period, no space). A
+naive version of this rule corrupted roughly 2,700 real "U.S." occurrences alone into
+"U.\n\nS." across the corpus. Fixed by leaving a match untouched whenever the token
+immediately before the period is exactly one uppercase letter — with one refinement found
+live: "non-U.S." would otherwise merge "non-U" into a single 5-character token via the
+hyphen and escape the exclusion, so the digit-hyphen lead is only glued to what follows it
+when it's actually a digit (`10-`, `8-`, keeping SEC form codes like "10-K." intact as
+4-character tokens so they still split), never an alphabetic prefix like "non-".
+
+Re-verified against all 2,190 sections after the fix, same as the ALL-CAPS rule before it:
+zero remaining false positives, and the original RSUs/PSUs fix confirmed still intact
+alongside it. The known, accepted cost of the single-letter exclusion: a genuine
+one-letter sentence ending (found once — a loan facility literally named "Term Loan A",
+"...Term Loan A.On June 7, 2023...") stays unsplit rather than risk every "U.S." in the
+corpus. Same trade this project already made for the ALL-CAPS rule.

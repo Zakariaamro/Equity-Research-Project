@@ -308,3 +308,71 @@ def test_clean_section_display_text_leaves_titlecase_to_titlecase_joins_alone():
     raw = "Stock Repurchase ActivityIn March 2022, the Board authorized a program."
     cleaned = fmt.clean_section_display_text(raw, "Stockholders' Equity")
     assert "Stock Repurchase ActivityIn March 2022" in cleaned
+
+
+# SPEC-008-batch-4 follow-up item 2 (approved 2026-08-18): a full stop
+# directly into a capital letter, no space -- always a lost boundary,
+# except inside a multi-period initialism like "U.S."/"B.V.", which this
+# rule must not corrupt. Every case below is either a real example from
+# the item's own message or a shape confirmed live against the real
+# corpus before this was written.
+
+def test_clean_section_display_text_restores_paragraph_break_at_period_into_capital():
+    raw = "eliminated.Use of estimates in the preparation of financial statements."
+    cleaned = fmt.clean_section_display_text(raw, "Unrelated Section Name")
+    assert "eliminated.Use" not in cleaned
+    assert "eliminated.\n\nUse of estimates" in cleaned
+
+
+def test_clean_section_display_text_restores_paragraph_break_at_period_into_capital_second_example():
+    raw = "estimates.During the period, management made no material changes."
+    cleaned = fmt.clean_section_display_text(raw, "Unrelated Section Name")
+    assert "estimates.During" not in cleaned
+    assert "estimates.\n\nDuring the period" in cleaned
+
+
+def test_clean_section_display_text_restores_paragraph_break_after_a_form_reference():
+    # "10-K." ends in a single capital letter but is a 4-character code,
+    # not a bare initial -- the digit-hyphen prefix keeps it out of the
+    # single-letter exclusion built for "U.S."-style abbreviations.
+    # Confirmed live: this exact shape repeats across the real corpus
+    # ("...our 2025 Annual Report on Form 10-K.Principles of...").
+    raw = "our 2025 Annual Report on Form 10-K.Principles of consolidation follow."
+    cleaned = fmt.clean_section_display_text(raw, "Unrelated Section Name")
+    assert "10-K.Principles" not in cleaned
+    assert "10-K.\n\nPrinciples of consolidation" in cleaned
+
+
+def test_clean_section_display_text_does_not_split_us_style_initials():
+    # The false positive found live testing the naive version of this
+    # rule against the real corpus: "U.S." is "U" + "." + "S" + ".", the
+    # identical local shape (single capital, period, no space) to a
+    # genuine one-letter sentence ending -- roughly 2,700 real
+    # occurrences in the corpus, by far the most common risk case.
+    raw = "Our income tax expense includes U.S. and foreign components for the period."
+    cleaned = fmt.clean_section_display_text(raw, "Unrelated Section Name")
+    assert "U.S. and foreign components" in cleaned
+    assert "U.\n\nS." not in cleaned
+
+
+def test_clean_section_display_text_does_not_split_other_multi_period_initials():
+    # B.V. (Dutch corporate form), K.K. (Japanese), and U.S. federal
+    # district short forms (E.D./W.D./N.D.) -- all confirmed live in the
+    # real corpus, all the same "single capital + period, no space" shape.
+    raw = 'Micron Semiconductor B.V., ("Micron B.V."), in the U.S. District Court for the W.D. of Texas.'
+    cleaned = fmt.clean_section_display_text(raw, "Unrelated Section Name")
+    assert "B.V." in cleaned
+    assert "B.\n\nV." not in cleaned
+    assert "W.D." in cleaned
+    assert "W.\n\nD." not in cleaned
+
+
+def test_clean_section_display_text_does_not_split_hyphenated_us_abbreviation():
+    # Found live: a bare single-letter exclusion is not enough on its own
+    # -- "non-U.S." would otherwise merge "non-U" into one 5-character
+    # token via the hyphen and escape the exclusion. Must still resolve
+    # to the bare single letter "U" for this specific case.
+    raw = "certain non-U.S. subsidiaries had cumulative earnings not subject to tax."
+    cleaned = fmt.clean_section_display_text(raw, "Unrelated Section Name")
+    assert "non-U.S. subsidiaries" in cleaned
+    assert "non-U.\n\nS." not in cleaned
