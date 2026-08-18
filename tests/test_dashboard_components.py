@@ -881,12 +881,12 @@ def test_statement_table_widens_the_line_item_column_past_the_longest_real_label
     assert column_config[components._LINE_ITEM_COL]["width"] == components._LINE_ITEM_COL_WIDTH_PX
     # Wide enough for the real registry's own longest label, not just an
     # arbitrary bigger number -- proves the width was actually SIZED to
-    # something, not picked blind. SPEC-008-batch-4 item 1 (approved
-    # 2026-08-16) shortened the labels themselves ("Property, plant and
-    # equipment and finance-lease ROU assets, net", 63 characters, is now
-    # "PP&E and finance-lease ROU assets, net", 39) -- this is the new
-    # real worst case, not the old one.
-    longest_real_label = "PP&E and finance-lease ROU assets, net"
+    # something, not picked blind. SPEC-008-batch-4 follow-up item 1
+    # (approved 2026-08-18) shortened the labels further ("PP&E and
+    # finance-lease ROU assets, net", 39 characters, is now "PP&E &
+    # finance-lease ROU assets, net", 36) -- this is the new real worst
+    # case, not the old one.
+    longest_real_label = "PP&E & finance-lease ROU assets, net"
     assert components._LINE_ITEM_COL_WIDTH_PX > len(longest_real_label) * 7  # rough px-per-character floor
 
 

@@ -252,11 +252,28 @@ _MAX_TABLE_HEIGHT_PX = 700
 # registry, same discipline as before -- SPEC-008-batch-4 item 1 (approved
 # 2026-08-16) shortened the labels themselves rather than widening the
 # column further; the old 63-character worst case ("Property, plant and
-# equipment and finance-lease ROU assets, net") is now 39 ("PP&E and
-# finance-lease ROU assets, net"), and this width shrinks to match --
-# still a generous, rounded-up estimate at typical UI-font metrics, not a
-# browser-measured exact fit.
-_LINE_ITEM_COL_WIDTH_PX = 320
+# equipment and finance-lease ROU assets, net") went to 39 ("PP&E and
+# finance-lease ROU assets, net"), and this width shrank to match.
+#
+# SPEC-008-batch-4 follow-up item 1 (approved 2026-08-18): shortened again,
+# 39 -> 36 ("PP&E and..." -> "PP&E & finance-lease ROU assets, net";
+# ampersand-for-and, same convention "PP&E" itself already uses) -- the
+# floor for THIS label via recognised shorthand alone, since "ROU assets"
+# is the underlying XBRL concept's own wording, not decoration to trim.
+# Two more labels lost real, precedented padding in the same pass
+# ("Acquisitions, net"; "Maturities/sales of investments", reusing the
+# exact shorthand config.py's own METRIC_REGISTRY already uses for the
+# same canonical) but neither was ever the binding outlier, so neither
+# moves this number on its own.
+#
+# The two known data points (63 chars -> 520px, 39 chars -> 320px) sit
+# exactly on one line -- px = round(chars * 25/3 - 5) -- close enough to
+# treat as this project's own estimation method rather than re-eyeballing
+# a third time: 36 chars -> 295, rounded up to a clean 300. Requested
+# target was ~260px; not reachable at 36 chars without inventing a
+# further abbreviation (e.g. "fin." for "finance"), which the item
+# explicitly rules out -- reported rather than forced.
+_LINE_ITEM_COL_WIDTH_PX = 300
 # "small" (75px) already comfortably fits every fiscal-label header item
 # 5 produces (FY2025, Q3 FY26 -- 6-7 characters) by the same rough
 # metric; widened modestly anyway as cheap insurance for the longer

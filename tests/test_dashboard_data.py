@@ -1142,7 +1142,7 @@ def test_balance_sheet_table_splits_ppe_row_when_fallback_used_in_at_least_one_c
     assert ppe_rows[0]["label"] == "PP&E, net"
     assert ppe_rows[0]["cells"][0]["value"] == 50_000_000_000
     assert ppe_rows[0]["cells"][1]["value"] is None
-    assert ppe_rows[1]["label"] == "PP&E and finance-lease ROU assets, net"
+    assert ppe_rows[1]["label"] == "PP&E & finance-lease ROU assets, net"
     assert ppe_rows[1]["cells"][0]["value"] is None
     assert ppe_rows[1]["cells"][1]["value"] == 80_000_000_000
 
@@ -1178,7 +1178,23 @@ def test_balance_sheet_table_omits_the_primary_row_when_only_the_fallback_is_eve
     rows = data.get_balance_sheet_table(AMZN_CIK, periods, "AMZN", db_path)
     ppe_rows = [r for r in rows if r["canonical"] == "ppe_net"]
     assert len(ppe_rows) == 1
-    assert ppe_rows[0]["label"] == "PP&E and finance-lease ROU assets, net"
+    assert ppe_rows[0]["label"] == "PP&E & finance-lease ROU assets, net"
+
+
+def test_cash_flow_lines_follow_up_shorthand_labels():
+    # SPEC-008-batch-4 follow-up item 1 (approved 2026-08-18): "Acquisitions,
+    # net" and "Maturities/sales of investments" -- the latter reused
+    # verbatim from config.py's own investment_maturities_discrete
+    # MetricDef.display_name (SPEC-006), not invented a second time here.
+    by_canonical = {line[0]: line for line in data.CASH_FLOW_LINES}
+    assert by_canonical["acquisitions"][1] == "Acquisitions, net"
+    assert by_canonical["acquisitions"][3] == "Acquisitions, net"
+    assert by_canonical["investment_maturities"][1] == "Maturities/sales of investments"
+    assert by_canonical["investment_maturities"][3] == "Maturities/sales of investments"
+    assert (
+        by_canonical["investment_maturities"][1]
+        == config.METRIC_REGISTRY["investment_maturities_discrete"].display_name.removesuffix(" (discrete quarter)")
+    )
 
 
 def test_statement_table_row_with_no_data_at_all_still_shows_a_single_blank_row(db_path):

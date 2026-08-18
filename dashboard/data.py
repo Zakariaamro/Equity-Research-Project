@@ -480,9 +480,18 @@ BALANCE_SHEET_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
     # own suggested shorthand, and the single biggest contributor to the
     # line-item column's old 63-character worst case -- 63 -> 39 for the
     # fallback row alone.
+    #
+    # SPEC-008-batch-4 follow-up item 1 (approved 2026-08-18): "and" -> "&"
+    # shortens it further to 36 -- the same ampersand-for-and convention
+    # "PP&E" itself already uses, so not a second style introduced here.
+    # "ROU assets" is deliberately kept: it isn't decorative -- it's the
+    # actual wording of the underlying XBRL concept (config.py's
+    # PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulated
+    # DepreciationAndAmortization), and dropping it would be inventing a
+    # paraphrase, not applying a recognised shorthand.
     (
         "ppe_net", "PP&E, net",
-        "ppe_and_lease_net", "PP&E and finance-lease ROU assets, net",
+        "ppe_and_lease_net", "PP&E & finance-lease ROU assets, net",
     ),
     ("total_assets", "Total assets", None, None),
     ("goodwill", "Goodwill", None, None),
@@ -527,14 +536,25 @@ CASH_FLOW_LINES: tuple[tuple[str, str, str | None, str | None], ...] = (
         "cfo_discrete", "Net cash from operating activities",
     ),
     ("capex", "Capital expenditure", "capex_discrete", "Capital expenditure"),
-    ("acquisitions", "Acquisitions, net of cash acquired", "acquisitions_discrete", "Acquisitions, net of cash acquired"),
+    # SPEC-008-batch-4 follow-up item 1 (approved 2026-08-18): batch 4 item 1
+    # itself checked this one and found no recognised shorthand -- re-checked
+    # here and found one after all: "Acquisitions, net" (dropping "of cash
+    # acquired", which "net" already carries) is a caption that appears
+    # verbatim in real condensed cash-flow disclosures, not paraphrased for
+    # this project.
+    ("acquisitions", "Acquisitions, net", "acquisitions_discrete", "Acquisitions, net"),
     (
         "investment_purchases", "Purchases of investments",
         "investment_purchases_discrete", "Purchases of investments",
     ),
+    # SPEC-008-batch-4 follow-up item 1 (approved 2026-08-18): reused, not
+    # invented -- "Maturities/sales of investments" is already this
+    # project's OWN established shorthand for this exact canonical
+    # (config.py's investment_maturities_discrete MetricDef display_name,
+    # SPEC-006), just never brought over to this table before now.
     (
-        "investment_maturities", "Maturities and sales of investments",
-        "investment_maturities_discrete", "Maturities and sales of investments",
+        "investment_maturities", "Maturities/sales of investments",
+        "investment_maturities_discrete", "Maturities/sales of investments",
     ),
     # Checked against the real corpus and REJECTED, per the spec's own
     # explicit warning: summing this section's own four lines above
