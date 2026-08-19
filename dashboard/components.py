@@ -666,7 +666,15 @@ def statement_table(rows: list[dict], periods: list[dict], show_growth: bool, ke
         file_name=f"{key}_raw.csv",
         mime="text/csv",
         key=f"raw_export__{key}",
-        help=(
+        # SPEC-008-batch-4 follow-up item 4 (approved 2026-08-20): the D1
+        # currency/LaTeX bug a THIRD time -- Streamlit markdown-renders
+        # help= tooltips too, not just st.markdown/write/caption. Escaped
+        # at the call site, same discipline as every other '$'-bearing
+        # caption in this project (see _KEY_METRICS_CAPTION and this
+        # function's own header a few calls up); the constant itself stays
+        # readable and is named on the allowlist in
+        # tests/test_dashboard_structure.py instead of hand-escaped here.
+        help=fmt.escape_markdown_currency(
             "Model-ready: the same rows and columns as the table above, but as plain numbers -- "
             "no thousands separators, no $/%, negatives as '-' not parentheses, blank cells left "
             "genuinely empty (never '--' or 'n/m'). Units are stated per row in the line-item "
