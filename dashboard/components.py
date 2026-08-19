@@ -305,6 +305,35 @@ _CELL_FORMATTERS = {
     "fcff_tax_rate": lambda value: fmt.format_percent(value, 1),
 }
 
+# SPEC-008-batch-4 follow-up item 3 (approved 2026-08-19): model-ready CSV
+# export -- same per-canonical unit exceptions as `_CELL_FORMATTERS` above,
+# reused by name rather than re-derived, so the two can never quietly drift
+# apart (`test_raw_export_units_cover_exactly_the_cell_formatter_exceptions`
+# pins this). `_RAW_EXPORT_SCALE` divides a raw stored value down to the
+# SAME magnitude the on-screen table already shows (millions for usd,
+# unscaled for EPS dollars and the tax-rate fraction) -- the export is
+# meant to map onto what's on screen, not reintroduce a second scale a
+# reader would have to reconcile against the app. Full float precision is
+# kept (no rounding to the on-screen 0-2dp) -- a model built from this
+# export should not carry this project's own DISPLAY rounding as error.
+_RAW_EXPORT_SCALE = {
+    "eps_basic": 1,
+    "eps_diluted": 1,
+    "basic_shares": 1 / 1_000_000,
+    "diluted_shares": 1 / 1_000_000,
+    "fcff_tax_rate": 1,
+}
+_RAW_EXPORT_DEFAULT_SCALE = 1 / 1_000_000  # usd, millions -- R1's own convention
+_RAW_EXPORT_UNIT_SUFFIX = {
+    "eps_basic": " ($)",
+    "eps_diluted": " ($)",
+    "basic_shares": " (shares, m)",
+    "diluted_shares": " (shares, m)",
+    "fcff_tax_rate": " (decimal fraction)",
+}
+_RAW_EXPORT_DEFAULT_UNIT_SUFFIX = " ($m)"
+_RAW_EXPORT_GROWTH_UNIT_SUFFIX = " (decimal fraction)"
+
 # SPEC-008-batch-3 item 1 (approved 2026-08-13): cash flow section
 # subtotals -- the lines each section builds up to (plus the statement's
 # own final closing balance). Structural, by canonical, never by a cell's
@@ -366,6 +395,61 @@ def _fiscal_column_label(period: dict) -> str:
             return f"Q4 FY{fiscal_year % 100:02d}"
         return f"FY{fiscal_year}"
     return f"{fiscal_period} FY{fiscal_year % 100:02d}"
+
+
+def build_raw_export_rows(rows: list[dict], period_cols: list[str], show_growth: bool) -> list[dict]:
+    """SPEC-008-batch-4 follow-up item 3 (approved 2026-08-19): the model-
+    ready counterpart to `statement_table`'s own display rows -- same
+    line-item rows, same period columns (`rows`/`period_cols` must already
+    be in whatever order the caller wants exported; this function performs
+    no reversal of its own), but every cell is a plain number or `None`,
+    never a formatted string. A separate, standalone function -- not
+    folded into `statement_table`'s own display loop -- specifically so it
+    can be unit-tested directly: `st.download_button`'s underlying file
+    bytes aren't reachable through `AppTest` (checked: `DownloadButtonProto`
+    exposes a `deferred_file_id`, no `data` field, at this Streamlit
+    version), so a pure function callable outside of Streamlit entirely is
+    the only way to pin this behaviour with a real test rather than an
+    exception-only smoke check.
+
+    Per-canonical scale/unit come from `_RAW_EXPORT_SCALE`/
+    `_RAW_EXPORT_UNIT_SUFFIX`, which mirror `_CELL_FORMATTERS`'s own
+    exception set by construction (same three, still `eps_basic`,
+    `eps_diluted`, `basic_shares`, `diluted_shares`, `fcff_tax_rate`) --
+    reused, not re-decided, so the on-screen table and this export can
+    never silently disagree about which rows are dollars-in-millions and
+    which aren't.
+
+    Blank causes ("gap" vs "split") and the derived-quarter marker (†)
+    both collapse to `None`/no marker here -- correct per the item's own
+    "blanks genuinely empty" instruction for the first, and a real, small,
+    known loss of information for the second (there's no way to flag
+    "derived by subtraction" on a plain number without breaking numeric
+    parsing) -- the provenance stays visible in the app itself, just not
+    in this export."""
+    raw_rows: list[dict] = []
+    for row in rows:
+        scale = _RAW_EXPORT_SCALE.get(row["canonical"], _RAW_EXPORT_DEFAULT_SCALE)
+        unit_suffix = _RAW_EXPORT_UNIT_SUFFIX.get(row["canonical"], _RAW_EXPORT_DEFAULT_UNIT_SUFFIX)
+        # Indentation/bold are display styling for the on-screen row's
+        # STRUCTURAL role (SPEC-008-batch-3 item 1) -- not data, so this
+        # label carries neither; the row itself still sits in the same
+        # position either way, which is what "same row structure" means
+        # for a CSV with no visual weight or whitespace to preserve.
+        value_entry = {_LINE_ITEM_COL: row["label"] + unit_suffix}
+        for col_name, cell in zip(period_cols, row["cells"]):
+            value_entry[col_name] = None if cell["value"] is None else cell["value"] * scale
+        raw_rows.append(value_entry)
+
+        if show_growth:
+            growth_entry = {_LINE_ITEM_COL: _GROWTH_ROW_LABEL.strip() + _RAW_EXPORT_GROWTH_UNIT_SUFFIX}
+            for col_name, cell in zip(period_cols, row["cells"]):
+                if cell.get("growth_not_meaningful") is not None:
+                    growth_entry[col_name] = None  # "n/m" is a display-only marker, not exportable data
+                else:
+                    growth_entry[col_name] = cell.get("growth_pct")  # already a fraction, e.g. 0.101 for +10.1%
+            raw_rows.append(growth_entry)
+    return raw_rows
 
 
 def _parenthesize_if_negative(text: str, value: float) -> str:
@@ -557,6 +641,37 @@ def statement_table(rows: list[dict], periods: list[dict], show_growth: bool, ke
     height = min(_HEADER_HEIGHT_PX + _ROW_HEIGHT_PX * len(table_rows), _MAX_TABLE_HEIGHT_PX)
     st.dataframe(
         styled, column_config=column_config, hide_index=True, height=height, key=f"table_grid__{key}",
+    )
+
+    # SPEC-008-batch-4 follow-up item 3 (approved 2026-08-19): the native
+    # grid toolbar's own CSV export (st.dataframe ships one by default)
+    # exports the FORMATTED strings above -- "(142,545)", "n/m", "$7.29" --
+    # unusable as an input to a DCF built outside this app. This is a
+    # SEPARATE download of the SAME row/column structure with the
+    # underlying numbers instead: no thousands separators, no "$"/"%",
+    # negatives as a plain "-" (never parentheses), blanks genuinely empty
+    # (never "--"/"n/m"). Units are stated in the "Line item" label per
+    # row (" ($m)", " ($)", " (shares, m)", " (decimal fraction)") rather
+    # than in one caption or the filename -- this table mixes at least four
+    # different units across its own rows (see _RAW_EXPORT_UNIT_SUFFIX), so
+    # a single blanket statement anywhere else would be wrong for most of
+    # the rows it sits above; per-row is the only placement that's both
+    # accurate for every row and keeps the actual VALUE cells unlabeled
+    # numbers, which is what the item's own instruction is protecting.
+    raw_rows = build_raw_export_rows(rows, period_cols, show_growth)
+    raw_df = pd.DataFrame(raw_rows, columns=[_LINE_ITEM_COL] + period_cols)
+    st.download_button(
+        "Download raw values (CSV)",
+        data=raw_df.to_csv(index=False).encode("utf-8"),
+        file_name=f"{key}_raw.csv",
+        mime="text/csv",
+        key=f"raw_export__{key}",
+        help=(
+            "Model-ready: the same rows and columns as the table above, but as plain numbers -- "
+            "no thousands separators, no $/%, negatives as '-' not parentheses, blank cells left "
+            "genuinely empty (never '--' or 'n/m'). Units are stated per row in the line-item "
+            "label, since this table mixes $m, $, share counts, and decimal fractions."
+        ),
     )
 
     # SPEC-008-batch-4 item 1 (approved 2026-08-16): stated once, here,

@@ -1096,3 +1096,130 @@ def test_statement_table_subtotal_treatment_never_depends_on_the_cells_own_value
     assert df.iloc[0][components._LINE_ITEM_COL] == (
         components._SUBTOTAL_INDENT + "Net cash provided by operating activities"
     )
+
+
+# --- SPEC-008-batch-4 follow-up item 3 (approved 2026-08-19): model-ready CSV export ---
+#
+# `build_raw_export_rows` is tested directly, as a pure function, rather
+# than through AppTest -- `st.download_button`'s file bytes aren't reachable
+# through AppTest (`DownloadButtonProto` exposes a `deferred_file_id`, no
+# `data` field), so a real test of the actual VALUES needs a function
+# callable outside of Streamlit entirely. The button itself (label,
+# file_name, no-exception) is still checked once through AppTest below.
+
+
+def test_raw_export_units_cover_exactly_the_cell_formatter_exceptions():
+    # Reused, not re-decided: the raw export's own scale/unit tables must
+    # name exactly the same canonicals _CELL_FORMATTERS already treats as
+    # exceptions to the default $m-usd rule -- if the two ever drifted,
+    # the on-screen table and this export could disagree about what a row
+    # even IS (dollars vs. millions vs. a fraction) without either being
+    # obviously wrong on its own.
+    assert set(components._RAW_EXPORT_SCALE) == set(components._CELL_FORMATTERS)
+    assert set(components._RAW_EXPORT_UNIT_SUFFIX) == set(components._CELL_FORMATTERS)
+
+
+def test_raw_export_scales_usd_to_millions_like_the_on_screen_table():
+    rows = [{"canonical": "revenue", "label": "Revenue", "cells": [{"value": 637_960_000_000}]}]
+    raw = components.build_raw_export_rows(rows, ["Jun 30, 2026"], show_growth=False)
+    assert raw[0]["Jun 30, 2026"] == 637_960.0
+    assert raw[0][components._LINE_ITEM_COL] == "Revenue ($m)"
+
+
+def test_raw_export_keeps_negatives_as_a_plain_minus_never_parentheses():
+    rows = [{"canonical": "free_cash_flow", "label": "Free cash flow", "cells": [{"value": -18_171_000_000}]}]
+    raw = components.build_raw_export_rows(rows, ["Jun 30, 2026"], show_growth=False)
+    assert raw[0]["Jun 30, 2026"] == -18_171.0
+    csv_text = pd.DataFrame(raw, columns=[components._LINE_ITEM_COL, "Jun 30, 2026"]).to_csv(index=False)
+    assert "(18,171)" not in csv_text
+    assert "-18171" in csv_text or "-18171.0" in csv_text
+
+
+def test_raw_export_does_not_scale_eps_or_the_tax_rate_fraction():
+    rows = [
+        {"canonical": "eps_diluted", "label": "Diluted EPS", "cells": [{"value": 2.3541}]},
+        {"canonical": "fcff_tax_rate", "label": "Effective tax rate (FCFF)", "cells": [{"value": 0.118}]},
+    ]
+    raw = components.build_raw_export_rows(rows, ["Jun 30, 2026"], show_growth=False)
+    assert raw[0]["Jun 30, 2026"] == 2.3541  # dollars, not millions
+    assert raw[0][components._LINE_ITEM_COL] == "Diluted EPS ($)"
+    assert raw[1]["Jun 30, 2026"] == 0.118  # already a fraction -- not *100, never a '%' suffix
+    assert raw[1][components._LINE_ITEM_COL] == "Effective tax rate (FCFF) (decimal fraction)"
+
+
+def test_raw_export_scales_share_counts_to_millions():
+    rows = [{"canonical": "diluted_shares", "label": "Diluted shares outstanding", "cells": [{"value": 10_743_000_000}]}]
+    raw = components.build_raw_export_rows(rows, ["Jun 30, 2026"], show_growth=False)
+    assert raw[0]["Jun 30, 2026"] == 10_743.0
+    assert raw[0][components._LINE_ITEM_COL] == "Diluted shares outstanding (shares, m)"
+
+
+def test_raw_export_blank_cells_are_none_never_an_em_dash_or_n_m():
+    rows = [{"canonical": "revenue", "label": "Revenue", "cells": [{"value": None, "blank_cause": "gap"}]}]
+    raw = components.build_raw_export_rows(rows, ["Jun 30, 2026"], show_growth=False)
+    assert raw[0]["Jun 30, 2026"] is None
+    csv_text = pd.DataFrame(raw, columns=[components._LINE_ITEM_COL, "Jun 30, 2026"]).to_csv(index=False)
+    assert "—" not in csv_text  # em dash
+    assert "n/m" not in csv_text
+
+
+def test_raw_export_growth_rows_are_decimal_fractions_not_percent_strings():
+    rows = [
+        {
+            "canonical": "revenue", "label": "Revenue",
+            "cells": [{"value": 100_000_000, "growth_pct": 0.101, "growth_not_meaningful": None}],
+        },
+    ]
+    raw = components.build_raw_export_rows(rows, ["Jun 30, 2026"], show_growth=True)
+    assert len(raw) == 2
+    growth_row = raw[1]
+    assert growth_row[components._LINE_ITEM_COL] == "↳ Growth % (decimal fraction)"
+    assert growth_row["Jun 30, 2026"] == 0.101  # not "+10.1%"
+
+
+def test_raw_export_growth_not_meaningful_is_blank_not_the_n_m_marker():
+    rows = [
+        {
+            "canonical": "revenue", "label": "Revenue",
+            "cells": [{"value": 100_000_000, "growth_pct": None, "growth_not_meaningful": True}],
+        },
+    ]
+    raw = components.build_raw_export_rows(rows, ["Jun 30, 2026"], show_growth=True)
+    assert raw[1]["Jun 30, 2026"] is None
+
+
+def test_raw_export_omits_growth_rows_when_toggle_is_off():
+    rows = [
+        {
+            "canonical": "revenue", "label": "Revenue",
+            "cells": [{"value": 100_000_000, "growth_pct": 0.1, "growth_not_meaningful": None}],
+        },
+    ]
+    raw = components.build_raw_export_rows(rows, ["Jun 30, 2026"], show_growth=False)
+    assert len(raw) == 1  # value row only -- same row set the on-screen table shows with growth off
+
+
+def test_raw_export_row_and_column_structure_matches_the_display_table():
+    # Same number of rows (value + growth), same period columns, same
+    # ORDER -- the item's own "maps to what's on screen" requirement.
+    rows, periods = _table_fixture(with_growth=True)
+    period_cols = [fmt_module.format_date(p["period_end"]) for p in periods]
+    raw = components.build_raw_export_rows(rows, period_cols, show_growth=True)
+    assert len(raw) == 2 * len(rows)  # one value row + one growth row per line item
+    assert list(raw[0].keys()) == [components._LINE_ITEM_COL] + period_cols
+
+
+def test_statement_table_offers_a_raw_csv_download_button():
+    def script(rows, periods):
+        from dashboard import components
+
+        components.statement_table(rows, periods, show_growth=True, key="AMZN_Income statement")
+
+    rows, periods = _table_fixture(with_growth=True)
+    at = AppTest.from_function(script, kwargs={"rows": rows, "periods": periods})
+    at.run()
+    assert at.exception == []
+    buttons = at.get("download_button")
+    assert len(buttons) == 1
+    assert "raw" in buttons[0].proto.label.lower()
+    assert buttons[0].proto.id  # a real widget, not a no-op

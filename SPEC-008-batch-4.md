@@ -314,3 +314,55 @@ alongside it. The known, accepted cost of the single-letter exclusion: a genuine
 one-letter sentence ending (found once — a loan facility literally named "Term Loan A",
 "...Term Loan A.On June 7, 2023...") stays unsplit rather than risk every "U.S." in the
 corpus. Same trade this project already made for the ALL-CAPS rule.
+
+### Follow-up item 3 — model-ready export
+
+`components.statement_table` now renders a second download button, "Download raw values
+(CSV)", beside the grid's own native export. Same row/column structure as the table above
+it (same line items in the same order, same periods in the same order) — the item's own
+"maps to what's on screen" requirement — but every cell is a plain number or genuinely
+empty, never a formatted string: no thousands separators, no `$`/`%`, negatives as a plain
+`-` (never parentheses), `"n/m"` and blank-cause markers (`—`, `° `) all collapse to an
+empty cell rather than a word.
+
+**Units**: stated per row, in the "Line item" label itself (`"Revenue ($m)"`, `"Diluted
+EPS ($)"`, `"Diluted shares outstanding (shares, m)"`, `"Effective tax rate (FCFF)
+(decimal fraction)"`, `"↳ Growth % (decimal fraction)"`), not in one caption or the
+filename. Checked before choosing this: this table mixes at least four different units
+across its own rows (USD-in-millions is the default; EPS is raw dollars; share counts are
+millions of shares; the FCFF tax rate and every growth row are decimal fractions) — a
+single blanket statement anywhere outside the rows themselves would be correct for at most
+one of the four and silently wrong for the rest. Per-row is the only placement that is
+accurate for every row while still keeping the actual value cells unlabeled numbers, which
+is what the item's own instruction is protecting.
+
+**Scale**: USD rows stay in millions, matching the on-screen table (not raw dollars) —
+this is what "maps to what's on screen" means for a reader cross-checking the CSV against
+the app; a different scale would silently disagree with the number visible on the page
+above it. Full float precision is kept rather than rounded to the on-screen 0–2dp, since a
+model built from this export shouldn't inherit this project's own DISPLAY rounding as
+error.
+
+**Not carried into the export**: the † derived-quarter marker (a plain number has nowhere
+to carry a footnote glyph without breaking numeric parsing — the provenance stays visible
+in the app itself, just not here) and the two blank-cause distinctions (`gap` vs. `split`
+both become the same empty cell — the item asked for genuinely empty, not a second marker
+system).
+
+**Tested as a pure function, not through the button**: `build_raw_export_rows` is a
+standalone function, called once to build the export DataFrame — checked directly with
+`AppTest`, `st.download_button`'s underlying file bytes are not reachable through it at
+all (`DownloadButtonProto` exposes a `deferred_file_id`, no `data` field, at the installed
+1.60.0), so a real test of the actual exported values needs a function callable outside of
+Streamlit entirely. The button itself is checked once for exceptions and a real label.
+
+**CSV vs. `.xlsx`**: CSV. No concrete reason for `.xlsx` turned up — the export is a single
+flat numeric table, and every advantage `.xlsx` has over CSV (multiple sheets, preserved
+cell formatting, native Excel types) applies to a workbook with structure or presentation
+worth preserving, and this export deliberately has neither: it's a plain values dump meant
+to be pasted or imported into a DCF the reader already owns, not the model itself. `.xlsx`
+would add a binary format and an `openpyxl` dependency for zero functional gain here — one
+real, common CSV pitfall (some non-US Excel locales default to `;`-separated CSV, so a
+`,`-separated file opens as one column) is worth knowing about but isn't a reason to
+switch formats project-wide on a US-locale, English-language dataset; it's a one-time
+"use Data → Text to Columns" fix for the rare reader who hits it.
