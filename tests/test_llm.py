@@ -211,6 +211,59 @@ def test_estimate_cost_returns_tokens_and_cost():
     assert result["cost_usd"] == pytest.approx(llm.compute_cost("claude-sonnet-5", result["input_tokens"], 300))
 
 
+# SPEC-009 P2 (recalibrated 2026-08-20): pinned real measurements, not a
+# live query against data/app.db (this project's own established
+# convention -- every other test here runs against an isolated fixture
+# database, never the real one; see config.py's own comment on
+# BRIEF_ESTIMATED_GENERATOR_OUTPUT_TOKENS for the full recalibration and
+# where these specific numbers came from). Frozen as of 2026-08-20:
+# filing_brief v2's real max observed output_tokens was 1780 (n=19);
+# brief_verifier v1's was 674 (n=37). These tests exist so a future edit
+# that "corrects" the estimate back toward the original 3-6-sentence,
+# pre-implementation assumption -- exactly what caused the original 1.9x
+# under-estimate SPEC-009 measured -- fails loudly instead of silently.
+def test_brief_generator_output_estimate_covers_the_real_measured_max():
+    assert config.BRIEF_ESTIMATED_GENERATOR_OUTPUT_TOKENS >= 1780
+    assert config.BRIEF_ESTIMATED_GENERATOR_OUTPUT_TOKENS <= config.BRIEF_MAX_OUTPUT_TOKENS
+
+
+def test_brief_verifier_output_estimate_covers_the_real_measured_max():
+    assert config.BRIEF_ESTIMATED_VERIFIER_OUTPUT_TOKENS >= 674
+    assert config.BRIEF_ESTIMATED_VERIFIER_OUTPUT_TOKENS <= config.BRIEF_VERIFIER_MAX_OUTPUT_TOKENS
+
+
+def test_brief_generator_estimate_no_longer_understates_a_real_recorded_run():
+    # SPEC-009 P2's own measured discrepancy, reproduced here as a fixed
+    # regression check rather than a live re-measurement: real filing_brief
+    # v2 calls (n=19) totalled $0.3854 actual spend against these same
+    # inputs; the OLD estimate (500 output tokens) came in at 0.55x of
+    # that -- roughly the "1.9x low" SPEC-009 measured. The new estimate
+    # must land at or above real spend, not merely closer to it.
+    real_total = 0.385424  # SELECT SUM(cost_usd) FROM llm_calls WHERE prompt_name='filing_brief' AND prompt_version='v2' AND status='ok'
+    old_estimate_total = sum(
+        llm.compute_cost("claude-sonnet-5", input_tokens, 500)
+        for input_tokens in _REAL_FILING_BRIEF_V2_INPUT_TOKENS
+    )
+    new_estimate_total = sum(
+        llm.compute_cost("claude-sonnet-5", input_tokens, config.BRIEF_ESTIMATED_GENERATOR_OUTPUT_TOKENS)
+        for input_tokens in _REAL_FILING_BRIEF_V2_INPUT_TOKENS
+    )
+    assert old_estimate_total < real_total  # the bug: old estimate understated real spend
+    assert new_estimate_total >= real_total  # the fix: new estimate no longer does
+
+
+# Real input_tokens recorded in data/app.db's llm_calls for every
+# prompt_name='filing_brief', prompt_version='v2', status='ok' row, frozen
+# as of 2026-08-20 -- paired 1:1 with real_total above (both come from the
+# same 19 rows: SELECT input_tokens, cost_usd FROM llm_calls WHERE
+# prompt_name='filing_brief' AND prompt_version='v2' AND status='ok'),
+# not independently re-derived or approximated.
+_REAL_FILING_BRIEF_V2_INPUT_TOKENS = [
+    3254, 3262, 3300, 3171, 3187, 3130, 2568, 2910, 3253, 2872,
+    3002, 2954, 3035, 3079, 3265, 3073, 3048, 3044, 2915,
+]
+
+
 def test_compute_input_hash_changes_with_interpolated_content():
     # Same template-shaped text, different interpolated note text -> must
     # NOT collide (R2: hash covers the fully rendered prompt, not the template).

@@ -2420,7 +2420,38 @@ BRIEF_VERIFIER_MAX_OUTPUT_TOKENS: int = 1024
 # What --dry-run assumes a call will actually EMIT, as distinct from the caps
 # above -- same asymmetry as LLM_ESTIMATED_OUTPUT_TOKENS vs
 # LLM_MAX_OUTPUT_TOKENS (SPEC-006): a dry-run estimate should reflect real
-# expected usage, not the defensive ceiling. From the same real-data
-# measurement above.
-BRIEF_ESTIMATED_GENERATOR_OUTPUT_TOKENS: int = 500
-BRIEF_ESTIMATED_VERIFIER_OUTPUT_TOKENS: int = 250
+# expected usage, not the defensive ceiling.
+#
+# SPEC-009 P2 (recalibrated 2026-08-20): the ORIGINAL values (500 / 250,
+# comment above) were sized against the prompt's STATED 3-6 sentences,
+# pre-implementation, before a single real call had been made. Real
+# production calls never matched that: the generator produces ~12.9
+# sentences per brief in practice, not 3-6. Measured directly off this
+# project's OWN llm_calls ledger (real API responses, not a re-estimate of
+# a re-estimate) -- prompt_name='filing_brief', prompt_version='v2' (the
+# CURRENTLY ACTIVE generator prompt; v1's 18 calls, mean 1258/max 1625,
+# checked too and tell the same story, but are a retired prompt version
+# and are not what a future call will look like): n=19, output_tokens mean
+# 1414.6, max 1780. The generator's estimate goes 500 -> 1800: rounded up
+# from the observed max (not the mean -- this number feeds a pre-flight
+# BUDGET gate, L4/L7, where underestimating is the dangerous direction;
+# covering the full observed range with a small margin costs nothing but
+# an occasionally-conservative estimate, while UNDERcovering it is exactly
+# the failure SPEC-009 P2 describes), comfortably under the 2048 hard cap.
+#
+# The verifier's own estimate has an identical, independently-confirmed
+# version of the same problem, not previously named in SPEC-009's own text
+# but found while investigating it here: prompt_name='brief_verifier',
+# prompt_version='v1', n=37 real calls, mean 385.9, max 674 -- the
+# existing 250 estimate undercounts the mean itself, let alone the
+# observed max. Same fix, same reasoning: 250 -> 700, rounded up from the
+# observed max, under the 1024 hard cap.
+#
+# Both numbers track MEASURED REALITY as of this recalibration, not
+# intended/designed behaviour -- when they next drift (a prompt edit that
+# changes typical output length, more real calls widening the observed
+# range), recalibrate against a fresh query of llm_calls, not by "correcting"
+# these back toward the original 3-6-sentence assumption; that assumption is
+# what caused this in the first place.
+BRIEF_ESTIMATED_GENERATOR_OUTPUT_TOKENS: int = 1800
+BRIEF_ESTIMATED_VERIFIER_OUTPUT_TOKENS: int = 700
