@@ -9,3 +9,8 @@ venv/
 data/*.bak
 # SPEC-008: dashboard password, per-deployment -- never committed.
 .streamlit/secrets.toml
+# SPEC-009 Decision 1 (approved 2026-08-24): pipeline-reproducibility only,
+# re-fetchable from EDGAR, not read by the deployed app -- the one
+# component of data/ with zero deployment benefit. Stops NEW growth here;
+# the ~40MB already committed stays in history untouched (not rewritten).
+data/raw/

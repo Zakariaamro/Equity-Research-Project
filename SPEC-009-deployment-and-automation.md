@@ -177,6 +177,38 @@ Options:
 clones the repo on every scheduled run, so repo size is also a recurring cost against the
 free tier's monthly minutes.
 
+#### Resolution (approved 2026-08-24): (b) — and this item's own premise was wrong
+
+**The "SQLite doesn't delta-compress, ~8MB/run, 400MB/year" premise above is incorrect, and
+worth correcting here rather than letting it get re-derived the same wrong way later.**
+Measured before deciding, not assumed: `data/app.db`'s real 18-commit history (2026-07-26 to
+2026-08-13) totals 173MB of LOGICAL blob size across those versions, but only **6.1MB of
+actual packed `.git` storage** after `git gc` — roughly 28x smaller. Git's own pack-level
+delta compression finds substantial byte-level similarity between successive commits of the
+SAME file regardless of that file's internal format; "SQLite doesn't delta-compress" is true
+of SQLite's own file format and irrelevant to how git stores successive snapshots of it. The
+~8MB-per-commit, 400MB/year figure was never measured against this project's own history
+before being written down.
+
+This does NOT change the recommendation, but it changes WHY. `data/sections` and `data/app.db`
+are both needed by the deployed app, and (now confirmed) `app.db`'s own growth is
+substantially self-limiting via ordinary git packing. `data/raw` is different in kind, not
+degree: it is not read by the deployed app at all, AND each archive is unique, unrelated
+content per filing (nothing for delta compression to work against) — a genuinely avoidable,
+non-compressible cost regardless of how (a) turned out to be less scary than described.
+
+**Decided: (b).** `data/raw/` added to `.gitignore`; `git rm -r --cached data/raw` stops
+tracking it going forward (files stay on disk, still usable locally, just untracked). The
+~40MB already in history is deliberately left alone — rewriting history to remove it was
+explicitly ruled out (not worth the disruption for a one-time, non-recurring cost). (c) stays
+un-built: nothing measured here justifies its added complexity (a fetch step, a cache, a new
+can't-start failure mode) over (b)'s free win.
+
+Also worth recording: `actions/checkout`'s default is a **shallow clone** (depth 1), so a
+scheduled run's clone cost is dominated by the CURRENT working-tree size, not cumulative git
+history — the "recurring CI minutes" concern in this item's own text is smaller than a
+naive full-history read would suggest, as long as the workflow doesn't request full history.
+
 ### Decision 2 — Cadence
 
 What schedule, and why that one? Filings arrive in clusters (earnings season), not evenly.
@@ -185,6 +217,21 @@ may leave the dashboard four days stale.
 
 Propose a cadence with reasoning, including what happens when a run finds nothing new — that
 should be the common case and must be cheap and silent.
+
+#### Resolution (approved 2026-08-24): daily, early UTC
+
+A no-op check costs one Actions minute and zero API spend (Part A's own AC1) regardless of
+cadence, so the only real tradeoff is staleness — daily minimizes it for free. Filings
+cluster around each company's own quarterly reporting window; daily checking keeps the
+dashboard within at most a day of a new filing landing, exactly when staleness would be most
+visible. No reason to go more frequent than daily (SEC processing lag, and no user need for
+hour-level freshness, make it unnecessary).
+
+**The no-op case is silent** — no notification when nothing new is found, matching "cheap and
+silent." **A real failure is loud**: GitHub's own default behaviour already emails the actor
+who last edited the workflow file when a scheduled run fails, which is where AC4's "fail
+loudly... surface failures somewhere you'll actually see them" is satisfied — no separate
+notification channel built for this.
 
 ---
 
