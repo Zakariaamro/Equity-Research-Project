@@ -307,6 +307,62 @@ never exceeds the ceiling — catching any wiring bug the mocked tests alone cou
 5. The Action's commits touch only `data/`. **You never hand-edit those files**, so this
    should never conflict — but state it as a rule so it isn't discovered the hard way.
 
+### Resolution (approved 2026-08-24): `.github/workflows/scheduled-ingestion.yml`
+
+Built, not yet deployed via the cron on its own — per instruction, this is proven on a real,
+manually-triggered run first (`workflow_dispatch`), before anything relies on the schedule
+alone or Part B gets built.
+
+**Sequence** (each its own named step, so a failure is immediately locatable in the Actions
+UI): verify secrets present → `pytest -q` (fail fast, before any real spend) → `discover` →
+`extract` → `ingest-xbrl` → `compute-metrics` → `backfill-readability` → `compute-observations`
+(no `--ticker`, ever) → `scheduled-llm-run` (the combined-ceiling command from the P2
+follow-up above — not two separate, uncoordinated `analyze-sections --scheduled` /
+`generate-briefs --scheduled` calls) → `validate` → commit-if-changed.
+
+**Secrets** declared once at job level, not per step — drafting this file caught its own
+mistake this way: `ingest-xbrl` was initially missed from a per-step `SEC_USER_AGENT` list
+(it also calls `EdgarClient()`, confirmed via the constructor's own eager resolution), found
+only by re-checking against the client's source. Job-level env removes the whole class of
+"which steps need which secret" bookkeeping. `EQUITY_RESEARCH_ANTHROPIC_API_KEY` only, never
+`ANTHROPIC_API_KEY` (SPEC-006A's founding incident).
+
+**AC4** ("fails at the first step with a clear message"): a dedicated step calls
+`config.get_sec_user_agent()`/`config.get_anthropic_api_key()` — reused, not
+reimplemented — before `discover` even runs, so a missing Anthropic key (not needed until
+the LLM stage, many steps later) is still caught immediately rather than after several other
+steps have already run for nothing.
+
+**"Never invoke a backfill... path"**: read as ruling out the genuinely one-time,
+historical-reprocessing commands (`migrate-sections`, `backfill-manifests`) and any
+`--force` path — neither appears anywhere in this workflow. `backfill-readability` (no
+`--force`) is deliberately INCLUDED despite its name: `sections.backfill_readability` is
+idempotent by construction (skips any row already populated), functioning as the ordinary
+incremental step new sections need, not a bulk reprocessing of history. Flagged explicitly,
+not assumed, in case this reading of the constraint is wrong.
+
+**AC1/AC5**: the commit step checks `git status --porcelain` on exactly `data/app.db` and
+`data/sections` before committing — empty means nothing runs, matching "cheap and silent" on
+the common no-op case. Never touches `data/raw` (gitignored, Decision 1).
+
+**Found while building, not fixed here**: `cmd_extract` (and possibly others) reports a
+per-filing failure count without exiting non-zero on a partial failure — a real gap against
+"fail loudly" at the level of an individual command, though `validate`'s own exit code
+(binding constraint 5, already gates the commit) is the authoritative backstop that keeps a
+downstream consequence of such a failure from ever reaching the committed database. Hardening
+individual commands' exit codes is a separate, smaller change, not done here.
+
+**Tested**: `tests/test_scheduled_workflow.py` parses the workflow file itself (not a live
+run — nothing here can execute a GitHub Actions runner) and checks it structurally against
+every constraint above: every referenced `edgar.pipeline` command is real and currently
+registered (catches a future CLI rename before a scheduled run would), `compute-observations`
+never carries `--ticker`, no step ever carries `--force`/`--sample`,
+`migrate-sections`/`backfill-manifests` never appear, `validate` precedes the commit step,
+`scheduled-llm-run` (not two separate calls) is what runs the LLM stages, both secrets are
+referenced by name and `ANTHROPIC_API_KEY` never is, the commit step's `git add` names only
+`data/app.db data/sections`, and no notification integration (Slack/webhook/etc.) exists for
+either the silent-on-no-op or loud-on-failure half of Decision 2.
+
 ---
 
 ## Part B — Deployment

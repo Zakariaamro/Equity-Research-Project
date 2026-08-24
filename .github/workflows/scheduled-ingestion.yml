@@ -1,0 +1,160 @@
+# SPEC-009 Part A: scheduled ingestion. Checks EDGAR for new filings, runs
+# the pipeline on anything new, and commits the result -- independent of
+# the dashboard (Part B, not built yet).
+#
+# Cadence (SPEC-009 Decision 2, approved 2026-08-24): daily, early UTC. A
+# no-op day costs one Actions minute and zero API spend, so daily is free
+# relative to a slower cadence and minimizes staleness right when a new
+# filing lands. Silent on a no-op (no notification below); loud on
+# failure via GitHub's own default behaviour -- a failed scheduled run
+# emails the actor who last edited this file. `workflow_dispatch` is here
+# so the job can be proven on a real, manually-triggered run first, per
+# instruction, before relying on the cron alone.
+name: Scheduled ingestion
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # 06:00 UTC, daily
+  workflow_dispatch: {}
+
+# Never let two runs touch the database/commit history at the same time --
+# a second trigger (manual, while the daily cron is mid-run) waits rather
+# than racing it. Never cancel-in-progress: a real, billed LLM call must
+# never be interrupted mid-flight by a newer run superseding it.
+concurrency:
+  group: scheduled-ingestion
+  cancel-in-progress: false
+
+permissions:
+  contents: write # required to commit data/app.db and data/sections back to the repo
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    # Job-level, not per-step: every pipeline step below that touches
+    # sec.gov needs SEC_USER_AGENT (discover, extract, ingest-xbrl), and
+    # getting that list right per-step is exactly the kind of thing that's
+    # easy to miss one of (it was missed once, for ingest-xbrl, while
+    # drafting this file, and caught only by re-checking EdgarClient's own
+    # constructor). Declaring both here once removes that whole class of
+    # mistake -- no step can forget a secret it never had to ask for by
+    # name. EQUITY_RESEARCH_ANTHROPIC_API_KEY, never ANTHROPIC_API_KEY
+    # (SPEC-006A's founding incident -- see llm.py's environment canary).
+    env:
+      SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+      EQUITY_RESEARCH_ANTHROPIC_API_KEY: ${{ secrets.EQUITY_RESEARCH_ANTHROPIC_API_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        # Default depth (shallow, depth=1) is deliberate, not an oversight
+        # -- SPEC-009 Decision 1's own resolution measured that a scheduled
+        # run's clone cost is dominated by the current working-tree size,
+        # not cumulative git history, as long as history isn't requested.
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install (fresh, from pyproject.toml)
+        run: pip install -e ".[dev]"
+
+      - name: Verify required secrets are present
+        # SPEC-009 P3 / AC4: fail at the FIRST step with a clear message,
+        # not partway through a real (billable) run. SEC_USER_AGENT is
+        # needed by the very first pipeline step (discover); the Anthropic
+        # key isn't needed until the LLM stage, many steps later -- checked
+        # here, up front, so a missing key is never discovered only after
+        # discover/extract/ingest-xbrl/compute-metrics/compute-observations
+        # have already run for nothing. Reuses config.py's own
+        # get_sec_user_agent/get_anthropic_api_key (which already raise a
+        # clear, specific message) rather than a second, separate check.
+        run: |
+          python -c "
+          from edgar import config
+          config.get_sec_user_agent()
+          config.get_anthropic_api_key()
+          print('Required secrets present.')
+          "
+
+      - name: Run test suite (fail fast, before any real spend)
+        run: pytest -q
+
+      - name: Discover new filings
+        run: python -m edgar.pipeline discover
+
+      - name: Extract sections
+        run: python -m edgar.pipeline extract
+
+      - name: Ingest XBRL facts
+        run: python -m edgar.pipeline ingest-xbrl
+
+      - name: Compute metrics
+        run: python -m edgar.pipeline compute-metrics
+
+      - name: Backfill readability (incremental -- new sections only, never --force)
+        # Despite the command's name, this is NOT the kind of backfill the
+        # binding constraints below rule out: sections.backfill_readability
+        # is idempotent by construction (skips any row already populated
+        # unless force=True, which is never passed here) -- it is the
+        # ordinary incremental step that computes readability/
+        # normalized_text_hash for whatever sections `extract` just added,
+        # not a bulk reprocessing of history. `migrate-sections` and
+        # `backfill-manifests` (genuine one-time, historical-reprocessing
+        # commands) are deliberately absent from this workflow entirely.
+        run: python -m edgar.pipeline backfill-readability
+
+      - name: Compute observations
+        # Binding constraint (SPEC-009 Part A): NEVER scope this by
+        # --ticker -- doing so silently breaks cross-company same-day
+        # observation annotation. No --ticker flag appears anywhere below;
+        # this comment is the guard against it ever being added by habit
+        # (every other step above restricts nothing, or takes the whole
+        # watchlist by omitting --ticker, the same way).
+        run: python -m edgar.pipeline compute-observations
+
+      - name: Run section analysis + brief generation (combined L7 ceiling)
+        # scheduled-llm-run (edgar.pipeline, SPEC-009 P2 follow-up): runs
+        # analyze-sections then generate-briefs from one process, holding
+        # BOTH to config.LLM_SCHEDULED_RUN_MAX_COST_USD COMBINED -- the
+        # second stage's own ceiling is computed as what the first stage
+        # actually left behind, never a fresh $0.50 of its own. Never
+        # --sample, never --force -- this command doesn't expose either.
+        run: python -m edgar.pipeline scheduled-llm-run
+
+      - name: Validate
+        # Binding constraint: validate runs BEFORE the commit, not after.
+        # A hard failure here exits non-zero (edgar.pipeline validate's own
+        # behaviour), which stops the job here -- the commit step below
+        # never runs, so invalid data is never committed. This is also the
+        # authoritative "did anything upstream go wrong" signal for this
+        # job as a whole (SPEC-009 Part A's own "fail loudly" constraint):
+        # individual steps above print their own failure counts but don't
+        # all exit non-zero on a partial failure (e.g. `extract` reports
+        # failed filings without failing the step) -- validate's data-
+        # quality categories are what catch a real downstream consequence
+        # of that before it reaches the committed database. Found while
+        # building this, not fixed here: hardening every individual
+        # command to exit non-zero on partial failure is a separate,
+        # smaller change than this workflow, noted for a future pass.
+        run: python -m edgar.pipeline validate
+
+      - name: Commit and push if data changed
+        # AC1/AC5: nothing to commit is the common case and must be cheap
+        # and silent -- checked explicitly rather than letting `git commit`
+        # fail on an empty diff. Touches ONLY data/app.db and data/sections
+        # (data/raw is gitignored as of SPEC-009 Decision 1 and was never a
+        # candidate here anyway). These files are written exclusively by
+        # this job and the local pipeline commands that produced them --
+        # never hand-edit them, so this should never conflict.
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git status --porcelain -- data/app.db data/sections | grep -q .; then
+            git add data/app.db data/sections
+            git commit -m "Scheduled ingestion: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push
+          else
+            echo "No changes to data/app.db or data/sections -- nothing to commit."
+          fi

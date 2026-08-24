@@ -33,6 +33,12 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    # SPEC-009 Part A: tests/test_scheduled_workflow.py parses
+    # .github/workflows/scheduled-ingestion.yml to check its commands
+    # against the real CLI and its binding constraints -- a real dev-only
+    # dependency, not an ad hoc one, since the workflow's own "Run test
+    # suite" step installs via this same [dev] extra before running pytest.
+    "pyyaml>=6.0",
 ]
 
 [tool.setuptools.packages.find]
