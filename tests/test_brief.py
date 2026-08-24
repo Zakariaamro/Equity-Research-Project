@@ -549,3 +549,42 @@ def test_cross_filing_reference_rejected_by_validate(conn):
     report = validate.run_validate(conn)
     assert len(report.brief_cross_filing_refs) == 1
     assert report.brief_cross_filing_refs[0]["source_accession_no"] == "acc2"
+
+
+# --- SPEC-009 P2 follow-up (approved 2026-08-24): L7 wired into generate-briefs ---
+
+
+def test_scheduled_brief_run_uses_lower_ceiling(conn, monkeypatch):
+    # Mirrors test_analyze.py's test_scheduled_run_uses_lower_ceiling
+    # exactly -- same shape of proof, applied to run_brief_generation's own
+    # new `scheduled` parameter.
+    monkeypatch.setattr(config, "LLM_SCHEDULED_RUN_MAX_COST_USD", 0.006)
+    for i in range(5):
+        accession_no = f"acc{i}"
+        period_end = f"2025-{i + 1:02d}-28"
+        _insert_filing(conn, accession_no, period_end=period_end)
+        _insert_observation(
+            conn, accession_no, "metric_multi_year_extreme", "gross_margin", "low",
+            "gross_margin is unremarkable this period.", period_end=period_end,
+        )
+    fake = FakeRawClient([_generator_response([], material=False)] * 5)
+    client = llm.LLMClient(raw_client=fake)
+
+    stats = brief.run_brief_generation(
+        conn, execute=True, client=client,
+        max_run_cost_usd=1000.0,  # a huge explicit override -- scheduled must clamp below it anyway
+        scheduled=True,
+    )
+
+    assert stats.calls_made < 5
+    assert stats.stopped_reason is not None
+    assert stats.run_cost_usd <= config.LLM_SCHEDULED_RUN_MAX_COST_USD + 1e-9
+
+
+def test_generate_briefs_has_no_sample_flag_to_refuse():
+    # L7 on analyze-sections refuses --sample; generate-briefs has never
+    # had a --sample flag at all, so there is nothing for `scheduled=True`
+    # to refuse here -- confirmed structurally rather than left unstated.
+    import inspect
+
+    assert "sample" not in inspect.signature(brief.run_brief_generation).parameters

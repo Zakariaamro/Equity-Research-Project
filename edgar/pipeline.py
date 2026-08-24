@@ -569,6 +569,7 @@ def cmd_generate_briefs(args: argparse.Namespace) -> None:
 
         stats = brief.run_brief_generation(
             conn, tickers=tickers, accession=args.accession, execute=True, client=client,
+            max_run_cost_usd=args.max_run_cost, max_calls_per_run=args.max_calls, scheduled=args.scheduled,
         )
 
         print(f"[EXECUTE] {stats.candidates} candidate filing(s), {stats.processed} processed.")
@@ -593,6 +594,108 @@ def cmd_generate_briefs(args: argparse.Namespace) -> None:
         if stats.stopped_reason is not None:
             print(f"  STOPPED EARLY: {stats.stopped_reason}")
             raise SystemExit(1)
+    finally:
+        conn.close()
+
+
+def run_scheduled_llm_stages(
+    conn: sqlite3.Connection, tickers: list[str] | None = None, client: llm.LLMClient | None = None,
+) -> tuple[analyze.RunStats, brief.BriefRunStats]:
+    """SPEC-009 P2 follow-up (approved 2026-08-24): the two LLM-calling
+    pipeline stages Part A's scheduled job runs in sequence -- section
+    analysis, then brief generation -- held to config.LLM_SCHEDULED_RUN_
+    MAX_COST_USD ACROSS BOTH, not $0.50 each.
+
+    Why this shape, not the alternative: `analyze.run_analysis` and
+    `brief.run_brief_generation` already each accept an explicit
+    `max_run_cost_usd` override (SPEC-006A L3), and `scheduled=True` on
+    either only ever CLAMPS that value down to the L7 ceiling, never widens
+    it back up. That makes a genuinely shared ceiling possible two ways:
+    (a) run the two pipeline stages as separate CLI invocations (as today),
+    and have the ORCHESTRATING shell script/workflow parse stage 1's
+    printed cost and pass `generate-briefs --scheduled --max-run-cost
+    <remainder>`; or (b) call both functions from one Python process,
+    computing the remainder directly. (a) means the shared-ceiling
+    invariant lives in un-tested shell arithmetic parsing a human-readable
+    log line -- exactly the kind of thing this project's own test suite
+    exists to replace. (b) is a plain Python function, callable from a
+    single pytest with a fixture database, the same way every other
+    guarantee in this codebase is checked -- chosen for that reason alone,
+    not because either is unable to enforce the ceiling correctly.
+
+    Runs analyze-sections first (gets the FULL scheduled ceiling -- nothing
+    else has spent yet this run), then generate-briefs with its own ceiling
+    explicitly reduced by whatever the first stage actually spent. If the
+    first stage alone reaches the scheduled ceiling, the second is skipped
+    outright -- constructing a RunGuard with a zero or negative ceiling
+    would just refuse on its first candidate anyway, less clearly than
+    saying so directly here.
+
+    Deliberately narrow: this is the two LLM stages only, not the rest of
+    Part A's job (discover/extract/ingest-xbrl/compute-metrics/compute-
+    observations/validate/commit) -- SPEC-009's own text is explicit that
+    building the rest of that job waits on both "Decide first" questions,
+    which this does not answer or depend on."""
+    analysis_stats = analyze.run_analysis(conn, tickers=tickers, execute=True, client=client, scheduled=True)
+
+    remaining = config.LLM_SCHEDULED_RUN_MAX_COST_USD - analysis_stats.run_cost_usd
+    if remaining <= 0:
+        brief_stats = brief.run_brief_generation(conn, tickers=tickers, execute=False)
+        brief_stats.stopped_reason = (
+            f"SPEC-009 P2 follow-up: section analysis alone spent ${analysis_stats.run_cost_usd:.4f} of this "
+            f"scheduled run's ${config.LLM_SCHEDULED_RUN_MAX_COST_USD:.2f} combined ceiling -- no budget left "
+            "for brief generation this run"
+        )
+        return analysis_stats, brief_stats
+
+    brief_stats = brief.run_brief_generation(
+        conn, tickers=tickers, execute=True, client=client, max_run_cost_usd=remaining, scheduled=True,
+    )
+    return analysis_stats, brief_stats
+
+
+def cmd_scheduled_llm_run(args: argparse.Namespace) -> None:
+    tickers = None
+    if args.ticker:
+        _validate_ticker(args.ticker)
+        tickers = [args.ticker]
+
+    conn = db.get_connection()
+    try:
+        client = llm.LLMClient()
+        analysis_stats, brief_stats = run_scheduled_llm_stages(conn, tickers=tickers, client=client)
+
+        print(
+            f"[analyze-sections] {analysis_stats.candidates} candidate(s), {analysis_stats.processed} processed, "
+            f"cost ${analysis_stats.run_cost_usd:.4f}"
+        )
+        if analysis_stats.stopped_reason is not None:
+            print(f"  STOPPED EARLY: {analysis_stats.stopped_reason}")
+        print(
+            f"[generate-briefs]  {brief_stats.candidates} candidate(s), {brief_stats.processed} processed, "
+            f"cost ${brief_stats.run_cost_usd:.4f}"
+        )
+        if brief_stats.stopped_reason is not None:
+            print(f"  STOPPED EARLY: {brief_stats.stopped_reason}")
+
+        combined_cost = analysis_stats.run_cost_usd + brief_stats.run_cost_usd
+        # L10, combined: this run's TOTAL cost across both stages, checked
+        # against the SAME ceiling both stages were individually clamped
+        # to -- the one number this whole function exists to keep honest.
+        print(
+            f"  combined this-run cost: ${combined_cost:.4f} of ${config.LLM_SCHEDULED_RUN_MAX_COST_USD:.2f} "
+            f"scheduled ceiling | lifetime spend: ${llm.total_spent(conn):.4f} of ${config.LLM_BUDGET_USD:.2f} "
+            f"budget | remaining: ${config.LLM_BUDGET_USD - llm.total_spent(conn):.4f}"
+        )
+        if combined_cost > config.LLM_SCHEDULED_RUN_MAX_COST_USD:
+            # Should be unreachable -- both stages clamp themselves via
+            # `scheduled=True` -- but this is exactly the invariant this
+            # command exists to guarantee, so it fails loudly rather than
+            # trusting the arithmetic silently, if it's ever wrong.
+            raise SystemExit(
+                f"INVARIANT VIOLATED: combined cost ${combined_cost:.4f} exceeds the "
+                f"${config.LLM_SCHEDULED_RUN_MAX_COST_USD:.2f} scheduled ceiling both stages were clamped to."
+            )
     finally:
         conn.close()
 
@@ -820,6 +923,31 @@ def build_parser() -> argparse.ArgumentParser:
             f"{config.LLM_CACHE_INVALIDATION_WARN} previously-cached briefs."
         ),
     )
+    # SPEC-009 P2 follow-up (approved 2026-08-24): mirrors p_analyze_sections'
+    # own --max-run-cost/--max-calls/--scheduled exactly -- same flags, same
+    # help text shape, same L3/L6/L7 layers. generate-briefs has never had a
+    # --sample flag, so L7's "refuses --sample" half does not apply here.
+    p_generate_briefs.add_argument(
+        "--max-run-cost", type=float, default=None,
+        help=f"SPEC-006A L3: override the per-run cost ceiling (default ${config.LLM_MAX_RUN_COST_USD:.2f}).",
+    )
+    p_generate_briefs.add_argument(
+        "--max-calls", type=int, default=None,
+        help=f"SPEC-006A L6: override the per-run call-count ceiling (default {config.LLM_MAX_CALLS_PER_RUN}).",
+    )
+    p_generate_briefs.add_argument(
+        "--scheduled", action="store_true",
+        help=f"SPEC-006A L7: unattended-run mode. Clamps the run-cost ceiling to ${config.LLM_SCHEDULED_RUN_MAX_COST_USD:.2f}.",
+    )
+
+    p_scheduled_llm_run = sub.add_parser(
+        "scheduled-llm-run",
+        help=(
+            "SPEC-009 P2 follow-up: run analyze-sections then generate-briefs, execute, scheduled, held to "
+            f"${config.LLM_SCHEDULED_RUN_MAX_COST_USD:.2f} COMBINED across both, not each"
+        ),
+    )
+    p_scheduled_llm_run.add_argument("--ticker", help="Restrict to one watchlist ticker")
 
     p_show_brief = sub.add_parser("show-brief", help="Print a stored brief, each sentence with its type and resolved sources")
     p_show_brief.add_argument("--accession", required=True, help="Filing to show the brief for")
@@ -867,6 +995,8 @@ def main(argv: list[str] | None = None) -> int:
         cmd_spend(args)
     elif args.command == "generate-briefs":
         cmd_generate_briefs(args)
+    elif args.command == "scheduled-llm-run":
+        cmd_scheduled_llm_run(args)
     elif args.command == "show-brief":
         cmd_show_brief(args)
     elif args.command == "status":

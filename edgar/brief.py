@@ -807,6 +807,7 @@ def run_brief_generation(
     client: llm.LLMClient | None = None,
     max_run_cost_usd: float | None = None,
     max_calls_per_run: int | None = None,
+    scheduled: bool = False,
 ) -> BriefRunStats:
     """The single entry point pipeline.py's generate-briefs command calls.
 
@@ -815,6 +816,23 @@ def run_brief_generation(
     makes no calls. execute=True actually calls generate_brief per filing,
     guarded by an llm.RunGuard (SPEC-006A L3/L6, same defaults as
     analyze-sections unless overridden).
+
+    SPEC-009 P2 follow-up (approved 2026-08-24): `scheduled=True` (L7)
+    clamps the run-cost ceiling to config.LLM_SCHEDULED_RUN_MAX_COST_USD
+    regardless of max_run_cost_usd -- the exact same clamp
+    `analyze.run_analysis`'s own `scheduled` parameter already applies,
+    mirrored here rather than reinvented. Unlike section-analysis, there is
+    no `--sample` flag on this command to refuse (generate-briefs has never
+    had one), so that half of L7 does not apply here.
+
+    Callers that need a SHARED ceiling across BOTH LLM stages of one
+    scheduled run (this function's own calls plus analyze-sections' own,
+    run as two separate pipeline stages) should pass an explicit
+    `max_run_cost_usd` -- already below config.LLM_SCHEDULED_RUN_MAX_COST_USD
+    -- computed from what the other stage actually spent; `scheduled=True`'s
+    own clamp is a ceiling, never a floor, so it never widens a smaller
+    value back up. See `pipeline.run_scheduled_llm_stages` for the one
+    caller that does this.
     """
     stats = BriefRunStats(dry_run=not execute)
     candidates = select_candidate_filings(conn, tickers=tickers, accession=accession)
@@ -882,6 +900,8 @@ def run_brief_generation(
         return stats
 
     effective_run_cost = max_run_cost_usd if max_run_cost_usd is not None else config.LLM_MAX_RUN_COST_USD
+    if scheduled:
+        effective_run_cost = min(effective_run_cost, config.LLM_SCHEDULED_RUN_MAX_COST_USD)
     effective_call_ceiling = max_calls_per_run if max_calls_per_run is not None else config.LLM_MAX_CALLS_PER_RUN
     run_guard = llm.RunGuard(max_run_cost_usd=effective_run_cost, max_calls_per_run=effective_call_ceiling)
 

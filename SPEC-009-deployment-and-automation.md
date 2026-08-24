@@ -182,6 +182,47 @@ These are not negotiable and each exists because something went wrong:
 5. **`validate` runs before the commit**, not after. A run that produces invalid data must
    not commit it.
 
+#### Constraint 1 resolution (2026-08-24): L7 wired into generate-briefs, ceiling shared
+
+Found while doing SPEC-009 P2: `generate-briefs` had no `--scheduled` flag at all — only
+`analyze-sections` did. Both stages call the LLM, both stages spend real money, and only one
+was clamped.
+
+**Fixed in two parts.** First, `--scheduled`/`--max-run-cost`/`--max-calls` added to
+`generate-briefs`, mirroring `analyze-sections` exactly — `brief.run_brief_generation` gained
+the identical `scheduled: bool` parameter `analyze.run_analysis` already had, same clamp
+(`min(effective_run_cost, LLM_SCHEDULED_RUN_MAX_COST_USD)`). This alone would still let each
+stage spend up to $0.50 independently if run as two separate CLI invocations, though — not
+what "across BOTH stages" requires.
+
+**Second, and this is the part that actually enforces "the run as a whole": a new
+`edgar.pipeline scheduled-llm-run` command** (`run_scheduled_llm_stages`) that runs
+`analyze-sections` then `generate-briefs` from ONE Python process, computing the second
+stage's ceiling as `LLM_SCHEDULED_RUN_MAX_COST_USD - (what the first stage actually spent)`
+and passing it in explicitly. If the first stage alone reaches the combined ceiling, the
+second is skipped outright with a stated reason, rather than constructed with a zero/negative
+ceiling and left to refuse silently on its first candidate.
+
+Two ways to share a ceiling across two separate CLI invocations were considered. (a) Keep
+them as two separate commands and have the orchestrating shell script/workflow parse stage
+1's printed cost and pass `--max-run-cost <remainder>` to stage 2. (b) Call both functions
+from one Python process. (a) puts the shared-ceiling invariant in un-tested shell arithmetic
+parsing a human-readable log line; (b) is a plain function, callable from a real pytest
+against a fixture database, the same way every other guarantee in this codebase is checked.
+Chose (b) for that reason alone — not because (a) is incapable of being correct, but because
+nothing here would prove it stayed correct.
+
+Deliberately narrow: `scheduled-llm-run` covers only the two LLM-calling stages, not the rest
+of Part A's job (discover/extract/ingest-xbrl/compute-metrics/compute-observations/validate/
+commit) — building the rest still waits on both "Decide first" questions below, unchanged by
+this fix.
+
+Tested at three levels: an arg-capturing unit test proves the arithmetic (stage 2 receives
+exactly `ceiling - stage1_actual`, not a fresh $0.50); a companion test proves stage 2 is
+skipped, not attempted with a negative ceiling, when stage 1 alone exhausts it; an
+end-to-end test runs both REAL functions (fake LLM clients only) and confirms combined spend
+never exceeds the ceiling — catching any wiring bug the mocked tests alone could miss.
+
 ### Acceptance criteria
 
 1. A scheduled run with no new filings completes cheaply, spends nothing, and commits
