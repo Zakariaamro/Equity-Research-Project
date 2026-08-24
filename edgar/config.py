@@ -2073,7 +2073,18 @@ LLM_MODEL: str = "claude-sonnet-5"
 # operator responsibility no code enforces. Re-aligning LLM_BUDGET_USD
 # against the real Console figure, periodically, is that same responsibility
 # applied on an ongoing basis, not a one-time correction.
-LLM_BUDGET_USD: float = 8.50
+#
+# Re-aligned 2026-08-24 (8.50 -> 13.50, SPEC-009 P1, decision log #69):
+# operator topped up the real Console balance by $5.00. 13.50 = the prior
+# 8.50 cap + the 5.00 added, which is also, equivalently, recorded lifetime
+# spend ($7.6886 at re-alignment) + real remaining balance ($5.8114) --
+# same two-different-things-that-should-sum-to-this-cap check #46 used, not
+# a fresh assumption. Same standing caveat as #41/#46: this figure is only
+# as good as the last time it was checked against the ACTUAL Console
+# balance, not something to treat as exact indefinitely -- re-check and
+# re-align again the next time real money moves against the account outside
+# this ledger's view (top-up, an unrelated bill, another leak).
+LLM_BUDGET_USD: float = 13.50
 LLM_WARN_FRACTION: float = 0.75
 
 # --- SPEC-006A: budget guardrails (L3-L7) ---
