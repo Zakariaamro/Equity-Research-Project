@@ -227,6 +227,22 @@ def test_brief_generator_output_estimate_covers_the_real_measured_max():
     assert config.BRIEF_ESTIMATED_GENERATOR_OUTPUT_TOKENS <= config.BRIEF_MAX_OUTPUT_TOKENS
 
 
+# SPEC-009 P2 follow-up (recalibrated 2026-08-24): section_analysis's own
+# estimate, a DIFFERENT calibration choice from the brief generator's
+# above -- this distribution is heavily right-skewed (n=281, mean 843,
+# median 363, p95 3250, max 5402), so p95 was used, not the max: replaying
+# 5402 across the same 281-call real corpus put the full-run dry-run
+# estimate at 3.18x real spend, close to reproducing the exact "12x,
+# uninformative" failure this constant's own comment already records from
+# its first calibration. p95 lower-bounds it here (>= 3250) the same way
+# the brief generator's own max lower-bounds ITS estimate above -- a
+# future edit that quietly drops this back toward the mean (843) or the
+# original stale 1024 fails loudly instead of silently.
+def test_section_analysis_output_estimate_covers_the_real_measured_p95():
+    assert config.LLM_ESTIMATED_OUTPUT_TOKENS >= 3250
+    assert config.LLM_ESTIMATED_OUTPUT_TOKENS <= config.LLM_MAX_OUTPUT_TOKENS
+
+
 def test_brief_verifier_output_estimate_covers_the_real_measured_max():
     assert config.BRIEF_ESTIMATED_VERIFIER_OUTPUT_TOKENS >= 674
     assert config.BRIEF_ESTIMATED_VERIFIER_OUTPUT_TOKENS <= config.BRIEF_VERIFIER_MAX_OUTPUT_TOKENS

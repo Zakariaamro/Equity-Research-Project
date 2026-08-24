@@ -2302,19 +2302,50 @@ LLM_MAX_OUTPUT_TOKENS: int = 4096
 LLM_TRUNCATION_RETRY_OUTPUT_TOKENS: int = 8192
 
 # What --dry-run assumes a call will actually EMIT, as distinct from the
-# ceiling above. Measured over the 26 real v2/v3 calls of the sampled
-# development runs: mean 334 output tokens, p95 840, max 972 -- empty
-# responses cost 14 tokens and a three-finding response under 1,000. Using
+# ceiling above. Originally measured over 26 real v2/v3 calls from the
+# sampled development runs (mean 334, p95 840, max 972) -- this constant
+# has always been p95-based, not mean-based, on purpose: using
 # LLM_MAX_OUTPUT_TOKENS for estimation instead put the full-set estimate at
-# $20.06, over the $20 cap, for a run whose real cost is under $6: an
+# $20.06, over the $20 cap, for a run whose real cost was under $6 -- an
 # estimate 12x high is not conservative, it is uninformative, and it would
 # have argued against a run that was always affordable.
+#
+# SPEC-009 P2 follow-up (recalibrated 2026-08-24): re-measured against the
+# full real corpus now in llm_calls (281 calls, prompt_version='v3',
+# status='ok') rather than the original 26-call development sample, which
+# this 1024 value was never actually re-derived from -- it happened to
+# land close to the old sample's p95 (840) but had drifted stale as real
+# volume grew. The distribution is heavily right-skewed: mean 843, median
+# 363, p95 3250, max 5402 (a handful of truncation-retry calls -- decision
+# log #43 -- billed above the normal 4096 cap). The MEAN is the wrong
+# summary for a shape like this (SPEC-009 P2's own finding, applied here
+# too): it sits far below where the real risk is, so an average-sized
+# estimate still meant 30% of real calls exceeded it -- not a working
+# safety margin for a pre-flight budget gate, where underestimating is the
+# dangerous direction (same principle as BRIEF_ESTIMATED_GENERATOR_OUTPUT_
+# TOKENS above it in this file).
+#
+# The MAX (5402) was deliberately NOT used either, unlike the brief
+# generator's own recalibration -- checked before choosing, not assumed:
+# replaying this constant across the SAME 281-call real corpus, 5402 would
+# put the full-set dry-run total at 3.18x real spend, close to
+# reproducing this comment's own original "12x, uninformative" failure
+# mode on a large run. p95, rounded up (3250 -> 3300, comfortably under
+# the 4096 hard cap), is the balance point: it protects the individual-
+# call gate against the 30%-exceeding-estimate case the mean left open,
+# without re-inflating a full run's total estimate into "so conservative
+# it blocks normal runs" territory the way the max would. (Checked too,
+# for completeness: even at 3300, the SAME 281-call full-corpus replay
+# comes to 2.18x real spend -- a real, known overshoot for a bulk-sized
+# run, but this constant exists for a small, INCREMENTAL scheduled run's
+# dry-run estimate, not a 281-call backfill; L7's own $0.50 ceiling is
+# sized for the former.)
 #
 # The BUDGET CAP deliberately keeps using LLM_MAX_OUTPUT_TOKENS, not this
 # value. The asymmetry is intentional: over-estimating a dry run misleads,
 # whereas over-estimating at the cap only ever refuses a call slightly too
 # early, which is the safe direction for a hard spending limit.
-LLM_ESTIMATED_OUTPUT_TOKENS: int = 1024
+LLM_ESTIMATED_OUTPUT_TOKENS: int = 3300
 
 # Edge case (R2/R6): "Section text exceeds the context limit -> skip, log
 # with the section identity. Do not silently truncate." Every candidate

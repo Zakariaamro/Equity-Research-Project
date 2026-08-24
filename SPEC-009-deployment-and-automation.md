@@ -102,6 +102,31 @@ sequence, and only the first of those two currently has L7 wired at all. This be
 Part A's build, not this prerequisite — noted here so it isn't rediscovered the hard way
 once Part A starts.
 
+#### Both follow-ups resolved (2026-08-24)
+
+**`generate-briefs` L7 wiring**: see Part A's own "Constraint 1 resolution" below —
+`--scheduled` added, mirroring `analyze-sections` exactly, plus a new `scheduled-llm-run`
+command that shares one combined ceiling across both LLM stages rather than giving each its
+own independent $0.50.
+
+**`LLM_ESTIMATED_OUTPUT_TOKENS`, p95 not the mean**: re-measured against the same 281-call
+real corpus. The mean (843) is the wrong summary for this shape — right-skewed enough that
+30% of real calls still exceeded it, not a working margin for a budget gate where
+underestimating is the dangerous direction. Went to **p95, rounded up: 1024 → 3300** (raw
+p95 3250), the same "underestimating is dangerous, so lean toward the observed tail, not the
+center" principle the brief generator's own recalibration used — but NOT the max (5402) the
+way the brief generator's was: checked first, and replaying 5402 across this same 281-call
+corpus would put the full-run dry-run estimate at 3.18x real spend, close to reproducing the
+"12x, uninformative" failure this constant's own original comment already records from ITS
+first calibration. p95 protects the individual-call gate against the 30%-exceeding-estimate
+case without re-inflating a full run's aggregate estimate into the same trap. (Checked too:
+even at 3300, a 281-call bulk-sized replay comes to 2.18x real spend — a real, known
+overshoot, but this constant is sized for a small, INCREMENTAL scheduled run's estimate, the
+size L7's own $0.50 ceiling assumes, not a 281-call backfill.) Comfortably under the 4096
+hard truncation cap. Full reasoning recorded in `config.py`'s own comment on
+`LLM_ESTIMATED_OUTPUT_TOKENS`, pinned by
+`test_section_analysis_output_estimate_covers_the_real_measured_p95` in `tests/test_llm.py`.
+
 ### P3 — Secrets
 
 Two values the Action needs, as GitHub repository secrets:
