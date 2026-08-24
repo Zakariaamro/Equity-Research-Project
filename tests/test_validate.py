@@ -226,7 +226,7 @@ def test_discrete_quarter_sum_back_covers_income_statement_lines_too(conn):
     assert report.discrete_quarter_sum_violations == []
 
     conn.execute(
-        "UPDATE xbrl_facts SET value = 999_000_000 WHERE cik = ? AND period_start = '2025-01-01' "
+        "UPDATE xbrl_facts SET value = 999000000 WHERE cik = ? AND period_start = '2025-01-01' "
         "AND period_end = '2025-12-31'",
         (AMZN_CIK,),
     )

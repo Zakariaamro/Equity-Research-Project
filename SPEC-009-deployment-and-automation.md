@@ -378,6 +378,30 @@ the first deployment**, and that check must be part of the deployment process ra
 one-off. Streamlit Cloud builds from scratch every time, so its build log must show the
 project itself being installed — not only third-party packages.
 
+**A third instance, this AC's concrete evidence rather than a hypothetical (2026-08-24)**:
+Part A's own scheduled-ingestion workflow — a genuinely fresh environment in exactly the
+sense this AC cares about, just GitHub Actions' rather than Streamlit Cloud's — failed on
+its very first real run, at the `pytest` step, before fetching or spending anything.
+`tests/test_validate.py` had `999_000_000` (a Python numeric-underscore literal) written
+directly inside a raw SQL string. Python accepts numeric underscores in any int/float
+literal; SQLite's own parser only accepts them from version 3.46 (2024). The operator's Mac
+ships a newer SQLite than the GitHub Actions runner's, so the test passed locally and failed
+in CI — invisible on the machine that built it, exactly the shape of every prior instance of
+this AC's own warning, just with SQLite's version instead of a missing package.
+
+Fixed at the one real occurrence (`999_000_000` → `999000000`); Python-level numeric
+underscores are unaffected everywhere else in the codebase (dozens of legitimate uses —
+`LLM_MAX_INPUT_TOKENS_ESTIMATE = 150_000` and similar — none of which are ever parsed as SQL
+text). Guarded structurally, the same SHAPE as `test_dashboard_structure.py`'s currency-
+escaping guard: `tests/test_sql_literal_safety.py` scans every `.py` file in the project for
+string literals reaching a `.execute()`/`.executemany()`/`.executescript()` call's SQL-text
+argument, and fails if a numeric-underscore literal is present there — confirmed live to
+catch the real line before it was fixed, and, while building it, to correctly NOT flag a
+coincidental digit-underscore-digit shape inside a SQL `--` comment (`edgar/db.py`'s own
+schema script references a real, date-stamped filename that happened to match the pattern
+being checked for — found and fixed by stripping SQL comments before the check, not by
+loosening the check itself).
+
 ### Other requirements
 
 - The password gate (SPEC-008 R2) protects the deployed app. `.streamlit/secrets.toml` is
