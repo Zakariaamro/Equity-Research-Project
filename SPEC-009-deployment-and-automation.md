@@ -415,6 +415,78 @@ loosening the check itself).
 - The deployed app must show **what filing it's current as of**, on every page. A dashboard
   that silently serves stale data is the failure mode this whole spec exists to prevent.
 
+### Resolution: code-side Part B items (approved 2026-08-25)
+
+**Login-screen leak, fixed structurally.** Read the installed Streamlit source
+(`streamlit/runtime/pages_manager.py`, `streamlit/runtime/scriptrunner/script_runner.py`,
+1.60.0) before deciding, not assumed from docs: `PagesManager.uses_pages_directory` is set
+`True` purely by `Path(app.py's own parent / "pages").exists()` — a class-level flag computed
+from the filesystem alone, independent of whether `app.py` itself calls `st.navigation()`.
+When set, the script runner calls a legacy `_mpa_v1(...)` shim INSTEAD OF `app.py`'s own
+top-level code: it globs every `.py` file in that directory, builds a page per bare filename,
+and renders its OWN sidebar navigation before `app.py`'s own auth gate — let alone its real,
+correctly-titled `st.navigation()` call — ever runs. That is the exact leak. Fixed by
+renaming `dashboard/pages/` → `dashboard/app_pages/`: with no directory literally named
+`pages` next to `app.py`, `uses_pages_directory` can never become `True` again, so `_mpa_v1`
+never runs and nothing renders pre-auth beyond the password prompt. Pinned two ways: a
+filesystem check, and a live call into Streamlit's own `PagesManager` class confirming the
+real flag reads `False` against this project's actual `app.py`.
+
+**Data-freshness caption, shared not per-page.** `data.get_most_recent_filing()` — every form
+type across the whole watchlist, including 8-Ks, ordered by `discovered_at` (when this
+deployment's own pipeline noticed the filing) rather than `filing_date` (when SEC says it was
+filed): `filing_date` alone can look fresh even if the scheduled job silently stopped
+running, since the same quarterly filing stays "most recent by `filing_date`" for months
+either way — deliberately different scope from `get_anchor_filing`'s own 10-K/10-Q-only,
+per-company anchor, which answers a different question ("what is this page's analysis built
+from"). `components.data_freshness_caption()` renders it once from `app.py`, same placement
+discipline as the existing `environment_caption()` — every page gets it by construction, no
+per-page implementation to forget or word differently. The Filings page's own old caption
+("Data as of the current deployment's database") was removed, not reworded — it promised a
+date and never gave one.
+
+**Fresh-environment AC, verified for real, not assumed — and it found a real bug.** A
+genuinely fresh `git clone` into a temp directory, a fresh `pip install -e ".[dev]"`, and
+`streamlit run` — twice, the second time to confirm the fix. The fresh install independently
+resolved **Streamlit 1.62.0** and **anthropic 1.0.0** (a major version), both ahead of the
+long-lived dev `.venv`'s 1.60.0 / 0.120.2 — `pyproject.toml` has no upper bound on either, by
+design, matching this project's own established philosophy (decision log #66: code should
+work at the declared floor AND at whatever's newest, not pinned to one snapshot).
+
+The first fresh-clone run **hung** — genuinely, not slowly: 100% CPU for over an hour before
+being killed. Root cause: `tests/test_sql_literal_safety.py`'s own `_project_py_files()`
+(added earlier this session) scanned `ROOT.rglob("*.py")` filtered by an exact-name
+venv-exclusion set (`.venv`, `venv`, …). A fresh clone's own venv, named wherever the
+operator puts it (`.venv-fresh`, here, to keep it distinct from the project's existing
+`.venv`) was not in that set — confirmed live, it walked and `ast.parse`'d **7,117**
+third-party files (the entire installed dependency tree) against 56 real project files. Fixed
+by scoping to this project's actual, named source directories (`edgar/`, `dashboard/`,
+`tests/`, `scripts/`) rather than "everything under the repo root minus a blocklist," which
+can never enumerate every name a future venv, scratch directory, or build artifact might get
+— structurally immune to this class of gap now, not just patched for the one name that broke
+it. Pinned as its own regression test (a generous file-count ceiling plus a check that every
+scanned file lives under one of the four real source directories).
+
+Re-verified end to end after the fix, against a second fresh clone: full 600-test suite in
+21 seconds; `streamlit run dashboard/app.py` served `/_stcore/health` as `ok` with no errors
+in its log; `AppTest.from_file("dashboard/app.py")` ran the real entry point directly with no
+exceptions, both pre- and post-login, correctly landing on "Overview" after authenticating and
+showing both sidebar captions rendering real data (`Streamlit 1.62.0`; `Data current as of:
+AMZN 10-Q filed Jul 31, 2026 (added Aug 4, 2026)`).
+
+**One thing checked but not fully verifiable without a paid call, flagged rather than
+asserted**: `edgar/llm.py`'s `_RealAnthropicClient` (the real, billed path Part A's scheduled
+job actually uses) constructs `anthropic.Anthropic(api_key=..., max_retries=...)` and calls
+`.messages.create(model=..., max_tokens=..., thinking=..., messages=...)`. Checked
+structurally against the real installed 1.0.0 package via `inspect.signature` (no network
+call — object construction and signature introspection only, no paid request): every
+parameter this project passes still exists, under the same names, on both the constructor
+and `.messages.create`. This is real evidence the major version bump doesn't break
+construction, not a guess — but it does not, and cannot, confirm the response object's shape
+(`response.content[i].text`/`.type`, `response.usage.input_tokens`/`output_tokens`,
+`response.stop_reason`) without an actual billed call, which is outside what this agent may
+do on its own. Worth a first real Part A run being watched, not assumed clean.
+
 ---
 
 ## Explicitly out of scope
