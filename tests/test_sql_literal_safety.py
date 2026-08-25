@@ -161,6 +161,30 @@ def _sql_numeric_underscore_offenders(path: Path) -> list[str]:
     return offenders
 
 
+def test_project_py_files_stays_scoped_to_real_source_not_the_whole_repo_root():
+    """SPEC-009 Part B (approved 2026-08-25): pins the fix for the fresh-
+    clone hang found live -- `_project_py_files()` used to be
+    `ROOT.rglob("*.py")` filtered by an exact-name venv-directory
+    exclusion set, which only ever excludes a virtualenv literally named
+    `.venv`/`venv`. A genuinely fresh clone's own venv, named wherever the
+    operator puts it (`.venv-fresh`, confirmed live), was NOT excluded --
+    7,117 third-party files walked and ast.parse'd, a functional hang
+    (100% CPU for over an hour before being killed), not just a slow
+    pass. A generous ceiling here, not the current exact count (58, which
+    will legitimately grow as the project does) -- this exists to catch a
+    future regression back to an unscoped `ROOT.rglob(...)`, which would
+    reproduce the exact same class of hang the moment anyone's own venv,
+    scratch directory, or build artifact sits inside the repo root under
+    a name nobody thought to add to a blocklist."""
+    files = _project_py_files()
+    assert 0 < len(files) < 500
+    # Structural confirmation, not just a count: every file found must
+    # actually live under one of the four real source directories --
+    # proves the ceiling above isn't passing by coincidence.
+    for path in files:
+        assert path.relative_to(ROOT).parts[0] in _SOURCE_DIRS
+
+
 def test_no_numeric_underscore_literal_reaches_sql_text():
     """General across the whole project, not just the one file that broke
     -- SQL is built in edgar/, dashboard/, and tests/ alike. Confirmed to
