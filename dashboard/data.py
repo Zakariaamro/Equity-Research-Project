@@ -144,6 +144,42 @@ def get_all_filings(db_path: Path = DEFAULT_DB_PATH) -> list[dict]:
     )
 
 
+def get_most_recent_filing(db_path: Path = DEFAULT_DB_PATH) -> dict | None:
+    """SPEC-009 Part B (approved 2026-08-25): the single most recent filing
+    across the ENTIRE watchlist, every form type included -- deliberately
+    NOT `get_anchor_filing`'s 10-K/10-Q-only, per-company scoping. That
+    function answers "what is THIS page's analysis built from"; this one
+    answers a different question -- "has this deployment's own scheduled
+    ingestion actually run recently, or is it silently stale" -- and an 8-K
+    is real evidence of that just as much as a 10-K/10-Q is, since it's
+    still a real filing the pipeline had to discover and commit.
+
+    Ordered by `discovered_at` DESC, not `filing_date` DESC -- deliberate,
+    and the opposite of `get_anchor_filing`'s own ordering, for the same
+    reason: `filing_date` is a fact about SEC's own calendar (whether
+    Amazon filed something), `discovered_at` is a fact about THIS
+    deployment's own pipeline (whether it noticed). A scheduled job that
+    silently stopped running would still show a recent `filing_date` for
+    as long as any of the fixed-cadence quarterly filings it last caught
+    stay the most recent one filed -- `discovered_at` is the only column
+    that actually answers "when did WE last update," which is what a
+    reader with no terminal needs to see to trust a public deployment
+    isn't silently stale.
+
+    `accession_no` DESC as the final tie-break, matching `get_anchor_
+    filing`'s own tie-break discipline (SPEC-008 review D2) -- a `filings`
+    row's own primary key, deterministic regardless of insertion order."""
+    return _one(
+        db_path,
+        """
+        SELECT f.accession_no, f.form_type, f.filing_date, f.discovered_at,
+               c.ticker, c.name AS company_name
+        FROM filings f JOIN companies c ON c.cik = f.cik
+        ORDER BY f.discovered_at DESC, f.accession_no DESC LIMIT 1
+        """,
+    )
+
+
 def get_filing(accession_no: str, db_path: Path = DEFAULT_DB_PATH) -> dict | None:
     return _one(
         db_path,

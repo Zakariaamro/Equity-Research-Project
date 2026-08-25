@@ -1,4 +1,4 @@
-"""Tests for dashboard.pages.filings (SPEC-008-batch-4 item 3, approved
+"""Tests for dashboard.app_pages.filings (SPEC-008-batch-4 item 3, approved
 2026-08-16). D10 solved the brief/observations duplication on the
 Overview page's "What changed?" by excluding observations already cited
 by a kept brief sentence (`components.observation_ids_cited_in_brief`).
@@ -89,7 +89,7 @@ def test_filings_page_source_reuses_observation_ids_cited_in_brief():
     # test_dashboard_components.py.
     from pathlib import Path
 
-    text = (Path(__file__).parent.parent / "dashboard" / "pages" / "filings.py").read_text()
+    text = (Path(__file__).parent.parent / "dashboard" / "app_pages" / "filings.py").read_text()
     assert "components.observation_ids_cited_in_brief(" in text
 
 
@@ -115,7 +115,7 @@ def test_filings_page_excludes_observations_already_cited_in_the_brief(tmp_path,
     monkeypatch.setattr(data, "get_filing_detail", lambda accession_no: real_get_filing_detail(accession_no, db_path=db_path))
 
     def script(accession_no):
-        from dashboard.pages import filings
+        from dashboard.app_pages import filings
 
         filings._render_detail(accession_no)
 
@@ -144,7 +144,7 @@ def test_filings_page_excludes_observations_already_cited_in_the_brief(tmp_path,
 def test_filings_page_source_reuses_clean_section_display_text():
     from pathlib import Path
 
-    text = (Path(__file__).parent.parent / "dashboard" / "pages" / "filings.py").read_text()
+    text = (Path(__file__).parent.parent / "dashboard" / "app_pages" / "filings.py").read_text()
     assert "fmt.clean_section_display_text(" in text
 
 
@@ -163,7 +163,7 @@ def test_filings_page_renders_cleaned_section_text_without_touching_the_stored_r
     monkeypatch.setattr(data, "get_filing_detail", lambda accession_no: real_get_filing_detail(accession_no, db_path=db_path))
 
     def script(accession_no):
-        from dashboard.pages import filings
+        from dashboard.app_pages import filings
 
         filings._render_detail(accession_no)
 

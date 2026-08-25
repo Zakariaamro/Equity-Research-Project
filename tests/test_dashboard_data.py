@@ -22,13 +22,19 @@ def db_path(tmp_path):
 
 
 def _insert_filing(db_path, accession_no, cik=AMZN_CIK, form_type="10-K", filing_date="2026-02-06",
-                    period_end="2025-12-31", fiscal_year=2025, fiscal_period="FY"):
+                    period_end="2025-12-31", fiscal_year=2025, fiscal_period="FY", discovered_at=None):
+    # SPEC-009 Part B (approved 2026-08-25): discovered_at defaults to
+    # filing_date at midnight, same as every existing call site already
+    # relied on -- an explicit override exists only for
+    # get_most_recent_filing's own tests, which need the two to genuinely
+    # differ (a filing filed long ago but only recently discovered).
+    discovered_at = discovered_at or f"{filing_date}T00:00:00"
     conn = db.get_connection(db_path)
     conn.execute(
         "INSERT INTO filings (accession_no, cik, form_type, filing_date, period_end, fiscal_year, "
         "fiscal_period, discovered_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sectioned') "
         "ON CONFLICT(accession_no) DO NOTHING",
-        (accession_no, cik, form_type, filing_date, period_end, fiscal_year, fiscal_period, f"{filing_date}T00:00:00"),
+        (accession_no, cik, form_type, filing_date, period_end, fiscal_year, fiscal_period, discovered_at),
     )
     conn.commit()
     conn.close()
@@ -168,6 +174,68 @@ def test_get_all_filings_and_get_filing(db_path):
     single = data.get_filing("acc1", db_path)
     assert single["ticker"] == "AMZN"
     assert data.get_filing("does-not-exist", db_path) is None
+
+
+# --- SPEC-009 Part B (approved 2026-08-25): "which filing is this deployment current as of" ---
+
+
+def test_get_most_recent_filing_orders_by_discovered_at_not_filing_date(db_path):
+    # The load-bearing distinction this function's own docstring makes:
+    # an OLDER filing discovered MORE RECENTLY must win -- filing_date
+    # alone can look fresh even if the scheduled job silently stopped
+    # running for months.
+    _insert_filing(
+        db_path, "acc-old-filed-recent-discover", filing_date="2026-01-01", discovered_at="2026-08-20T00:00:00",
+    )
+    _insert_filing(
+        db_path, "acc-new-filed-old-discover", filing_date="2026-08-01", discovered_at="2026-01-05T00:00:00",
+    )
+    most_recent = data.get_most_recent_filing(db_path)
+    assert most_recent["accession_no"] == "acc-old-filed-recent-discover"
+
+
+def test_get_most_recent_filing_counts_8ks_not_just_10k_10q(db_path):
+    # Deliberately different from get_anchor_filing's own 10-K/10-Q-only
+    # scoping -- this answers "is the pipeline current," not "what is a
+    # page's own analysis built from," so an 8-K counts just as much.
+    _insert_filing(db_path, "acc-10q", form_type="10-Q", filing_date="2026-05-01", discovered_at="2026-05-02T00:00:00")
+    _insert_filing(db_path, "acc-8k", form_type="8-K", filing_date="2026-06-01", discovered_at="2026-06-02T00:00:00")
+    most_recent = data.get_most_recent_filing(db_path)
+    assert most_recent["accession_no"] == "acc-8k"
+    assert most_recent["form_type"] == "8-K"
+
+
+def test_get_most_recent_filing_includes_ticker_and_company_name(db_path):
+    _insert_filing(db_path, "acc1")
+    most_recent = data.get_most_recent_filing(db_path)
+    assert most_recent["ticker"] == "AMZN"
+    assert most_recent["company_name"]
+
+
+def test_get_most_recent_filing_none_on_an_empty_database(db_path):
+    # No filings inserted at all -- the empty-database case
+    # data_freshness_caption's own docstring says must be handled
+    # explicitly, never silently.
+    assert data.get_most_recent_filing(db_path) is None
+
+
+def test_get_most_recent_filing_picks_the_true_global_most_recent_across_companies(db_path):
+    _insert_filing(
+        db_path, "acc-amzn", cik=AMZN_CIK, filing_date="2026-01-01", discovered_at="2026-01-02T00:00:00",
+    )
+    conn = db.get_connection(db_path)
+    conn.execute(
+        "INSERT INTO companies (cik, ticker, name) VALUES (?, ?, ?) ON CONFLICT(cik) DO NOTHING",
+        ("0001045810", "NVDA", "NVIDIA Corporation"),
+    )
+    conn.commit()
+    conn.close()
+    _insert_filing(
+        db_path, "acc-nvda", cik="0001045810", filing_date="2026-06-01", discovered_at="2026-06-02T00:00:00",
+    )
+    most_recent = data.get_most_recent_filing(db_path)
+    assert most_recent["accession_no"] == "acc-nvda"
+    assert most_recent["ticker"] == "NVDA"
 
 
 # --- observations ---

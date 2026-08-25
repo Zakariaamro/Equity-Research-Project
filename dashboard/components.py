@@ -159,6 +159,42 @@ def environment_caption() -> None:
         st.sidebar.caption(caption)
 
 
+def data_freshness_caption() -> None:
+    """SPEC-009 Part B (approved 2026-08-25): "the deployed app must show
+    what filing it's current as of, on every page. A dashboard that
+    silently serves stale data is the failure mode this whole spec exists
+    to prevent" -- once this is on a public URL, a reader has no terminal
+    to run `edgar.pipeline status` against, the way this project's own
+    operator always could.
+
+    Rendered once, here, exactly the same "impossible, not merely
+    discouraged" placement as `environment_caption()` a few lines up --
+    called once from `app.py`, before dispatching to whichever page, so
+    every page gets it by construction; no per-page implementation to
+    remember, forget, or word inconsistently.
+
+    Reads `data.get_most_recent_filing`, NOT `get_anchor_filing` (the
+    Overview page's own per-company 10-K/10-Q anchor, a different
+    question -- "what is this page's analysis built from," not "is this
+    deployment's own data current"). Every form type counts here,
+    including 8-Ks, and the ordering is by `discovered_at` (when THIS
+    deployment's pipeline noticed the filing), not `filing_date` (when SEC
+    says the company filed it) -- see that function's own docstring for
+    why the distinction is load-bearing: `filing_date` alone can look
+    fresh even if the scheduled job silently stopped running, since the
+    same quarterly filing stays "most recent by filing_date" for months
+    either way; `discovered_at` is the only column that actually reflects
+    whether the pipeline has run recently."""
+    filing = data.get_most_recent_filing()
+    if filing is None:
+        st.sidebar.caption(fmt.format_empty_section("Data current as of: no filings in the database yet."))
+        return
+    st.sidebar.caption(
+        f"Data current as of: {filing['ticker']} {filing['form_type']} filed {fmt.format_date(filing['filing_date'])} "
+        f"(added {fmt.format_date(filing['discovered_at'])})"
+    )
+
+
 # --- C5: shared sub-tab bar ---
 
 

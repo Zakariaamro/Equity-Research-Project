@@ -10,7 +10,12 @@ import ast
 from pathlib import Path
 
 DASHBOARD_DIR = Path(__file__).parent.parent / "dashboard"
-PAGES_DIR = DASHBOARD_DIR / "pages"
+# SPEC-009 Part B (approved 2026-08-25): named app_pages, deliberately NOT
+# `pages` -- see app.py's own module docstring for why that specific name,
+# sitting next to app.py, made Streamlit run a different script entirely
+# (`_mpa_v1`, confirmed against the installed Streamlit source) before
+# this project's own auth gate ever got a chance to run.
+PAGES_DIR = DASHBOARD_DIR / "app_pages"
 
 _SQL_MARKERS = ("SELECT ", ".execute(", "import sqlite3", "from sqlite3")
 
@@ -37,6 +42,73 @@ def _function_source(path: Path, func_name: str) -> str:
 
 def _page_files() -> list[Path]:
     return sorted(p for p in PAGES_DIR.glob("*.py") if p.name != "__init__.py")
+
+
+def test_no_directory_literally_named_pages_sits_next_to_app_py():
+    """SPEC-009 Part B (approved 2026-08-25): the login-screen leak's exact
+    root cause, confirmed by reading the installed Streamlit source
+    (`streamlit/runtime/pages_manager.py`, 1.60.0) before deciding, not
+    assumed from docs -- `PagesManager.uses_pages_directory` is set to
+    True purely by `Path(app.py's own parent / "pages").exists()`, a
+    class-level flag computed from the filesystem alone. When True,
+    `script_runner.py` runs a legacy `_mpa_v1(...)` shim INSTEAD OF this
+    project's own `app.py` body: it globs every `.py` file in that `pages`
+    directory, builds a page per bare filename, and renders ITS OWN
+    sidebar navigation before `app.py`'s own auth gate (let alone its own,
+    correctly-titled `st.navigation()` call) ever runs -- exactly the
+    `app`/`filings`/`financials`/`metrics`/`overview` leak reported on the
+    pre-auth login screen. Renamed to `app_pages` to make `uses_pages_
+    directory` structurally unable to ever become True again -- this test
+    pins that no directory literally named `pages` can silently return,
+    e.g. if a future edit reverts the rename without reading this."""
+    app_py = DASHBOARD_DIR / "app.py"
+    assert app_py.exists()
+    assert not (app_py.parent / "pages").exists()
+
+
+def test_page_files_directory_has_the_expected_four_pages():
+    # Sanity check on the rename itself -- proves PAGES_DIR/_page_files()
+    # above are pointed at a real, populated directory, not silently
+    # empty (which every test built on _page_files() would pass against
+    # vacuously).
+    names = {p.stem for p in _page_files()}
+    assert names == {"overview", "financials", "metrics", "filings"}
+
+
+def test_streamlits_own_pages_manager_confirms_the_legacy_shim_is_disabled():
+    """Not just a filesystem check -- calls the REAL Streamlit class this
+    project's own leak traced back to (`PagesManager.uses_pages_
+    directory`), the exact flag that made `script_runner.py` run
+    `_mpa_v1(...)` instead of this project's own `app.py` body. Confirmed
+    live, the same way, before writing this test: printed False for this
+    project's real `dashboard/app.py` after the rename, True before it
+    (with the old `dashboard/pages/` directory still present)."""
+    from streamlit.runtime.pages_manager import PagesManager
+
+    original = PagesManager.uses_pages_directory
+    try:
+        # Class-level flag, memoized on first read (see the library's own
+        # comment in pages_manager.py) -- reset so this constructor call
+        # actually recomputes it against THIS project's real app.py,
+        # rather than reusing whatever an earlier import in this same
+        # test process already cached.
+        PagesManager.uses_pages_directory = None
+        PagesManager(str((DASHBOARD_DIR / "app.py").resolve()))
+        assert PagesManager.uses_pages_directory is False
+    finally:
+        PagesManager.uses_pages_directory = original
+
+
+def test_app_py_calls_data_freshness_caption_exactly_once():
+    """SPEC-009 Part B: 'the deployed app must show what filing it's
+    current as of, on every page' -- checked structurally, the same
+    'impossible, not merely discouraged' argument app.py's own docstring
+    already makes for the sidebar selector and the auth gate. Rendered
+    from app.py (which `st.navigation`/`st.Page` genuinely re-executes on
+    every navigation, per that same docstring), never per-page, so no
+    individual page can omit or misword it."""
+    text = (DASHBOARD_DIR / "app.py").read_text()
+    assert text.count("components.data_freshness_caption()") == 1
 
 
 def test_no_sql_outside_data_module():
@@ -171,15 +243,15 @@ def _dollar_string_literals(path: Path) -> list[tuple[int, str]]:
 # set -- deliberately: the point of an allowlist is that every entry was
 # looked at, not that it was looked at once, in the past, forever.
 _ALLOWED_DOLLAR_STRINGS: dict[tuple[str, int, str], str] = {
-    ("components.py", 328, " ($)"): (
+    ("components.py", 364, " ($)"): (
         "SPEC-008-batch-4 follow-up item 3: _RAW_EXPORT_UNIT_SUFFIX['eps_basic'], appended to "
         "the raw CSV export's own Line item labels (pandas .to_csv) -- never reaches a "
         "Streamlit render call at all."
     ),
-    ("components.py", 329, " ($)"): (
+    ("components.py", 365, " ($)"): (
         "Same as the eps_basic entry above -- _RAW_EXPORT_UNIT_SUFFIX['eps_diluted']."
     ),
-    ("components.py", 334, " ($m)"): (
+    ("components.py", 370, " ($m)"): (
         "SPEC-008-batch-4 follow-up item 3: _RAW_EXPORT_DEFAULT_UNIT_SUFFIX, same CSV-only sink "
         "as the two entries above."
     ),
@@ -216,7 +288,7 @@ _ALLOWED_DOLLAR_STRINGS: dict[tuple[str, int, str], str] = {
         "variable, same escape_markdown_currency call site."
     ),
     (
-        "components.py", 678,
+        "components.py", 714,
         "Model-ready: the same rows and columns as the table above, but as plain numbers -- "
         "no thousands separators, no $/%, negatives as '-' not parentheses, blank cells left "
         "genuinely empty (never '--' or 'n/m'). Units are stated per row in the line-item "

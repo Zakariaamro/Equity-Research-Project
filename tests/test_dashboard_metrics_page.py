@@ -1,4 +1,4 @@
-"""Tests for dashboard.pages.metrics (SPEC-008 C6). `_group_metrics` is the
+"""Tests for dashboard.app_pages.metrics (SPEC-008 C6). `_group_metrics` is the
 one function responsible for AC5's guarantee -- a metric added under a new
 category appears with no page-file changes. A hardcoded category list would
 make that guarantee silently false; these pin it against the registry
@@ -23,7 +23,7 @@ def _metric_def_with_group(group: str) -> config.MetricDef:
 
 
 def test_group_metrics_derives_categories_from_the_registry_not_a_hardcoded_list():
-    from dashboard.pages import metrics
+    from dashboard.app_pages import metrics
 
     extra = _metric_def_with_group("Zzz Brand New Category")
     original = dict(config.METRIC_REGISTRY)
@@ -38,7 +38,7 @@ def test_group_metrics_derives_categories_from_the_registry_not_a_hardcoded_list
 
 
 def test_group_metrics_preserves_registry_order_not_alphabetical_or_hardcoded():
-    from dashboard.pages import metrics
+    from dashboard.app_pages import metrics
 
     groups = metrics._group_metrics()
     # The pre-fix hardcoded list was exactly the first seven of this
@@ -56,7 +56,7 @@ def test_group_metrics_preserves_registry_order_not_alphabetical_or_hardcoded():
 
 
 def test_group_metrics_new_category_appears_after_existing_ones_when_appended():
-    from dashboard.pages import metrics
+    from dashboard.app_pages import metrics
 
     extra = _metric_def_with_group("Zzz Brand New Category")
     original = dict(config.METRIC_REGISTRY)

@@ -74,7 +74,13 @@ def _render_detail(accession_no: str) -> None:
 
 def render() -> None:
     st.title("Filings")
-    st.caption(f"Data as of the current deployment's database.")
+    # SPEC-009 Part B (approved 2026-08-25): this used to say "Data as of
+    # the current deployment's database" -- a caption that promised a
+    # concrete date and never gave one. Removed, not reworded: the real,
+    # dated freshness statement now lives in the sidebar
+    # (components.data_freshness_caption, called once from app.py), on
+    # every page including this one -- a second, page-local restatement
+    # here would just be one more place for the wording to drift.
     all_filings = data.get_all_filings()
     st.write(f"{len(all_filings)} filing(s) in the database.")
     accession_no = _render_filing_list(all_filings)

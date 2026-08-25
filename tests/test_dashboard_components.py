@@ -403,6 +403,57 @@ def test_environment_caption_warns_below_this_projects_declared_floor(monkeypatc
     assert any("1.40.0" in w and "below" in w for w in warnings)
 
 
+# --- SPEC-009 Part B (approved 2026-08-25): "the deployed app must show
+# what filing it's current as of, on every page" ---
+
+
+def test_data_freshness_caption_states_ticker_form_type_and_both_dates(monkeypatch):
+    from dashboard import data
+
+    monkeypatch.setattr(
+        data, "get_most_recent_filing",
+        lambda: {
+            "accession_no": "acc1", "ticker": "AMZN", "form_type": "10-Q",
+            "filing_date": "2026-08-21", "discovered_at": "2026-08-24T06:00:00",
+        },
+    )
+
+    def script():
+        from dashboard import components
+
+        components.data_freshness_caption()
+
+    at = AppTest.from_function(script)
+    at.run()
+    assert at.exception == []
+    captions = [c.value for c in at.sidebar.caption]
+    assert any("AMZN" in c and "10-Q" in c for c in captions)
+    # Both dates present and distinguishable -- filed vs. discovered are a
+    # real, load-bearing distinction (get_most_recent_filing's own
+    # docstring), not interchangeable phrasing.
+    assert any("Aug 21, 2026" in c for c in captions)
+    assert any("Aug 24, 2026" in c for c in captions)
+
+
+def test_data_freshness_caption_states_the_empty_case_explicitly(monkeypatch):
+    from dashboard import data
+
+    monkeypatch.setattr(data, "get_most_recent_filing", lambda: None)
+
+    def script():
+        from dashboard import components
+
+        components.data_freshness_caption()
+
+    at = AppTest.from_function(script)
+    at.run()
+    assert at.exception == []
+    captions = [c.value for c in at.sidebar.caption]
+    # R5/R8 discipline (dashboard/format.py's own NULL rule) applied here
+    # too -- never blank, never silently omitted.
+    assert any("no filings" in c.lower() for c in captions)
+
+
 # --- C5: shared sub-tab bar ---
 
 
