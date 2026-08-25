@@ -487,6 +487,55 @@ construction, not a guess — but it does not, and cannot, confirm the response 
 `response.stop_reason`) without an actual billed call, which is outside what this agent may
 do on its own. Worth a first real Part A run being watched, not assumed clean.
 
+### Resolution: dependencies pinned (approved 2026-08-25)
+
+The finding above — a fresh install independently resolving Streamlit 1.62.0 and anthropic
+1.0.0, both untested — is not a one-off. This project has now lost real time to three
+separate unpinned-version incidents, each a different mechanism: a bare `streamlit` on PATH
+resolving to an unrelated Anaconda install (decision log #52), a real `.venv`'s newer
+Streamlit exposing a `TextColumn(alignment=...)` kwarg an older declared floor didn't have
+(decision log #66), and this fresh-clone check's own anthropic major-version jump. Deployment
+(Streamlit Cloud) and the scheduled Action (Part A) both install fresh on every run — an open
+upper bound means both would silently run library versions nothing here has ever executed
+against, unattended, on a schedule.
+
+**Every dependency in `pyproject.toml` is now pinned with the compatible-release operator**
+(`~=X.Y.Z`, PEP 440 — equivalent to `>=X.Y.Z, ==X.*`), to exactly what this project's own
+`.venv` has actually been built and tested against throughout: `requests~=2.34.2`,
+`beautifulsoup4~=4.15.0`, `streamlit~=1.60.0`, `plotly~=6.9.0`, `anthropic~=0.120.2`,
+`pytest~=9.1.1`, `pyyaml~=6.0.3`.
+
+**Compatible-release, not exact (`==`)** — the choice between the two, and why: `~=X.Y.Z`
+blocks exactly the two failure SHAPES already experienced (a minor-version API surface
+change; a major-version jump) while still letting a same-minor-version PATCH release — a bug
+fix, a security fix — reach the project without anyone hand-bumping a version number first.
+An exact pin would need a human to manually re-approve every single patch release across
+every dependency to receive a security fix at all, risking the opposite failure: patches
+silently never applied because nobody is watching. This does NOT pin the full transitive
+tree (pandas/numpy/pyarrow/httpx/… are pulled in by streamlit/anthropic themselves, never
+declared here directly) — a complete, reproducible lockfile (pip-tools/uv or similar) is a
+real, larger undertaking, genuinely out of scope for this fix and recorded here as a known
+limitation, not silently glossed over.
+
+**Verified, not assumed, before calling this done**: a fresh clone with the new pins applied
+installed cleanly (no resolver conflicts between the tightened top-level bounds and their own
+transitive requirements), landed on exactly the seven pinned versions, and the full 601-test
+suite passed in 20 seconds.
+
+**The anthropic 1.0.0 risk flagged just above is resolved by this pin, not merely
+noted.** A structural signature check was never a substitute for a real, successful call —
+it was the best available verification *given* an unpinned dependency that had already
+drifted. With `anthropic~=0.120.2` in place, Part A's next scheduled run uses the exact
+version this project has real, successful call history against; the exposure a fresh install
+would otherwise have reintroduced is closed, not deferred.
+
+**Upgrading any pinned dependency is now a deliberate act, never something that happens by
+itself at the next scheduled run.** When one is upgraded, it goes through the same
+verification this spec item just established: a fresh clone, a fresh install, the full test
+suite, and (for streamlit specifically) a real `streamlit run` — not just editing the version
+number and trusting a green CI run, since CI's own fresh install would silently pick up
+whatever the new pin allows without re-proving the dashboard itself still starts.
+
 ---
 
 ## Explicitly out of scope
