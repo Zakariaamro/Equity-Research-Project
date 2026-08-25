@@ -38,7 +38,34 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
-_EXCLUDED_DIR_NAMES = {".venv", "venv", ".git", "__pycache__", ".pytest_cache", ".claude", "node_modules"}
+# SPEC-009 Part B (approved 2026-08-25, found live during the fresh-clone
+# AC verification): this used to be `ROOT.rglob("*.py")` filtered by an
+# exact-name exclusion set (".venv", "venv", ...) -- which only ever
+# excludes a virtualenv literally named one of those two strings. A
+# genuinely fresh clone's own verification, per this project's own
+# convention, creates its OWN venv wherever the operator happens to name
+# it (`.venv-fresh`, here) -- not in the exclusion set, and not caught by
+# it, since membership is exact-string, not a prefix/substring match.
+# Confirmed live: `ROOT.rglob("*.py")` under a fresh clone with a venv
+# named `.venv-fresh` walked and `ast.parse`'d 7,117 third-party files
+# (numpy/pandas/streamlit/anthropic/pyarrow/... -- everything pip
+# installed), against 56 real project files, and the recursive `ast.walk`
+# / `_resolved_strings` cost across a dependency tree that size ran for
+# over an hour at 100% CPU before being killed -- not a slow pass, a
+# functional hang, and the exact kind of gap invisible in a long-lived
+# dev `.venv` (excluded by exact name) that only a genuinely fresh,
+# differently-named environment surfaces.
+#
+# Fixed by scoping to the actual, named source directories this project
+# has -- not "everything under the repo root minus a blocklist," which
+# can never enumerate every possible name a future venv, scratch
+# directory, or build artifact might get. `edgar/`, `dashboard/` (which
+# already includes `app_pages/` via `rglob`), `tests/`, and `scripts/`
+# (checked: the one-off reconciliation script under `scripts/` also
+# builds real SQL) are the complete, real set -- anything outside these
+# four is either a dependency, a venv, or generated, never first-party
+# code this guard needs to check.
+_SOURCE_DIRS = ("edgar", "dashboard", "tests", "scripts")
 
 _EXECUTE_METHOD_NAMES = ("execute", "executemany", "executescript")
 
@@ -54,10 +81,7 @@ _NUMERIC_UNDERSCORE_RE = re.compile(r"\d_\d")
 
 
 def _project_py_files() -> list[Path]:
-    return [
-        p for p in ROOT.rglob("*.py")
-        if not any(part in _EXCLUDED_DIR_NAMES or part.endswith(".egg-info") for part in p.parts)
-    ]
+    return [p for source_dir in _SOURCE_DIRS for p in (ROOT / source_dir).rglob("*.py")]
 
 
 def _all_name_assignments(tree: ast.Module) -> dict[str, list[ast.expr]]:
