@@ -405,8 +405,8 @@ loosening the check itself).
 ### Other requirements
 
 - The password gate (SPEC-008 R2) protects the deployed app. `.streamlit/secrets.toml` is
-  gitignored, so the password becomes a Streamlit Cloud secret. **Change it from
-  `local-dev-only` before deploying.**
+  gitignored, so the password becomes a Streamlit Cloud secret. **Change it from the local
+  development password before deploying.**
 - The auth gate calls `st.stop()` before `st.navigation()`, so the login screen shows
   Streamlit's auto-discovered page names (`app`, `filings`, `financials`…). Confirmed not to
   be a bypass, but it leaks internal structure on a public URL. Suppress it before deploying.
